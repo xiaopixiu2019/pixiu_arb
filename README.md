@@ -1,2 +1,16 @@
-# pixiu_arb
-PIXIU ARB stable open-source releases. First release is in preparation.
+# PIXIU ARB
+
+PIXIU ARB 的公开稳定版发布仓库。
+
+**当前状态：首个稳定版本准备中。** 本仓库目前仅包含项目说明和许可证，尚未发布终端源码、安装包或可运行版本。
+
+计划提供两种自托管使用方式：
+
+- 本地电脑运行后台，通过本地浏览器操作。
+- 自有云服务器运行后台，通过 SSH 隧道在本地浏览器操作。
+
+稳定版本将经过源码与公开资料审查、自动化验证及安装验收后发布，包含对应源码、用户说明、安装包和校验文件。
+
+本项目后续终端版本基于 [yourQuantGuy 的 Gate CrossEx](https://github.com/your-quantguy/gate-crossex) 开源项目开发，保留原作者版权及第三方声明；这是独立项目，并非 Gate 官方产品。
+
+许可证：GNU AGPL-3.0-only，见 [LICENSE](LICENSE)。
