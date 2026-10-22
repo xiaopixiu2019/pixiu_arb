@@ -9,7 +9,9 @@ test('healthy margin never conceals paused tasks, readonly, partial recovery or 
     await r.fulfill({ json: { ...original, configured: true, activeProfileId: 'synthetic' } });
   });
   await page.route('**/api/trading-mode', r => r.fulfill({ json: { mode: 'readonly' } }));
-  const at = Date.now(); await page.clock.install({ time: new Date(at) }); await page.clock.pauseAt(new Date(at));
+  const initial = Date.now(), at = initial + 60_000;
+  // Keep the pause target ahead of real elapsed setup time (test timeout: 30 s).
+  await page.clock.install({ time: new Date(initial) }); await page.clock.pauseAt(new Date(at));
   const assets = ['XMR','MSTR','SNDK','SOXL'];
   const reason = 'Five consecutive maker quotes were rejected; check credentials, balances, and venue status';
   const tasks = assets.map(asset => StrategyRecordSchema.parse({ id: `PAIR-${asset}`, kind: 'position', status: 'PAUSED',

@@ -19,6 +19,15 @@ async function setup(page: Page) {
     lastSentAt: null, lastError: null, retryAt: null, storage: 'env_file', csrfToken: 'synthetic' } }));
 }
 
+async function pauseRiskClock(page: Page): Promise<number> {
+  const initial = Date.now();
+  // Pause ahead of the running clock, beyond the 30 s test timeout, before sampling risk.
+  const at = initial + 60_000;
+  await page.clock.install({ time: new Date(initial) });
+  await page.clock.pauseAt(new Date(at));
+  return at;
+}
+
 test('approximate protection and delayed fee details preserve healthy official risk and authorization', async ({ page }) => {
   await setup(page); const policy = { ...current().policy, protectedGroupIds: ['g'] };
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current({ policy, effectivePolicy: policy,
@@ -48,8 +57,7 @@ test('saved authorization does not claim borrowing protection when model evidenc
 });
 
 test('fresh stream observations stay valid between clock ticks and expire without another message', async ({ page }) => {
-  await setup(page); const at = Date.now(); let stream: WebSocketRoute | undefined;
-  await page.clock.install({ time: new Date(at) }); await page.clock.pauseAt(new Date(at));
+  await setup(page); const at = await pauseRiskClock(page); let stream: WebSocketRoute | undefined;
   await page.routeWebSocket('**/ws/stream', ws => { stream = ws; });
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current({ sampledAt: at }) }));
   await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId: 'risk-a', events: [], hasMore: false } }));
@@ -73,8 +81,7 @@ test('fresh stream observations stay valid between clock ticks and expire withou
 });
 
 test('a newer account observation replaces the previous expiry without extending its own deadline', async ({ page }) => {
-  await setup(page); const at=Date.now(); let stream!: WebSocketRoute, latest=current({sampledAt:at});
-  await page.clock.install({time:new Date(at)}); await page.clock.pauseAt(new Date(at));
+  await setup(page); const at=await pauseRiskClock(page); let stream!: WebSocketRoute, latest=current({sampledAt:at});
   await page.routeWebSocket('**/ws/stream', ws=>{stream=ws;});
   await page.route('**/api/risk/margin', r=>r.fulfill({json:latest}));
   await page.route('**/api/risk/margin/events*', r=>r.fulfill({json:{accountId:latest.accountId,events:[],hasMore:false}}));
@@ -102,7 +109,7 @@ test('portfolio margin ratios expire at the same 5001 ms boundary', async ({page
   await page.evaluate(()=>{history.pushState(null,'','/portfolio');window.dispatchEvent(new PopStateEvent('popstate'));});
   await page.locator('.portfolio-summary').waitFor();
   const rate=page.locator('.portfolio-summary article').filter({hasText:'起始保证金率'}).locator('strong');
-  const at=Date.now();await page.clock.install({time:new Date(at)});await page.clock.pauseAt(new Date(at));
+  const at=await pauseRiskClock(page);
   latest=current({sampledAt:at});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
   await expect(rate).toContainText('248');await page.clock.runFor(100);
   latest=current({sampledAt:at-4900});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
