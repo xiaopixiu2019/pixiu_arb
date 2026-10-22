@@ -1,16 +1,53 @@
 # PIXIU ARB
 
-PIXIU ARB 的公开稳定版发布仓库。
+通过Gate CrossEx管理跨交易所行情、对冲执行和托管持仓的单人自托管终端。它不是Gate官方产品，也不提供收益保证。
 
-**当前状态：首个稳定版本准备中。** 本仓库目前仅包含项目说明和许可证，尚未发布终端源码、安装包或可运行版本。
+**交付范围：1.0.2 源码与部署文档。** 当前不提供经过发行验收的预编译桌面安装包。
 
-计划提供两种自托管使用方式：
+提供两种自托管使用方式：
 
 - 本地电脑运行后台，通过本地浏览器操作。
 - 自有云服务器运行后台，通过 SSH 隧道在本地浏览器操作。
 
-稳定版本将经过源码与公开资料审查、自动化验证及安装验收后发布，包含对应源码、用户说明、安装包和校验文件。
+功能包括跨所行情与资金费率比较、手动和配对执行、显式接管持仓、保证金风控，以及订单、费用和任务盈亏记录。
 
-本项目后续终端版本基于 [yourQuantGuy 的 Gate CrossEx](https://github.com/your-quantguy/gate-crossex) 开源项目开发，保留原作者版权及第三方声明；这是独立项目，并非 Gate 官方产品。
+普通Maker–Taker任务提前准备两腿资金责任，按确认成交及时补腿。入场价差是触发条件，不是成交价差保证；仍有手续费、滑点、资金费和单腿暴露风险。
 
-许可证：GNU AGPL-3.0-only，见 [LICENSE](LICENSE)。
+新建对冲任务草稿默认使用挂单–吃单；退出条件为价差-90 bps、净资金费率年化低于-150%、任一满足、持续3000秒。这是界面初始值，不是收益建议；既有任务和手动修改的值不会被覆盖。
+
+启动和重启不会自动启用实盘。默认Stop保留仓位并停止自动保护，平仓需要明确选择。未知订单只查原单，不能重复提交。详见[安全说明](docs/safety.md)。
+
+## 从源码运行
+
+建议使用 Node.js 24 LTS、npm 和 Git。获取源码后执行：
+
+```sh
+git clone https://github.com/xiaopixiu2019/pixiu_arb.git
+cd pixiu_arb
+npm ci --no-audit --no-fund
+npm run build
+```
+
+Windows运行 `.\run.ps1`，Linux运行 `./run`。访问启动器输出的回环地址，默认 http://127.0.0.1:17840 。凭据通过安全录入页面配置，不写入源码。
+
+## Docker
+
+```sh
+docker compose up -d --build
+```
+
+默认仅发布主机回环端口并使用持久数据卷。云服务器通过SSH隧道访问，不直接开放终端端口。详见[部署、更新与恢复](docs/deployment.md)。
+
+## 开发与验证
+
+```sh
+npx playwright install chromium
+npm run verify
+npm audit --registry=https://registry.npmjs.org --audit-level=high
+```
+
+测试使用隔离数据库和模拟网关，不需要真实凭据。[开发说明](docs/local-development.md) · [架构](docs/architecture.md) · [更新记录](CHANGELOG.md) · [安全报告](SECURITY.md)
+
+项目来源、原作者版权及第三方声明见[来源及版权声明](SOURCE_NOTICES.md)和[第三方声明](THIRD_PARTY_NOTICES.md)，相关源码法律声明完整保留。
+
+许可证：[AGPL-3.0-only](LICENSE)。保留[来源及版权声明](SOURCE_NOTICES.md)和[第三方声明](THIRD_PARTY_NOTICES.md)。不要在公开问题、截图或日志中提交凭据、账户标识、数据库或真实交易资料。

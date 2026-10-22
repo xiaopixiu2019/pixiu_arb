@@ -1,0 +1,7 @@
+.field-help { display: inline-flex; vertical-align: middle; margin-left: 3px; flex: 0 0 auto; }
+.field-help > button { display: inline-grid; place-items: center; width: 24px; height: 24px; padding: 0; border: 0; color: #93adbf; background: transparent; cursor: help; font-size: 10px; font-weight: 600; }
+.field-help > button::before { content: ''; position: absolute; width: 12px; height: 12px; border: 1px solid #5e788b; border-radius: 50%; pointer-events: none; }
+.field-help > button:focus-visible { outline: 2px solid #25d5b0; border-radius: 4px; }
+.field-help-popover { position: fixed; z-index: 10000; width: min(320px, calc(100vw - 24px)); box-sizing: border-box; max-height: 200px; overflow: auto; padding: 16px; border: 1px solid #436273; border-radius: 8px; background: #14232f; color: #dfeaf0; box-shadow: 0 12px 40px #0008; font-size: 13px; line-height: 1.65; }
+.field-help-popover strong { display: block; margin-bottom: 6px; color: #eff7fa; }
+@media (max-width: 640px) { .field-help > button { width: 32px; height: 32px; } .field-help-popover { top: auto !important; bottom: 36px; left: 12px !important; width: calc(100vw - 24px); } }

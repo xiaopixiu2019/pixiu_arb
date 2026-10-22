@@ -1,0 +1,10 @@
+.asset-modal-backdrop { position: fixed; inset: 0; z-index: 80; background: #0009; display: flex; justify-content: flex-end; }
+.asset-modal { width: min(1600px,calc(100vw - 48px)); height: 100dvh; background: #070b10; border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; }
+.asset-modal > header { flex: none; display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--line); gap: 16px; }
+.asset-modal > header h2 { font-size: 20px; margin: 0; }.asset-modal > header > div { display: flex; gap: 12px; }
+.asset-modal > header button { padding: 8px 12px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: var(--panel); cursor: pointer; }
+.asset-modal-body { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.asset-modal .portfolio-view { padding-inline: 24px; }
+@media (max-width: 639px) { .asset-modal { width: 100vw; }.asset-modal > header { padding: 14px 12px; }.asset-modal .portfolio-view { padding-inline: 12px; } }
+
+html[data-theme='light'] .asset-modal { background: #f3f6f9; }

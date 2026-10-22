@@ -1,0 +1,67 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version: 24, cache: npm }
+      - name: Verify public repository, source and version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/release-guard.mjs
+      - run: npm ci --no-audit --no-fund
+      - run: npm audit --registry=https://registry.npmjs.org --audit-level=high
+      - run: npx playwright install --with-deps chromium
+      - run: npm run verify
+
+  source:
+    needs: verify
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with: { node-version: 24 }
+      - name: Recheck publication identity at the verified public tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/release-guard.mjs
+      - name: Archive the exact public commit
+        env:
+          SOURCE_TAG: ${{ github.ref_name }}
+        run: |
+          git archive --format=tar.gz --prefix="pixiu-arb-${SOURCE_TAG}/" --output="pixiu-arb-${SOURCE_TAG}.tar.gz" "$GITHUB_SHA"
+          sha256sum "pixiu-arb-${SOURCE_TAG}.tar.gz" > SHA256SUMS
+          cat > RELEASE_NOTES.md <<'NOTES'
+          Source and deployment documentation only. No precompiled installers are included.
+          The source archive corresponds to the verified public tag and commit.
+          Follow README.md and docs/deployment.md. Trading starts unset; preserve data and unresolved responsibility when upgrading.
+          NOTES
+      - name: Publish the verified source archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$SOURCE_TAG" "pixiu-arb-${SOURCE_TAG}.tar.gz" SHA256SUMS --verify-tag --title "PIXIU ARB $SOURCE_TAG — source" --notes-file RELEASE_NOTES.md
+

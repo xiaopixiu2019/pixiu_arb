@@ -1,0 +1,17 @@
+.running-row > .strategy-realized-pnl { min-width: 0; padding-block: 8px; }
+.strategy-realized-pnl details { color: var(--text-muted, #8795a6); overflow-wrap: anywhere; }
+.strategy-realized-pnl summary { cursor: pointer; }
+.strategy-realized-pnl details div { margin-top: 8px; }
+.strategy-realized-pnl details small { display: block; margin-top: 4px; }
+.running-table.with-trading:not(.historical) .running-head,
+.running-table.with-trading:not(.historical) .running-row {
+  grid-template-columns: 112px 82px minmax(130px,1fr) minmax(170px,1fr) 160px minmax(130px,1fr) 96px 88px 74px 220px 90px;
+  min-width: 1520px;
+}
+.running-table.with-trading.with-fees:not(.historical) .running-head,
+.running-table.with-trading.with-fees:not(.historical) .running-row {
+  grid-template-columns: 105px 80px minmax(120px,1fr) minmax(155px,1.2fr) 160px 108px 92px 82px 140px 70px 220px 72px;
+  min-width: 1540px;
+}
+.strategy-realized-pnl > small[role="status"] { color: var(--text-muted, #8795a6); }
+.running-table.with-trading:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }

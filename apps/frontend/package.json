@@ -1,0 +1,26 @@
+{
+  "name": "@gate-crossex/frontend",
+  "version": "1.0.2",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -p tsconfig.json --noEmit && vite build && node ../../scripts/compress-frontend-assets.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config ../../vitest.config.ts --passWithNoTests"
+  },
+  "dependencies": {
+    "@gate-crossex/domain": "1.0.2",
+    "@gate-crossex/shared-types": "1.0.2",
+    "lightweight-charts": "^5.2.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.16",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "5.0.4",
+    "typescript": "5.9.3",
+    "vite": "7.3.7"
+  }
+}
