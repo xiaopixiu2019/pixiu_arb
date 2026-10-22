@@ -53,6 +53,7 @@ function linksFor(root, path) {
 }
 
 export function checkDocumentation(root, paths) {
+  root = realpathSync(root);
   const deleted = new Set(paths.filter(path => !existsSync(resolve(root, path))).map(path => resolve(root, path)));
   const changed = paths.filter(path => existsSync(resolve(root, path)));
   const tracked = deleted.size ? git(root, ['ls-files', '-z']).split('\0').filter(path => path.endsWith('.md')) : [];

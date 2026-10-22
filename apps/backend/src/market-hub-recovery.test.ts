@@ -229,16 +229,24 @@ describe('manual quote recovery', () => {
   });
 
   it('invalidates only the disconnected quote owner and preserves primary receipts', async () => {
+    let owner: WebSocket | undefined;
     const h = await setup((s, index) => s.on('message', raw => {
       const m = JSON.parse(raw.toString()); if (m.event !== 'subscribe' || m.channel !== 'ticker') return;
-      if (index === 0) s.send(ticker(RIGHT)); else s.send(ticker(LEFT));
+      if (index === 0 && m.payload.includes(RIGHT)) s.send(ticker(RIGHT));
+      else if (index > 0 && m.payload.includes(LEFT) && (!owner || owner === s)) {
+        owner = s; s.send(ticker(LEFT));
+      }
     }));
     const release = h.hub.watchQuotes([LEFT, RIGHT]);
     await waitForStrategyQuotes(h.hub, [LEFT, RIGHT], () => true, 2_000);
     const receipt = h.hub.market(RIGHT)?.receivedAt;
-    h.sockets[1]!.terminate();
+    expect(owner).toBeDefined();
+    owner!.terminate();
+    // Keep replacement frames withheld until the disconnected owner's invalidation is checked.
     await until(() => h.hub.market(LEFT)?.receivedAt === '');
     expect(h.hub.market(RIGHT)?.receivedAt).toBe(receipt);
+    expect(h.sockets[0]?.readyState).toBe(WebSocket.OPEN);
+    owner = undefined;
     await waitForStrategyQuotes(h.hub, [LEFT, RIGHT], () => true, 2_000);
     release();
   });

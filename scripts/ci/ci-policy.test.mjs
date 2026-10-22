@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +61,23 @@ test('deleting documentation checks unchanged tracked documents referencing it',
   execFileSync('git', ['-C', root, 'add', '.']);
   rmSync(join(root, 'docs/guide.md'));
   assert.throws(() => checkDocumentation(root, ['docs/guide.md']), /missing local link/);
+});
+
+test('documentation accepts repository root aliases without allowing links outside the real root', t => {
+  const container = fixture(t), root = join(container, 'actual'), alias = join(container, 'alias');
+  put(root, 'README.md', '[guide](docs/guide.md)\n');
+  put(root, 'docs/guide.md', '# Guide\n');
+  symlinkSync(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.doesNotThrow(() => checkDocumentation(alias, ['README.md']));
+  execFileSync('git', ['-C', root, 'add', '.']);
+  rmSync(join(root, 'docs/guide.md'));
+  assert.throws(() => checkDocumentation(alias, ['docs/guide.md']), /missing local link/);
+  put(root, 'docs/guide.md', '# Guide\n');
+  put(container, 'outside/secret.md', '# Outside\n');
+  symlinkSync(join(container, 'outside'), join(root, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+  put(root, 'README.md', '[escape](linked/secret.md)\n');
+  assert.throws(() => checkDocumentation(alias, ['README.md']), /outside repository/);
+  assert.throws(() => checkDocumentation(alias, ['linked/secret.md']), /documentation must be a repository file/);
 });
 
 const context = { repository: 'xiaopixiu2019/pixiu_arb', event: 'push',
