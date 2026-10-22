@@ -1,0 +1,30 @@
+.portfolio-view .performance-kpis { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.performance-kpi { min-width: 0; display: flex; flex-direction: column; gap: 8px; padding: 20px 18px; border-right: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.performance-kpi:last-child { border-right: 0; }
+.performance-kpi-label { display: flex; align-items: center; color: var(--muted); font-size: 12px; }
+.performance-kpi > strong { font-size: clamp(20px,1.65vw,28px); overflow-wrap: anywhere; color: var(--text); }
+.performance-kpi > span, .performance-kpi > small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.performance-kpi .positive { color: var(--green); }.performance-kpi .negative { color: var(--red); }
+.performance-warning { color: #c9a45f !important; font-size: 12px; }
+.performance-trend { margin-top: 14px; overflow: hidden; background: var(--panel); }
+.performance-trend > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px 4px; }
+.performance-trend h2 { margin: 4px 0 0; font-size: 17px; color: var(--text); }
+.performance-trend header > div:last-child { display: flex; gap: 6px; }
+.performance-trend header button { padding: 7px 12px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; }
+.performance-trend header button[aria-pressed=true] { color: var(--green); border-color: var(--green); background: #11322f; }
+.performance-chart { position: relative; padding: 0 14px 12px; min-height: 230px; }
+.performance-legend { display: flex; align-items: center; gap: 14px; padding: 8px 4px 12px; }
+.performance-legend button { border: 0; background: transparent; font-size: 11px; cursor: pointer; }
+.performance-legend button::before { display: inline-block; width: 15px; margin-right: 6px; content: ''; border-top: 2px solid currentColor; vertical-align: middle; }
+.performance-legend .asset-legend { color: var(--green); }.performance-legend .return-legend { color: #9582d6; }.performance-legend .return-legend::before { border-top-style: dashed; }
+.performance-legend button[aria-pressed=false] { opacity: .45; }
+.performance-chart-empty { position: absolute; top: 52%; left: 15%; width: 70%; text-align: center; pointer-events: none; color: var(--muted); font-size: 13px; }
+.performance-chart-tooltip { position: absolute; top: 58px; left: 24%; max-width: 65%; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); display: grid; gap: 8px; font-size: 11px; pointer-events: none; z-index: 2; }
+.performance-chart-tooltip span { display: flex; justify-content: space-between; gap: 18px; }.performance-chart-tooltip b { color: var(--green); }.performance-chart-tooltip span:last-child b { color: #9582d6; }
+.performance-kpi-label, .performance-kpi > span, .performance-kpi > small, .performance-trend header button { color: #8d9eaf; }
+html[data-theme='light'] :is(.performance-kpi-label,.performance-kpi > span,.performance-kpi > small,.performance-trend header button) { color: #526579; }
+html[data-theme='light'] .performance-legend .asset-legend { color: #00755e; }
+html[data-theme='light'] .performance-legend .return-legend { color: #745fa7; }
+html[data-theme='light'] .performance-warning { color: #7b5d10 !important; }
+@media (max-width: 1279px) { .portfolio-view .performance-kpis { grid-template-columns: repeat(3,minmax(0,1fr)); }.performance-kpi:nth-child(3n) { border-right: 0; }.performance-kpi:nth-child(-n+3) { border-bottom: 1px solid var(--line); } }
+@media (max-width: 639px) { .portfolio-view .performance-kpis { grid-template-columns: repeat(2,minmax(0,1fr)); }.performance-kpi { padding: 16px 12px; border-bottom: 1px solid var(--line); }.performance-kpi:nth-child(3n) { border-right: 1px solid var(--line); }.performance-kpi:nth-child(2n) { border-right: 0; }.performance-kpi:nth-last-child(-n+2) { border-bottom: 0; }.performance-trend > header { align-items: flex-start; flex-direction: column; }.performance-legend { flex-wrap: wrap; gap: 8px; } }

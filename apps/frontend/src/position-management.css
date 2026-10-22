@@ -1,0 +1,13 @@
+.position-management-settings { margin: 16px 0; padding: 14px; border: 1px solid #26434b; border-radius: 8px; min-width: 0; }
+.position-management-settings legend { color: #12cfb2; font-weight: 600; padding: 0 6px; }
+.position-management-settings p, .position-management-settings small { display: block; color: #91a5b5; line-height: 1.6; font-size: 12px; }
+.management-toggle { display: flex !important; align-items: flex-start; gap: 8px; margin: 8px 0; }
+.management-toggle input { width: 16px !important; height: 16px; flex: 0 0 16px; accent-color: #12cfb2; margin: 2px 0; }
+.management-fields { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; margin: 12px 0; }
+.management-fields label { min-width: 0; display: grid; gap: 5px; font-size: 12px; }
+.management-fields input, .management-fields select { box-sizing: border-box; width: 100%; min-width: 0; background: #0a141d; border: 1px solid #28414c; border-radius: 5px; padding: 8px; color: #dce8ef; }
+.position-management-settings summary, .managed-position-status summary { cursor: pointer; color: #12cfb2; }
+.managed-position-status { flex: 1 1 auto; min-width: 0; max-width: none; font-size: 12px; }
+.managed-position-status summary { overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; white-space: nowrap; }
+.managed-position-status span { display: block; overflow-wrap: anywhere; line-height: 1.6; }
+@media (max-width: 420px) { .management-fields { grid-template-columns: 1fr; } }
