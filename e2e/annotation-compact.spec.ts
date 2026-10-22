@@ -36,6 +36,31 @@ test('page-local readonly review preserves backend unset when the mode stream fo
   expect(await (await page.request.get('/api/trading-mode')).json()).toMatchObject({ mode: 'unset' });
 });
 
+test('help ignores a completed scroll notification but closes when its anchor moves', async ({ page }) => {
+  await open(page);
+  const help = page.getByRole('button', { name: '持续监控与自动退出 · ?', exact: true });
+  await help.scrollIntoViewIfNeeded();
+  await help.focus(); await page.keyboard.press('Enter');
+  await expect(page.getByRole('note')).toContainText('优先市价只减仓');
+  // A queued notification from scrolling before opening must not dismiss stationary help.
+  await page.evaluate(() => document.dispatchEvent(new Event('scroll')));
+  await expect(page.getByRole('note')).toContainText('优先市价只减仓');
+  const before = await page.evaluate(() => window.scrollY);
+  await page.evaluate(() => window.scrollBy(0, window.scrollY > 0 ? -100 : 100));
+  await expect.poll(() => page.evaluate(() => window.scrollY)).not.toBe(before);
+  await expect(page.getByRole('note')).toHaveCount(0);
+  await help.click(); await expect(page.getByRole('note')).toBeVisible();
+  const viewport = page.viewportSize()!;
+  await page.setViewportSize({ ...viewport, width: viewport.width - 10 });
+  await expect(page.getByRole('note')).toHaveCount(0);
+  await help.click(); await expect(page.getByRole('note')).toBeVisible();
+  await page.getByRole('textbox', { name: '总数量', exact: true }).focus();
+  await expect(page.getByRole('note')).toHaveCount(0);
+  await help.click(); await expect(page.getByRole('note')).toBeVisible();
+  await page.locator('.strategy-rules').click({ position: { x: 10, y: 10 } });
+  await expect(page.getByRole('note')).toHaveCount(0);
+});
+
 for (const language of ['zh', 'en'] as const) {
   test(`static management guidance moves to accessible help without changing controls (${language})`, async ({ page }) => {
     await open(page, language);

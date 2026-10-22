@@ -7,12 +7,18 @@ export function FieldHelp({ label, children }: { label: string; children: ReactN
   const id = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
+  const anchor = useRef<DOMRect | null>(null);
   const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   useEffect(() => {
     if (!position) return;
     const close = (event: Event) => {
       if (event instanceof KeyboardEvent && event.key !== 'Escape') return;
-      if (event.type === 'scroll' && panel.current?.contains(event.target as Node)) return;
+      if (event.type === 'scroll') {
+        if (event.target instanceof Node && panel.current?.contains(event.target)) return;
+        const current = trigger.current?.getBoundingClientRect(), opened = anchor.current;
+        if (current && opened && current.top === opened.top && current.left === opened.left
+          && current.width === opened.width && current.height === opened.height) return;
+      }
       if (['pointerdown', 'focusin'].includes(event.type) && (panel.current?.contains(event.target as Node) || trigger.current?.contains(event.target as Node))) return;
       setPosition(null);
       if (event.type === 'keydown') trigger.current?.focus();
@@ -32,6 +38,7 @@ export function FieldHelp({ label, children }: { label: string; children: ReactN
         event.preventDefault(); event.stopPropagation();
         if (position) { setPosition(null); return; }
         const rect = event.currentTarget.getBoundingClientRect();
+        anchor.current = rect;
         window.dispatchEvent(new CustomEvent('field-help-open', { detail: id }));
         setPosition({ left: Math.max(12, Math.min(rect.left, window.innerWidth - 340)), top: rect.bottom + 8 > window.innerHeight - 220 ? Math.max(12, rect.top - 210) : rect.bottom + 8 });
       }}>!</button>
