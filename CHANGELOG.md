@@ -2,6 +2,8 @@
 
 ## 1.0.3 — source candidate
 
+- Disclose intentional KEEP exclusions without marking other verified protection as perpetually reconciling.
+
 - Update Zod to 4.6.6, Fastify to 5.12.6, and fast-uri resolutions to 3.1.9/4.2.3 for current security advisories.
 
 - Atomically enroll newly launched managed groups for protection during pauses/restarts, including adoption and transfer under stable group identity.

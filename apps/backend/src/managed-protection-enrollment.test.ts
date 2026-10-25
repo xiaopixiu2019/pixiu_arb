@@ -215,4 +215,14 @@ describe('atomic launch enrollment into continuous protection', () => {
     expect(h.submitted).toHaveLength(2); expect(h.submitted[1]).toMatchObject({ qty: '7', reduce_only: 'true' });
     expect(h.runtime.getStrategy('old').status).toBe('PAUSED');
   });
+  it('discloses an intentional KEEP without pretending the remaining verified groups are reconciling', async () => {
+    const h = await setup(), first = await h.launch('kept'); await h.filled('kept', first, '10', '10');
+    h.manager.handoff('kept', '10'); await h.manager.tick();
+    const second = await h.launch('watching', 'ETH'); await h.filled('watching', second, '10', '10');
+    h.manager.handoff('watching', '10'); await h.manager.tick(); h.manager.beginStop('kept', false);
+    const view = h.manager.protection.view();
+    expect(view.coverage).toContainEqual({ groupId: 'kept', strategyId: 'kept', enrolled: false, reason: 'protection_keep' });
+    expect(view.groups).toEqual([expect.objectContaining({ strategyId: 'watching', state: 'WATCHING' })]);
+    expect(view.state).toBe('WATCHING');
+  });
 });

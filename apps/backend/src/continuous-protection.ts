@@ -58,7 +58,7 @@ export class ContinuousProtection {
     }).map(s =>
       s.reason !== 'protection_entry_in_progress' && this.now() - s.checkedAt > 5000 ? { ...s, state: 'RECONCILING', reason: 'protection_observation_stale' } : s);
     const state = !enabled ? 'DISABLED' : groups.some(g => g.state === 'BLOCKED') ? 'BLOCKED'
-      : groups.some(g => g.state === 'EXECUTING') ? 'EXECUTING' : !groups.length || coverage.some(g => !g.enrolled) || groups.some(g => g.state === 'RECONCILING') ? 'RECONCILING' : 'WATCHING';
+      : groups.some(g => g.state === 'EXECUTING') ? 'EXECUTING' : !groups.length || coverage.some(g => !g.enrolled && g.reason !== 'protection_keep') || groups.some(g => g.state === 'RECONCILING') ? 'RECONCILING' : 'WATCHING';
     return { enabled, state, groups, coverage };
   }
   private coverage(): NonNullable<NonNullable<MarginSnapshot['continuousProtection']>['coverage']> {
