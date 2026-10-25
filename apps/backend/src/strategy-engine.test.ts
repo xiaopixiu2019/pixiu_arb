@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createMarginRiskService } from './margin-risk-service.js';
 import { afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import type Database from 'better-sqlite3';
 import { loadConfig } from './config.js';
 import { openDatabase } from './database.js';
@@ -35,9 +35,7 @@ afterAll(() => {
     samples: values.length, p95Ms: values[Math.ceil(values.length * 0.95) - 1], p99Ms: values[Math.ceil(values.length * 0.99) - 1],
     maximumMs: values.at(-1), extraAdmissionHttp: pairedAdmissionQueryCount, poolProofSamples: pairedPoolProofSamples,
     positionAheadSamples: pairedPositionAheadSamples, scale: PAIRED_PERFORMANCE_SCALE };
-  const output = resolve(process.env.GCT_BENCH_REPORT ?? '../../data/benchmarks/paired-execution-latency.json');
-  mkdirSync(dirname(output), { recursive: true });
-  writeFileSync(output, JSON.stringify(report, null, 2));
+  writeFileSync(resolve(process.env.GCT_BENCH_REPORT ?? '../../data/paired-checks-close-receipts-20261021/combined-latency.json'), JSON.stringify(report, null, 2));
   expect(report.samples).toBe(100); expect(report.extraAdmissionHttp).toBe(0);
   expect(report.poolProofSamples).toBe(100);
   expect(report.positionAheadSamples).toBe(50);
@@ -422,7 +420,7 @@ describe('pre-submit account recheck deferral', () => {
       await h.manager!.tick(); await h.manager!.tick(); // REST still contains the original empty holdings.
       expect(h.manager!.entryProgressPending(record.id)).toBe(true); expect(h.runtime.pairedMakerReady(record.id)).toBe(false);
       ackOrder(h.runtime, 'remote-1', 'CANCELLED', '0', '0');
-      expect(h.session.current).toBe('readonly');
+      expect(h.session.current).toBe('protect_only'); expect(h.session.liveTradingEnabled).toBe(false);
       expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toEqual({ reason: 'managed_entry_progress_unconfirmed' });
       await h.engine.tick(); expect(h.gateway.createdOrders).toHaveLength(1);
     } finally { await monitor.stop(); }
@@ -466,7 +464,7 @@ describe('pre-submit account recheck deferral', () => {
       clock += 20000;
       h.manager!.notifyPosition({ ...futuresPosition('BINANCE_FUTURE_BTC_USDT', 'SHORT', '0.08'), update_time: String(clock) });
       clock += 5001; (deadline![0] as () => void)();
-      expect(h.session.current).toBe('readonly');
+      expect(h.session.current).toBe('protect_only'); expect(h.session.liveTradingEnabled).toBe(false);
       expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toEqual({ reason: 'managed_account_recovery_expired' });
       expect(h.gateway.createdOrders).toHaveLength(1);
     } finally { timers.mockRestore(); await monitor.stop(); }
@@ -1802,7 +1800,8 @@ describe('strategy engine', () => {
     const pool = vi.spyOn(PairedEntryPool.prototype, 'costs').mockImplementation(() => { throw new Error('paired_entry_fee_budget_exceeded'); });
     try {
       ackOrder(h.runtime, 'remote-1', 'PARTIALLY_FILLED', '0.05', '111');
-      await waitFor(() => h.session.current === 'readonly');
+      await waitFor(() => h.session.current === 'protect_only');
+      expect(h.session.liveTradingEnabled).toBe(false);
       expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toEqual({ reason: 'paired_entry_fee_budget_exceeded' });
       expect(h.runtime.getStrategy(record.id).management?.phase).toBe('RISK_PAUSED');
       for (let i = 0; i < 3; i++) await h.engine.tick();

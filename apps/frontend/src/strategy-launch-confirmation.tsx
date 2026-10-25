@@ -38,8 +38,8 @@ export function StrategyLaunchConfirmation({
       </header>
       <p className="strategy-confirm-warning">{t('Review the strategy details before starting live automated execution.')}</p>
       <p className="strategy-confirm-warning">{managed ? language === 'zh'
-        ? '启动同时授权本托管组按账户IMR/MMR规则自动减仓，覆盖接管与新增的合并仓位。建仓核实且执行条件具备后，账户触线可先于经济退出分批减仓；可在风险管理页取消后续批次授权。'
-        : 'Starting authorizes account IMR/MMR reduction for this managed group, including adopted and added holdings. After holdings and execution conditions are verified, account risk may reduce positions before economic exit. Revoke future batches in Risk Management.'
+        ? '启动同时授权本托管组按账户IMR/MMR规则自动减仓及暂停期间持续保护，覆盖接管与新增的合并仓位。暂停或重启后仍核对实际持仓并仅减仓，不恢复普通交易、不补仓。KEEP、明确只读及撤权优先；本次启动不会恢复其他已撤权组。可在风险管理页关闭保护。'
+        : 'Starting authorizes account IMR/MMR reduction for this managed group, including adopted and added holdings, plus continuous protection during pauses and restarts. Only verified actual holdings may be reduced; ordinary trading is not resumed and exposure is not rebuilt. KEEP, explicit read-only and revocation take precedence. This launch does not reauthorize other revoked groups. Revoke protection in Risk Management.'
         : language === 'zh' ? '本任务未启用持仓管理，不新增保证金自动减仓授权。'
           : 'This task has no managed position group and adds no automatic margin reduction authority.'}</p>
       <dl className="confirm-order-summary">

@@ -67,8 +67,9 @@ describe('account admission at the real order boundary', () => {
       (symbol,exchange_type,business_type,state,lot_size,min_size,min_notional,tick_size,max_num_orders,max_market_size,default_leverage,delist_time,fetched_at)
       VALUES (?,?,'FUTURE','live',?,?,?,'0.0001','100',?,'3','0',?)`)
       .run(symbol, i === 0 ? 'GATE' : 'HYPERLIQUID', i === 0 ? '10' : '1', i === 0 ? '10' : '1', i === 0 ? null : '10', i === 0 ? '10000000' : maximum, now));
+    let observedQuantity = '1800';
     h.gateway.queryManagedState = async () => ({ positions: symbols.map((symbol, i) => ({ symbol,
-      position_side: i === 0 ? 'SHORT' : 'LONG', position_qty: '1800', margin_mode: 'CROSS' })) as GateCrossExPosition[], openOrders: [] });
+      position_side: i === 0 ? 'SHORT' : 'LONG', position_qty: observedQuantity, margin_mode: 'CROSS' })) as GateCrossExPosition[], openOrders: [] });
     const inspect = vi.spyOn(MarginReductionEvidence.prototype, 'inspectGroup').mockReturnValue({ ok: true, evidence: {
       initial: '100', maintenance: '10', initialRelease: '1', maintenanceRelease: '0.1', cost: '0.01', cap: '36', apr: '0',
       firstLeg: 0, checkedAt: Date.now(), initialReleaseByLeg: ['0.5', '0.5'], maintenanceReleaseByLeg: ['0.05', '0.05'],
@@ -78,6 +79,11 @@ describe('account admission at the real order boundary', () => {
       expect(h.monitor.snapshot().groups[0].readiness).toMatchObject({ status: 'ready', reason: null, maxBatchQuantity: maximum ?? '900' });
       expect(inspect.mock.calls[0][3]).toBe(maximum ?? '900');
       expect(h.createOrder).not.toHaveBeenCalled();
+      expect(h.monitor.sources.reviewReady?.()).toBe(true);
+      observedQuantity = '1700'; await h.monitor.refresh();
+      expect(h.monitor.sources.reviewReady?.()).toBe(false); // Balanced external reductions are not verified owned fills.
+      observedQuantity = '1800'; await h.monitor.refresh();
+      expect(h.monitor.sources.reviewReady?.()).toBe(true);
     } finally { inspect.mockRestore(); }
   });
   it('admits adequately funded new exposure with debt and keeps reduce-only separate', async () => {

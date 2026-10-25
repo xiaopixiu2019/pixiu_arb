@@ -1401,7 +1401,7 @@ function App() {
       </nav>
       <div className="top-actions">
         {tradingMode !== null && tradingMode !== 'unset' && <button className={`topbar-navigation-button mode-badge ${tradingMode}`} onClick={openModeDialog} title={t('Switch trading mode')} aria-label={t('Switch trading mode')}>
-          <i />{t(tradingMode === 'live' ? 'Live trading' : 'Read-only')}
+          <i />{tradingMode === 'protect_only' ? (language === 'zh' ? '仅保护' : 'Protection only') : t(tradingMode === 'live' ? 'Live trading' : 'Read-only')}
         </button>}
         <RiskIndicator snapshot={marginSnapshot} onOpen={() => navigate({ workspace: 'Risk Management' })} />
         <button className={`topbar-navigation-button portfolio-shortcut${workspace === 'Portfolio' ? ' active' : ''}`} aria-haspopup="dialog" aria-expanded={assetOpen} onClick={() => { setSettingsOpen(false); setNotificationsOpen(false); setAssetOpen(true); }}>

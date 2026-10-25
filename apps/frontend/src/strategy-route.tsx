@@ -765,8 +765,8 @@ export function StrategyView({ profileId, mode, prefill, marketSnapshot, catalog
               : (language === 'zh' ? '仅管理本次新建仓位；已有仓位会阻止启动。' : 'Manage only newly opened holdings; existing positions block launch.')
               : (language === 'zh' ? '本任务未启用持仓管理，不新增保证金自动减仓授权。' : 'Position management is disabled; no automatic margin reduction authority is added.'),
             ...(managedEnabled ? [language === 'zh'
-              ? '启动同时登记本托管组 IMR/MMR 减仓授权；失衡优先市价只减仓，允许全部退出。订单未知或保护失败时暂停并要求人工复核。手动停止并保留仓位后不再自动保护，重启后需恢复交易权限。'
-              : 'Launch authorizes IMR/MMR reduction for this group. Imbalance protection uses market reduce-only, including full exit. Unknown orders or protection failures pause for review. KEEP stops protection; restart requires live reactivation.'] : []),
+              ? '启动同时登记本组 IMR/MMR 减仓及暂停期间持续保护；暂停或重启后仍核对并只减仓，不补仓。未知订单或保护失败仍锁定普通交易。KEEP、明确只读及撤权优先。'
+              : 'Launch enrolls this group for IMR/MMR reduction and continuous protection during pauses and restarts. Only verified holdings may be reduced; exposure is not rebuilt. Unknown orders or protection failures lock ordinary trading. KEEP, explicit read-only and revocation take precedence.'] : []),
           ]} /> : <>
             <div className="launch-status"><span><i />{t('Review & launch')}</span><small>{t('Continuous')}</small></div>
             <div className="launch-intent"><div><small>{t('Strategy')}</small><strong>{asset} {t('spread bot')}</strong></div><p><span className={leftSide.toLowerCase()}>{t(leftSide)} {leftExchange.name}</span><i>⇄</i><span className={rightSide.toLowerCase()}>{t(rightSide)} {rightExchange.name}</span></p></div>
@@ -802,7 +802,7 @@ export function StrategyView({ profileId, mode, prefill, marketSnapshot, catalog
           { label: t('Reduce only'), value: t(reduceOnly ? 'Yes' : 'No') },
         ] : []),
         { label: t('Execution'), value: configuredExecutionMethod.replaceAll('–', '-') },
-        ...(managedEnabled && managedConfig ? [{ label: language === 'zh' ? '持仓管理与退出' : 'Position management and exit', value: managementSummary(managedConfig, language) }, { label: language === 'zh' ? '失衡保护' : 'Imbalance protection', value: language === 'zh' ? '市价只减仓，允许全部平仓；后台重启后需恢复权限' : 'Market reduce-only, including full close; restart requires live reactivation' }] : []),
+        ...(managedEnabled && managedConfig ? [{ label: language === 'zh' ? '持仓管理与退出' : 'Position management and exit', value: managementSummary(managedConfig, language) }, { label: language === 'zh' ? '失衡保护' : 'Imbalance protection', value: language === 'zh' ? '市价只减仓，允许全部平仓；暂停/重启后持续核对，普通交易仍需恢复权限' : 'Market reduce-only, including full close; protection continues after pauses/restarts, ordinary trading remains locked' }] : []),
       ]}
       busy={launching}
       onCancel={() => setConfirmingLaunch(false)}

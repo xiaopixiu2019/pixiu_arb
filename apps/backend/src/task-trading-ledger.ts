@@ -15,7 +15,7 @@ export function positionKey(row: PnlBook): string | null {
   const separator = row.business_id.lastIndexOf('_');
   return separator > 0 && /^\d+$/.test(row.business_id.slice(separator + 1)) ? `${row.symbol}:${row.business_id.slice(0, separator)}` : null;
 }
-function sharedIds(rows: PnlBook[]): Set<string> {
+export function sharedIds(rows: PnlBook[]): Set<string> {
   const ids = new Set(rows.filter(r => r.statement_type === 'INTEREST_ISOLATED' && !r.symbol).map(r => r.id));
   const conversions = new Map<string, PnlBook[]>();
   for (const r of rows.filter(r => r.statement_type === 'KRAKEN_CONVERSION' && !r.symbol && r.business_id)) conversions.set(r.business_id, [...(conversions.get(r.business_id) ?? []), r]);

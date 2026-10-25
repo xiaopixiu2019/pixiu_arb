@@ -3,6 +3,26 @@ import { GateApiError, GateCrossExClient, signGateRequest, type AuthenticatedReq
 import { marginReadFault } from './margin-read-fault.js';
 
 describe('Gate APIv4 signing', () => {
+  it.each(['managed','portfolio'] as const)('keeps bounded portfolio and protection reads independent when %s transport stalls',async blocked=>{
+    vi.useFakeTimers();let release!:()=>void;const held=new Promise<void>(r=>{release=r;});
+    const starts:number[]=[];let active=0,maximum=0,first=true;
+    const account={available_margin:'100',margin_balance:'100',initial_margin:'0',maintenance_margin:'0',
+      initial_margin_rate:'0',maintenance_margin_rate:'0',position_mode:'SINGLE',account_mode:'CROSS_EXCHANGE',exchange_type:'CROSSEX',update_time:'1783689000000',assets:[]};
+    const fetched=vi.fn(async(url:string|URL|Request)=>{
+      starts.push(Date.now());active++;maximum=Math.max(maximum,active);
+      try {if(first){first=false;await held;}return new Response(new URL(String(url)).pathname.endsWith('/accounts')?JSON.stringify(account):'[]');}
+      finally{active--;}
+    });
+    const client=new GateCrossExClient(fetched as typeof fetch,Date.now,undefined,100),credentials={apiKey:'synthetic',apiSecret:'synthetic'};
+    let otherFinished=false;
+    const blockedRead=blocked==='managed'?client.queryManagedState(credentials,new AbortController().signal):client.queryPortfolio(credentials);
+    const other=(blocked==='managed'?client.queryPortfolio(credentials):client.queryManagedState(credentials,new AbortController().signal)).then(()=>{otherFinished=true;});
+    try {
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(otherFinished).toBe(true);expect(maximum).toBe(2);
+      expect(starts.slice(1).every((at,i)=>at-starts[i]>=100)).toBe(true);
+    }finally{release();await vi.advanceTimersByTimeAsync(1500);await Promise.all([blockedRead,other]);vi.useRealTimers();}
+  });
   it('aborts a stalled response body and releases its stream reader', async () => {
     const cancelled = vi.fn(); const stream = new ReadableStream({ cancel: cancelled });
     const fetched = vi.fn(async () => new Response(stream));

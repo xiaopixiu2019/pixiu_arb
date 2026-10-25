@@ -392,6 +392,7 @@ async function readBoundedResponseText(response: Response, maxBytes: number, sig
 
 export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperationsCrossExGateway {
   private readonly readLane = Symbol('account-reader');
+  private portfolioReader?: GateCrossExClient;
   constructor(
     private readonly fetchImplementation: typeof fetch = fetch,
     private readonly now: () => number = Date.now,
@@ -474,6 +475,14 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
   async queryPortfolio(credentials: GateCredentials, signal?: AbortSignal): Promise<GateCrossExPortfolio> {
+    // UI enrichment must not occupy the control reader's lane. The shared scheduler still owns
+    // the same two read slots, start spacing, cooldown and independent serial write slot.
+    this.portfolioReader ??= new GateCrossExClient(this.fetchImplementation,this.now,this.baseUrl,
+      this.authenticatedRequestSpacingMs,this.onAuthenticatedTiming,this.pacing);
+    return this.portfolioReader.collectPortfolio(credentials,signal);
+  }
+
+  private async collectPortfolio(credentials: GateCredentials, signal?: AbortSignal): Promise<GateCrossExPortfolio> {
     signal?.throwIfAborted();
     const historyQuery = new URLSearchParams({ page: '1', limit: '100' }).toString();
     const [account, positions, marginPositions, openOrders, recentTrades] = await Promise.all([

@@ -10,10 +10,11 @@ import { strategyErrorMessage } from './strategy-error-message.js';
 import { receiptForRows, sameCloseTask } from './managed-close-receipt.js';
 import { ManagedCloseReceiptsContext } from './use-managed-close-receipts.js';
 
-function useCloseTargets(profileId?: string | null) {
+function useCloseTargets(profileId?: string | null, enabled = true) {
   const [targets, setTargets] = useState<ManagedCloseTarget[]>([]);
   const [readStatus, setReadStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
   useEffect(() => {
+    if (!enabled) return;
     const controller = new AbortController();
     let pending = false;
     const refresh = async () => {
@@ -29,14 +30,14 @@ function useCloseTargets(profileId?: string | null) {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5_000);
     return () => { controller.abort(); window.clearInterval(timer); };
-  }, [profileId]);
+  }, [profileId, enabled]);
 
   return { targets, readStatus };
 }
 
 function useCloseRequest(selection: ManagedCloseTarget | null, profileId: string | null | undefined,
   tradingMode: TradingMode | null, onOpenModeDialog: () => void, onChanged: () => Promise<void> | void,
-  accepted: () => void) {
+  accepted: () => void, dataUnavailable = false) {
   const { language } = useLanguage(), zh = language === 'zh';
   const [busy, setBusy] = useState(false), submitting = useRef(false);
   const [error, setError] = useState<string | null>(null), [notice, setNotice] = useState<string | null>(null);
@@ -46,7 +47,7 @@ function useCloseRequest(selection: ManagedCloseTarget | null, profileId: string
   if (!store) throw new Error('Managed close receipt provider is required');
   const { receipts, begin, update, read } = store;
   async function confirm() {
-    if (submitting.current || !selection || receipts.some(r => r.strategyId === selection.strategy.id) || selection.scope.accountProfileId !== profileId) return;
+    if (dataUnavailable || submitting.current || !selection || receipts.some(r => r.strategyId === selection.strategy.id) || selection.scope.accountProfileId !== profileId) return;
     if (tradingMode !== 'live') { onOpenModeDialog(); return; }
     const receipt = begin(selection);
     if (!receipt) return;
@@ -75,18 +76,19 @@ function useCloseRequest(selection: ManagedCloseTarget | null, profileId: string
 }
 
 interface ManagedPositionsTableProps {
+  staleReason?: string;
   rows: readonly PositionTableRow[]; profileId?: string | null; accountMarginBalance?: number | null;
   tradingMode: TradingMode | null; onOpenModeDialog: () => void; onChanged: () => Promise<void> | void;
 }
 export function ManagedPositionsTable(props: ManagedPositionsTableProps) {
   return <AccountManagedPositionsTable key={props.profileId ?? 'no-account'} {...props} />;
 }
-function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, tradingMode, onOpenModeDialog, onChanged }: ManagedPositionsTableProps) {
+function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, tradingMode, onOpenModeDialog, onChanged, staleReason }: ManagedPositionsTableProps) {
   const { language } = useLanguage(), zh = language === 'zh';
-  const { targets, readStatus } = useCloseTargets(profileId);
+  const { targets, readStatus } = useCloseTargets(profileId, !staleReason);
   const [selection, setSelection] = useState<ManagedCloseTarget | null>(null);
   const { busy, submitting, error, setError, notice, setNotice, receipts, confirm } = useCloseRequest(
-    selection, profileId, tradingMode, onOpenModeDialog, onChanged, () => setSelection(null));
+    selection, profileId, tradingMode, onOpenModeDialog, onChanged, () => setSelection(null), Boolean(staleReason));
   const latest = receipts.filter(r => r.scope.accountProfileId === profileId).at(-1);
   const completed = latest?.state === 'completed' ? latest.strategyId : null;
   useEffect(() => {
@@ -111,6 +113,7 @@ function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, t
             : pending ? (zh ? '正在提交退出请求，请勿重复操作' : 'Submitting the exit request; do not resubmit')
             : !target || readStatus === 'failed' ? (zh ? '退出请求已接受，等待结果核实' : 'Exit accepted; awaiting verification') : '' };
     }
+    if (staleReason) return { disabled: true, reason: staleReason };
     const exiting = phase === 'EXITING' || phase === 'STOPPING';
     const reason = readStatus === 'loading' ? (zh ? '正在核实托管归属' : 'Checking ownership')
       : readStatus === 'failed' ? (zh ? '托管归属读取失败，请等待更新' : 'Ownership read failed; awaiting an update')
@@ -126,12 +129,12 @@ function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, t
     setError(null); setNotice(null);
   }
   return <>
-    <PositionsTable rows={rows} profileId={profileId} accountMarginBalance={accountMarginBalance}
+    <PositionsTable rows={rows} profileId={profileId} accountMarginBalance={accountMarginBalance} dataStale={Boolean(staleReason)}
       onClose={requestClose} closeAction={closeAction} />
-    {readStatus === 'failed' && <p role="status">{zh ? '托管归属暂时无法读取；新的平仓请求已禁用，已提交请求不会重复发送。' : 'Ownership is unavailable. New close requests are disabled; submitted requests will not be resent.'}</p>}
+    {!staleReason && readStatus === 'failed' && <p role="status">{zh ? '托管归属暂时无法读取；新的平仓请求已禁用，已提交请求不会重复发送。' : 'Ownership is unavailable. New close requests are disabled; submitted requests will not be resent.'}</p>}
     {notice && <p role="status">{notice}</p>}
     {selection && selection.scope.accountProfileId === profileId && <StrategyStopConfirmation
       key={selection.strategy.id} strategy={selection.strategy} language={language} closeOnly busy={busy}
-      error={error} confirmDisabled={Boolean(error)} onCancel={() => { if (!submitting.current) setSelection(null); }} onConfirm={() => void confirm()} />}
+      error={error} confirmDisabled={Boolean(error) || Boolean(staleReason)} onCancel={() => { if (!submitting.current) setSelection(null); }} onConfirm={() => void confirm()} />}
   </>;
 }

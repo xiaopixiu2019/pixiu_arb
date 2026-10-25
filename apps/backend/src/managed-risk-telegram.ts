@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import type { MarginSnapshot } from '@gate-crossex/shared-types';
 import { MANAGED_ACCOUNT_RECHECKING, MANAGED_RECOVERY_WINDOW_MS } from './managed-position-store.js';
 
 const SettingsSchema = z.object({
@@ -42,7 +43,8 @@ export class ManagedRiskTelegramAlerts {
 
   constructor(private readonly db: Database.Database, private settings: TelegramAlertSettings | null,
     private readonly log: AlertLogger, private readonly fetchImpl: typeof fetch = fetch,
-    private readonly now: () => number = Date.now) {}
+    private readonly now: () => number = Date.now,
+    private readonly protection?: () => MarginSnapshot['continuousProtection']) {}
 
   updateSettings(settings: TelegramAlertSettings | null): void {
     this.settings = settings;
@@ -98,7 +100,8 @@ export class ManagedRiskTelegramAlerts {
       `${task.asset} ${task.id}: A ${task.left_quantity ?? '未知'} / B ${task.right_quantity ?? '未知'}；最后核对 ${task.checked_at ?? '未知'}`);
     return { key: lock.created_at, type: 'managed_risk_telegram_sent', reason: lock.reason, taskCount: tasks.length,
       text: ['🚨 Gate CrossEx 需要人工核查', `原因：${lock.reason}`, `故障开始：${lock.created_at} UTC`, ...this.readEvidence(lock),
-      '系统状态：全局风险暂停；新交易和自动退出已阻止。',
+      this.protection?.()?.enabled ? '系统状态：普通策略风险暂停；账户持续保护仍在独立核对。请查看保护状态，不需要恢复普通策略来解锁保护。'
+        : '系统状态：全局风险暂停；新交易和自动退出已阻止。',
       ...tasks, '请到交易所核对实际持仓、挂单和订单结果；未确认前不要重放订单或直接解除风险锁。'].join('\n') };
   }
   private readEvidence(lock: RiskLock): string[] {

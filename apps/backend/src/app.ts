@@ -86,6 +86,7 @@ import { ManagedPositionManager } from './managed-position-manager.js';
 import { loadTelegramAlertSettings, ManagedRiskTelegramAlerts } from './managed-risk-telegram.js';
 import { createMarginRiskService } from './margin-risk-service.js';
 import { registerMarginRiskRoutes } from './margin-risk-routes.js';
+import { registerContinuousProtectionRoutes } from './continuous-protection-routes.js';
 import { TelegramNotifications } from './telegram-notifications.js';
 import { registerTelegramNotificationRoutes } from './telegram-notification-routes.js';
 import { hasManagedClaims, managedOrderBlock, managedRiskBlock } from './managed-position-store.js';
@@ -857,7 +858,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   const quiesceForCredentialMutation = async (): Promise<void> => {
     const previous = tradingSession.current;
-    if (previous === 'live') {
+    if (previous === 'live' || previous === 'protect_only') {
       tradingSession.set('readonly');
     }
     const unresolved = await strategyEngine.suspendForTradingLock();
@@ -990,7 +991,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
   const managedRiskAlerts = new ManagedRiskTelegramAlerts(database,
     loadTelegramAlertSettings(join(config.dataDir, 'telegram-alert.env')),
-    (fields, message) => app.log.warn(fields, message));
+    (fields, message) => app.log.warn(fields, message), fetch, Date.now, () => positionManager?.protection.view());
   positionManager = new ManagedPositionManager(database, tradingSession, tradingRuntime, {
     market: (symbol) => marketHub.market(symbol), ensureMarket: ensureMarketKnown,
   }, {
@@ -1039,6 +1040,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await telegramNotifications.initialize();
   marginMonitor.subscribe((snapshot) => telegramNotifications.observe(snapshot));
   registerMarginRiskRoutes(app, marginMonitor);
+  registerContinuousProtectionRoutes(app, positionManager.protection, marginMonitor, runAuthenticatedWrite);
   registerTelegramNotificationRoutes(app, telegramNotifications);
 
   let portfolioRefreshInFlight: { generation: number; promise: Promise<LivePortfolioSnapshot>; controller: AbortController } | null = null;
@@ -1518,7 +1520,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     }
     const changeTradingMode = async () => {
       const previous = tradingSession.current;
-      if (parsed.data.mode === previous) return { mode: previous };
+      if (parsed.data.mode === previous) {
+        if (parsed.data.mode === 'readonly') tradingSession.set('readonly');
+        return { mode: previous };
+      }
 
       if (parsed.data.mode === 'live') {
         const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
@@ -2005,6 +2010,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const unsubscribeRuntime = tradingRuntime.subscribe(safeSend);
     const unsubscribePortfolio = livePortfolio.subscribe(safeSend);
     const unsubscribeMargin = marginMonitor.subscribe((snapshot) => safeSend({ type: 'risk.margin', payload: snapshot }));
+    // Completion is display-only; never re-enter margin control/notification subscribers.
+    const unsubscribeProtection = positionManager.protection.subscribeCompletion(() => {
+      if (socket.readyState === socket.OPEN) safeSend({ type: 'risk.margin', payload: marginMonitor.snapshot() });
+    });
     const unsubscribeMode = tradingSession.subscribe(safeSend);
     const statusHeartbeat = setInterval(() => {
       safeSend({ type: 'market.status', payload: {
@@ -2029,6 +2038,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     safeSend({ type: 'mode.update', payload: { mode: tradingSession.current } });
     safeSend({ type: 'strategy.snapshot', payload: { strategies: tradingRuntime.listStrategies() } });
     safeSend({ type: 'execution.snapshot', payload: tradingRuntime.snapshot() });
+    safeSend({ type: 'risk.margin', payload: marginMonitor.snapshot() });
     socket.on('message', (raw: { toString(): string }) => {
       let parsedMessage: unknown;
       try { parsedMessage = JSON.parse(raw.toString()); } catch { return; }
@@ -2096,6 +2106,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       unsubscribeRuntime();
       unsubscribePortfolio();
       unsubscribeMargin();
+      unsubscribeProtection();
       unsubscribeMode();
     });
   });

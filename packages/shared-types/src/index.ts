@@ -23,7 +23,7 @@ export const HealthResponseSchema = z.object({
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 export interface RiskRule { id: string; scope: 'account'|'venue'|'asset'|'strategy'; metric: string; limit: string; enabled: boolean; }
 
-export const TradingModeSchema = z.enum(['unset', 'readonly', 'live']);
+export const TradingModeSchema = z.enum(['unset', 'readonly', 'live', 'protect_only']);
 export type TradingMode = z.infer<typeof TradingModeSchema>;
 
 export const TradingModeResponseSchema = z.object({ mode: TradingModeSchema });

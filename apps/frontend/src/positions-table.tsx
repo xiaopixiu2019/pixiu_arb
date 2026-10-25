@@ -5,7 +5,7 @@ import { ExecutionPagination } from './execution-pagination-control.js';
 import { executionPageWindow } from './execution-pagination.js';
 import { useLanguage } from './i18n.js';
 import { marketSymbol } from './market-symbol.js';
-import { compactPrice } from './number-format.js';
+import { PositionPriceCell } from './position-prices.js';
 import {
   calculatePortfolioFundingYield,
   calculatePositionFundingYield,
@@ -17,6 +17,7 @@ import { usePositionFundingOverview } from './use-position-funding-overview.js';
 import { convertedTotal } from './position-money.js';
 
 interface PositionsTableProps {
+  dataStale?: boolean;
   profileId?: string | null;
   rows: readonly PositionTableRow[];
   accountMarginBalance?: number | null;
@@ -94,13 +95,14 @@ function PortfolioFundingSummary({ value, t }: {
 }
 
 /** The canonical position table shared by Trade, Strategies, and Portfolio. */
-export function PositionsTable({ rows, profileId, accountMarginBalance, onClose, closeAction }: PositionsTableProps) {
+export function PositionsTable({ rows, profileId, accountMarginBalance, onClose, closeAction, dataStale = false }: PositionsTableProps) {
   const { t } = useLanguage();
-  const valuation = useMarginValuation(profileId, rows.length > 0);
+  const observedValuation = useMarginValuation(profileId, rows.length > 0 && !dataStale);
+  const valuation = dataStale ? undefined : observedValuation;
   const [page, setPage] = useState(1);
   const [expandedPosition, setExpandedPosition] = useState<string | null>(null);
   const groups = useMemo(() => groupPositionRows(rows,valuation), [rows,valuation]);
-  const fundingOverview = usePositionFundingOverview(rows.length > 0, rows.map((row) => row.symbol));
+  const fundingOverview = usePositionFundingOverview(rows.length > 0 && !dataStale, rows.map((row) => row.symbol));
   const portfolioFundingYield = useMemo(
     () => calculatePortfolioFundingYield(rows, fundingOverview, accountMarginBalance, valuation),
     [accountMarginBalance, fundingOverview, rows, valuation],
@@ -126,8 +128,8 @@ export function PositionsTable({ rows, profileId, accountMarginBalance, onClose,
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
             <td>{position.valueAvailable===false?'—':`${formatAmount(position.value)} ${position.quote}`}</td>
             <FundingYieldCell value={calculatePositionFundingYield([position], fundingOverview, valuation)} detail="group" reportedLeverage={position.leverage} t={t} />
-            <td>{compactPrice(position.entryPrice)}</td>
-            <td>{compactPrice(position.markPrice)}</td>
+            <PositionPriceCell rows={[position]} kind="entry" />
+            <PositionPriceCell rows={[position]} kind="mark" />
             <td><AdlIndicators ranks={ranks} /></td>
             <td className={position.unrealizedAvailable===false?'':amountTone(position.unrealizedPnl)}>{pnlText(position.unrealizedAvailable===false?null:position.unrealizedPnl, position.quote)}</td>
             <td>{realizedAmount(position.realizedPnl, position.quote)}</td>
@@ -140,7 +142,6 @@ export function PositionsTable({ rows, profileId, accountMarginBalance, onClose,
         const aggregateQuote = 'USDT';
         const realizedPnl = convertedTotal(group.legs,(_,i)=>group.legs[i].realizedPnl,valuation);
         const fundingFee = convertedTotal(group.legs,(_,i)=>group.legs[i].fundingFee,valuation);
-        const samePriceUnit = group.legs.every(p=>p.quote===group.legs[0].quote);
         const groupFundingYield = calculatePositionFundingYield(group.legs, fundingOverview, valuation);
         return <Fragment key={group.key}>
           <tr className="aggregate-row">
@@ -149,8 +150,10 @@ export function PositionsTable({ rows, profileId, accountMarginBalance, onClose,
             <td>{group.mixedAssets ? '—' : `${group.quantity.toFixed(4)} ${group.asset}`}</td>
             <td>{group.grossNotional===null?'—':`${formatAmount(group.grossNotional)} USDT`}</td>
             <FundingYieldCell value={groupFundingYield} detail="group" t={t} />
-            <td>{group.mixedAssets || !samePriceUnit ? '—' : compactPrice(group.weightedEntryPrice)}</td>
-            <td>{group.mixedAssets || !samePriceUnit ? '—' : compactPrice(group.weightedMarkPrice)}</td>
+            <PositionPriceCell rows={group.legs} kind="entry" mixedAssets={group.mixedAssets} groupLabel={group.label}
+              expanded={expanded} onToggle={() => setExpandedPosition(expanded ? null : group.key)} />
+            <PositionPriceCell rows={group.legs} kind="mark" mixedAssets={group.mixedAssets} groupLabel={group.label}
+              expanded={expanded} onToggle={() => setExpandedPosition(expanded ? null : group.key)} />
             <td>—</td>
             <td className={amountTone(group.unrealizedPnl)}>{pnlText(group.unrealizedPnl, aggregateQuote)}</td>
             <td>{realizedAmount(realizedPnl, aggregateQuote)}</td>
@@ -165,8 +168,8 @@ export function PositionsTable({ rows, profileId, accountMarginBalance, onClose,
             <td>{position.quantity.toFixed(4)} {position.asset}</td>
             <td>{position.valueAvailable===false?'—':`${formatAmount(position.value)} ${position.quote}`}</td>
             <FundingYieldCell value={calculatePositionFundingYield([position], fundingOverview, valuation)} detail="leg" reportedLeverage={position.leverage} t={t} />
-            <td>{compactPrice(position.entryPrice)}</td>
-            <td>{compactPrice(position.markPrice)}</td>
+            <PositionPriceCell rows={[position]} kind="entry" />
+            <PositionPriceCell rows={[position]} kind="mark" />
             <td><AdlIndicators ranks={[{ key: position.id, venue: position.venue, crossExRank: position.crossExAdlRank, exchangeRank: position.exchangeAdlRank }]} /></td>
             <td className={position.unrealizedAvailable===false?'':amountTone(position.unrealizedPnl)}>{pnlText(position.unrealizedAvailable===false?null:position.unrealizedPnl, position.quote)}</td>
             <td>{realizedAmount(position.realizedPnl, position.quote)}</td>

@@ -30,9 +30,8 @@ export function decimal(value: unknown): Decimal | null {
   try { const n = typeof value === 'string' && value.trim() ? new Decimal(value) : null; return n?.isFinite() ? n : null; }
   catch { return null; }
 }
-function readTasks(fees: TransactionFeeStore, profile: string): TradingTask[] {
-  const rows = fees.db.prepare(`SELECT s.id,s.status,s.created_at,s.stopped_at,s.config_json,s.filled_left,s.filled_right,s.open_position,m.state_json
-    FROM execution_strategies s LEFT JOIN managed_positions m ON m.strategy_id=s.id WHERE s.credential_profile_id=?`).all(profile) as TradingTask[];
+export function readTradingTasks(fees: TransactionFeeStore, profile: string): TradingTask[] {
+  const rows = fees.reportTasks(profile);
   return rows.map(row => {
     try { return { ...row, state: stateSchema.parse(row.state_json ? JSON.parse(row.state_json) : {}) }; }
     catch { return { ...row, state: {}, invalidState: true }; }
@@ -111,7 +110,7 @@ function buildGroup(id: string, tasks: TradingTask[], fees: TransactionFeeStore,
 }
 export function tradingGroups(fees: TransactionFeeStore, key: string, profile: string, now: number): TradingGroup[] {
   const groups = new Map<string, TradingTask[]>();
-  for (const task of readTasks(fees, profile)) {
+  for (const task of readTradingTasks(fees, profile)) {
     const id = task.state.groupId ?? task.id; groups.set(id, [...(groups.get(id) ?? []), task]);
   }
   const bindings = fees.bindings(key), trades = fees.trades(key);

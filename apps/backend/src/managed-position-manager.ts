@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { ContinuousProtection } from './continuous-protection.js';
 import { confirmedExitQuantity, ordinaryManagedOrder, ownsManagedExecution, projectedExitHoldings } from './managed-execution-proof.js';
 import { randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
@@ -14,11 +15,12 @@ import { nativeMarketAsset } from './market-asset-aliases.js';
 import { quoteUnavailableReason } from './quote-recovery.js';
 import { managedOrderSizeIssue, managedConstraintsValid, isManagedQuantityIssue, type ManagedSizeIssue } from './managed-position-validation.js';
 import { ManagedAdoption, entryHoldings } from './managed-position-adoption.js';
+import type { ProtectionLaunchAuthorization } from './protection-authority.js';
 import { ManagedReadFailure, recoveryHoldings, recoveryOrder, type ControlledCancellation } from './managed-account-recovery.js';
 import { managedResumeAction, verifyResumableEntry, type ManagedResumeAction } from './managed-position-resume.js';
 import { ManagedEntryProgress } from './managed-entry-progress.js';
 import type { MarginRiskMonitor, MarginLaunchAuthorization } from './margin-risk-monitor.js';
-import { assertMarginHoldings, assertMarginSubmission, marginBatchFills, managedReductionTotals, managedActionPriority, observedHoldings } from './managed-margin-batch.js';
+import { assertMarginHoldings, assertMarginSubmission, marginBatchFills, managedReductionTotals, managedActionPriority, observedHoldings, knownMarginOrder, knownMarginPosition } from './managed-margin-batch.js';
 
 export interface ManagedAccountFacts { positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] }
 export interface ManagedSources {
@@ -40,9 +42,26 @@ const ACCOUNT_READ_TIMEOUT_MS = 8_000;
 
 /** Owns post-entry decisions; never adds exposure and never awaits a fill in the scheduling loop. */
 export class ManagedPositionManager {
+  readonly protection: ContinuousProtection;
   private marginMonitor: MarginRiskMonitor | null = null;
-  private readonly launchAuthorizations = new Map<string, MarginLaunchAuthorization & { controlContext: string }>();
+  private readonly launchAuthorizations = new Map<string, MarginLaunchAuthorization & { controlContext: string; protection: ProtectionLaunchAuthorization }>();
   setMarginMonitor(monitor: MarginRiskMonitor): void { this.marginMonitor = monitor; }
+  normalMarginRecoveryAuthority(): string | null {
+    if (this.stopped || !this.session.liveTradingEnabled || managedHardRiskReason(this.db)) return null;
+    const records = this.runtime.listStrategies().filter(r => r.config.management && r.accountProfileId === this.sources.activeAccount());
+    const current = records.filter(r => !['COMPLETED', 'TRANSFERRED', 'STOPPED'].includes(readManagedState(this.db, r.id)?.phase ?? ''));
+    if (current.some(r => {
+      const state = readManagedState(this.db, r.id);
+      if (r.status !== 'RUNNING' || !state?.verified || state.stopIntent || state.exitRequested || state.protectionIncident
+        || state.pauseAfterProtection || !['MONITORING', 'BALANCING'].includes(state.phase)) return true;
+      const claims = this.db.prepare('SELECT symbol FROM managed_position_claims WHERE strategy_id=? AND account_id=?')
+        .all(r.id, r.accountProfileId) as Array<{ symbol: string }>;
+      return claims.length !== 2 || !managedLegs(r.config).every(l => claims.some(c => c.symbol === l.symbol));
+    })) return null;
+    const controls = records.map(r => { const s = readManagedState(this.db, r.id);
+      return [r.id, r.config, s?.stopIntent, s?.exitRequested, s?.phase === 'TRANSFERRED']; }).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    return JSON.stringify([this.readContext(), this.protection.authority.epoch(), this.protection.authority.grant(), controls]);
+  }
   private marginFacts: ((facts: ManagedAccountFacts) => void) | null = null;
   setMarginFacts(listener: (facts: ManagedAccountFacts) => void): void { this.marginFacts = listener; }
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -123,7 +142,15 @@ export class ManagedPositionManager {
     this.now = sources.now ?? Date.now;
     this.entryProgress = new ManagedEntryProgress(db, runtime, sources.activeAccount, this.now);
     this.adoption = new ManagedAdoption(db, runtime, managedLegs);
+    this.protection = new ContinuousProtection(db, session, runtime, {
+      profile: sources.activeAccount, version: () => `${this.readContext()}:${this.revision}`,
+      stopped: () => this.stopped, read: () => this.facts(true), margin: () => this.marginMonitor,
+      publish: facts => this.marginFacts?.(facts), freeze: reason => this.failAll(reason),
+      evaluate: (record, facts, at) => this.evaluate(record, facts, at),
+      quotes: record => { for (const leg of managedLegs(record.config)) this.markets.ensureMarket?.(leg.symbol); },
+    }, this.now);
     this.unsubscribers.push(session.subscribe(() => {
+      this.marginMonitor?.invalidateNormalRecovery();
       this.controlEpoch += 1; this.revision += 1; this.abortReads(); this.resetConfirmations(); this.clearRecoveryTimer();
       this.entryProgress.clear();
       if (!managedRiskReason(this.db)) this.invalidatedSince = null;
@@ -144,14 +171,14 @@ export class ManagedPositionManager {
           makerOrderId: state.makerOrderId === order.id ? null : state.makerOrderId,
           pendingOrderId: state.pendingOrderId === order.id ? null : state.pendingOrderId });
       }
-      const normal = this.isNormalEntryQuote(order) || this.isOrdinaryExecution(order);
+      const normal = this.isNormalEntryQuote(order) || this.isOrdinaryExecution(order) || this.isKnownMarginExecution(order);
       this.wake(!normal);
       if (normal && order.reduceOnly && new Decimal(order.executedQuantity).gt(0) && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
     this.unsubscribers.push(runtime.onFill((fill) => {
       if (!this.claimed(fill.symbol)) return;
       const order = this.runtime.getOrder(fill.orderId);
-      const normal = this.isOrdinaryExecution(order) || this.isCoveredMonitoringFill(order);
+      const normal = this.isOrdinaryExecution(order) || this.isCoveredMonitoringFill(order) || this.isKnownMarginExecution(order);
       this.wake(!normal);
       if (normal && order.reduceOnly && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
@@ -214,6 +241,7 @@ export class ManagedPositionManager {
         .get(payload.symbol, this.sources.activeAccount()) as { strategy_id: string } | undefined;
       if (!claim) return false;
       const record = this.runtime.getStrategy(claim.strategy_id), state = readManagedState(this.db, record.id), legs = managedLegs(record.config);
+      if (knownMarginPosition(this.db, record, state, this.sources.activeAccount(), legs, payload)) return true;
       if (!ownsManagedExecution(this.db, record, state, this.sources.activeAccount(), legs)) return false;
       const index = legs.findIndex(l => l.symbol === payload.symbol);
       const expected = state!.phase === 'OPENING' && this.runtime.pairedEntryReady(record.id)
@@ -249,6 +277,11 @@ export class ManagedPositionManager {
       return ordinaryManagedOrder(this.db, record, readManagedState(this.db, record.id), order,
         this.sources.activeAccount(), managedLegs(record.config), this.runtime.pairedEntryReady(record.id));
     } catch { return false; }
+  }
+  private isKnownMarginExecution(order: ReturnType<TradingRuntime['getOrder']>): boolean {
+    if (!order.strategyId) return false;
+    const record = this.runtime.getStrategy(order.strategyId);
+    return knownMarginOrder(this.db, record, readManagedState(this.db, record.id), this.sources.activeAccount(), managedLegs(record.config), order);
   }
   private isCoveredMonitoringFill(order: ReturnType<TradingRuntime['getOrder']>): boolean {
     if (!order.strategyId || order.state !== 'FILLED' || order.failureReason
@@ -291,6 +324,14 @@ export class ManagedPositionManager {
     this.wakeTimer.unref?.();
   }
   async tick(): Promise<void> {
+    if (!this.stopped && this.protection.needsTick()) {
+      if (this.inFlight) return this.inFlight;
+      this.inFlight = this.protection.run().finally(() => {
+        this.inFlight = null;
+        if (!this.stopped && this.session.liveTradingEnabled && !managedRiskReason(this.db)) this.wake(false);
+      });
+      return this.inFlight;
+    }
     if (this.stopped || !this.session.liveTradingEnabled || managedHardRiskReason(this.db)) return;
     try {
       this.entryProgress.confirm(); this.checkRecheckDeadline(); this.armRecoveryTimer();
@@ -385,9 +426,9 @@ export class ManagedPositionManager {
       })]);
     } finally { if (timer) clearTimeout(timer); }
   }
-  private async facts(): Promise<ManagedAccountFacts> {
+  private async facts(protectionRead = false): Promise<ManagedAccountFacts> {
     const controller = new AbortController(); this.readControllers.add(controller);
-    const remaining = this.recoveryDeadline();
+    const remaining = protectionRead ? null : this.recoveryDeadline();
     const timeout = Math.min(ACCOUNT_READ_TIMEOUT_MS, remaining === null ? ACCOUNT_READ_TIMEOUT_MS : Math.max(1, remaining - this.now()));
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -555,10 +596,11 @@ export class ManagedPositionManager {
     this.revision += 1;
     let cancelledOldOrders = false;
     try {
+      const protection = this.protection.authority.captureLaunchAuthorization(accountId);
       if (this.marginMonitor) {
         if (!this.marginMonitor.snapshot().fresh) await this.marginMonitor.refresh();
         if (controlContext !== this.readContext()) throw new Error('margin_launch_context_changed');
-        this.launchAuthorizations.set(id, { ...this.marginMonitor.captureLaunchAuthorization(accountId), controlContext });
+        this.launchAuthorizations.set(id, { ...this.marginMonitor.captureLaunchAuthorization(accountId), controlContext, protection });
       }
       // Hold ownership during the bounded quote wait, then read current account facts. No
       // leverage or order mutation is allowed before this read-only preparation completes.
@@ -587,7 +629,7 @@ export class ManagedPositionManager {
     } catch (error) {
       this.abortReservation(id);
       if (cancelledOldOrders) this.failAll('managed_adoption_reconcile_failed');
-      if (error instanceof Error && !(error instanceof TradingRuntimeError) && /^(managed_|margin_)/.test(error.message)) throw new TradingRuntimeError(error.message, 409);
+      if (error instanceof Error && !(error instanceof TradingRuntimeError) && /^(managed_|margin_|protection_)/.test(error.message)) throw new TradingRuntimeError(error.message, 409);
       throw error;
     }
   }
@@ -614,11 +656,13 @@ export class ManagedPositionManager {
           const expected = this.launchAuthorizations.get(id);
           if (!expected) throw new Error('margin_launch_authorization_missing');
           if (expected.controlContext !== this.readContext()) throw new Error('margin_launch_context_changed');
-          this.marginMonitor.authorizeLaunchedGroup(account, id, readManagedState(this.db, id)!.groupId ?? id, expected);
+          const groupId = readManagedState(this.db, id)!.groupId ?? id;
+          this.marginMonitor.authorizeLaunchedGroup(account, id, groupId, expected);
+          this.protection.authority.authorizeLaunchedGroup(expected.accountId, groupId, expected.protection);
         }
       }
       catch (error) {
-        if (error instanceof Error && error.message.startsWith('margin_')) throw new TradingRuntimeError(error.message, 409);
+        if (error instanceof Error && /^(margin_|protection_)/.test(error.message)) throw new TradingRuntimeError(error.message, 409);
         throw error;
       }
     })();
@@ -634,6 +678,7 @@ export class ManagedPositionManager {
     this.wake();
   }
   requestExit(id: string): void {
+    this.marginMonitor?.invalidateNormalRecovery();
     if (!this.session.liveTradingEnabled || managedRiskReason(this.db)) throw new TradingRuntimeError('managed_review_required', 409);
     const state = readManagedState(this.db, id)!;
     const record = this.runtime.getStrategy(id);
@@ -646,6 +691,7 @@ export class ManagedPositionManager {
     this.wake();
   }
   beginStop(id: string, closePositions: boolean): void {
+    this.marginMonitor?.invalidateNormalRecovery();
     const state = readManagedState(this.db, id)!;
     if (this.runtime.getStrategy(id).accountProfileId !== this.sources.activeAccount()) throw new TradingRuntimeError('managed_account_changed', 409);
     if (state.phase === 'TRANSFERRED') throw new TradingRuntimeError('managed_group_transferred', 409);
@@ -774,6 +820,7 @@ export class ManagedPositionManager {
   }
 
   failAll(reason: string): void {
+    this.marginMonitor?.invalidateNormalRecovery();
     this.abortReads(); this.clearRecoveryTimer();
     this.marginMonitor?.blockIncident(reason);
     const current = managedRiskReason(this.db);
@@ -790,7 +837,7 @@ export class ManagedPositionManager {
       if (state) this.save(record.id, { ...state, phase: 'RISK_PAUSED', reason, conditionSince: null });
       this.runtime.addStrategyLog(record.id, 'error', 'Managed risk pause', reason, '—', 'Global pause; reconcile before explicit resume');
     }
-    this.session.set('readonly');
+    this.session.pause();
     this.sources.riskPause();
   }
   private save(id: string, state: ManagedState): void {
@@ -798,6 +845,9 @@ export class ManagedPositionManager {
     if (current?.stopIntent === 'KEEP' && state.stopIntent !== 'KEEP') return;
     if (current && ['STOPPING', 'STOPPED', 'TRANSFERRED'].includes(current.phase) && state.phase !== current.phase) return;
     const exitRequested = state.exitRequested || current?.exitRequested === true;
+    if (this.protection.isEvaluating(id) && current && this.runtime.getStrategy(id).status === 'PAUSED') {
+      state = { ...state, phase: current.phase, conditionSince: current.conditionSince };
+    }
     writeManagedState(this.db, id, { ...state, exitRequested,
       phase: exitRequested && state.phase === 'MONITORING' && managedRiskReason(this.db) !== MANAGED_ACCOUNT_RECHECKING ? 'EXITING' : state.phase,
       pendingOrderIds: this.runtime.listOpenOrders(id).map((o) => o.id) });
@@ -822,7 +872,7 @@ export class ManagedPositionManager {
     const contradictory = facts.openOrders.some((o) => legs.some((l) => l.symbol === o.symbol)
       && ownOrders.some((known) => (known.remote_order_id === o.order_id || known.client_order_id === o.text) && isTerminalOrderState(known.state)));
     if (contradictory) throw new Error('managed_order_state_conflict');
-    if (state.phase === 'OPENING') { await this.evaluateOpening(record, facts, state); return; }
+    if (state.phase === 'OPENING' && !this.protection.isEvaluating(record.id)) { await this.evaluateOpening(record, facts, state); return; }
     if (await this.settlePending(record, state)) return;
     state = readManagedState(this.db, record.id)!;
     if (['STOPPING', 'STOPPED', 'TRANSFERRED', 'COMPLETED'].includes(state.phase)) return;
@@ -861,7 +911,7 @@ export class ManagedPositionManager {
       if (open.length) { await this.cancelMaker(record, state); return; }
       if (facts.openOrders.some((o) => legs.some((l) => l.symbol === o.symbol))) return;
       if (state.marginBatch) this.completeMarginBatch(record, state, quantities);
-      if (state.protectionIncident) { this.failAll(state.protectionIncident.reason); return; }
+      if (state.protectionIncident) { if (!this.protection.isEvaluating(record.id)) this.failAll(state.protectionIncident.reason); return; }
       this.complete(record, readManagedState(this.db, record.id)!); return;
     }
     if (open.some((o) => o.id !== state.makerOrderId)) throw new Error('managed_unexpected_order');
@@ -878,7 +928,7 @@ export class ManagedPositionManager {
       if (new Decimal(quantities[0]).gte(state.marginBatch.before)) throw new Error('margin_reduction_not_effective');
       this.completeMarginBatch(record, state, quantities); return;
     }
-    if (state.pauseAfterProtection) { this.failAll(state.protectionIncident?.reason ?? 'managed_entry_exposure_changed'); return; }
+    if (state.pauseAfterProtection && !this.protection.isEvaluating(record.id)) { this.failAll(state.protectionIncident?.reason ?? 'managed_entry_exposure_changed'); return; }
     if (this.marginMonitor?.snapshot().incidentId) {
       const snapshot = this.marginMonitor.snapshot();
       const covered = snapshot.groups?.some(g => g.strategyId === record.id && g.eligible && g.authorized);
@@ -887,6 +937,7 @@ export class ManagedPositionManager {
       if (snapshot.groups?.some(g => g.eligible && g.authorized) || snapshot.protection?.stage === 'settlement_pending'
         || snapshot.protection?.stage === 'confirming_recovery' || !state.exitRequested) return;
     }
+    if (this.protection.isEvaluating(record.id)) { await this.reduceForMargin(record, state, facts); return; }
     if (state.exitRequested) { this.adoption.abortOwner(record.id); await this.exit(record, state, quantities); return; }
     if (await this.reduceForMargin(record, state, facts)) return;
     this.observe(record, state, legs);
@@ -894,7 +945,7 @@ export class ManagedPositionManager {
   }
 
   private async reduceForMargin(record: StrategyRecord, state: ManagedState, facts: ManagedAccountFacts): Promise<boolean> {
-    if (!this.marginMonitor || !this.session.liveTradingEnabled || managedRiskReason(this.db)) return false;
+    if (!this.marginMonitor || !this.protection.isEvaluating(record.id) && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) return false;
     const legs = managedLegs(record.config), constraints = legs.map((l) => this.constraints(l.symbol));
     if (legs.some((leg) => facts.positions.find((p) => p.symbol === leg.symbol)?.margin_mode !== 'CROSS')) return false;
     // LCM of decimal lot sizes gives a quantity both venues can represent exactly.
@@ -907,7 +958,8 @@ export class ManagedPositionManager {
     const limits = legs.map((leg) => this.db.prepare('SELECT max_market_size FROM crossex_instruments WHERE symbol = ?').get(leg.symbol) as { max_market_size: string | null });
     const max = Decimal.min(...limits.map((l) => l.max_market_size ?? state.leftQuantity!)).toString();
     const quantity = this.db.transaction(() => {
-      const proposed = this.marginMonitor!.planBatch({ ...record, management: state }, facts.positions, this.active(), lot, max);
+      const proposed = this.marginMonitor!.planBatch({ ...record, management: state }, facts.positions,
+        this.protection.isEvaluating(record.id) ? this.protection.records() : this.active(), lot, max);
       if (!proposed) return null;
       for (const leg of legs) this.requireSize(leg, new Decimal(proposed));
       const batch = this.marginMonitor!.preparedBatch(record.id);
@@ -1065,7 +1117,8 @@ export class ManagedPositionManager {
   }
   private async submit(record: StrategyRecord, index: number, quantity: Decimal, maker: boolean,
     purpose: 'paired-first-leg' | 'existing-imbalance', feePhase: 'exit' | 'adjustment' = purpose === 'existing-imbalance' ? 'adjustment' : 'exit'): Promise<void> {
-    if (!this.session.liveTradingEnabled || managedRiskReason(this.db)) return;
+    const protecting = this.protection.isEvaluating(record.id);
+    if (!protecting && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) return;
     if (purpose === 'paired-first-leg' && this.fastPairing.has(record.id)) return;
     const control = this.controlEpoch, context = this.readContext();
     const leg = managedLegs(record.config)[index], side = opposite(leg.side);
@@ -1084,8 +1137,8 @@ export class ManagedPositionManager {
     const wasPairing = pairing();
     const authorize = (excludeOrderId?: string): void => {
         const latestRecord = this.runtime.getStrategy(record.id), latestState = readManagedState(this.db, record.id);
-        if (control !== this.controlEpoch || context !== this.readContext() || !this.session.liveTradingEnabled
-          || latestRecord.status !== 'RUNNING' || latestRecord.accountProfileId !== this.sources.activeAccount()
+        if (control !== this.controlEpoch || context !== this.readContext() || (!protecting && !this.session.liveTradingEnabled)
+          || (!protecting && latestRecord.status !== 'RUNNING') || latestRecord.accountProfileId !== this.sources.activeAccount()
           || latestState?.stopIntent === 'KEEP')
           throw new TradingRuntimeError('managed_review_changed', 409);
         if (batch) {
@@ -1101,10 +1154,13 @@ export class ManagedPositionManager {
           || this.marginMonitor && (!this.marginMonitor.snapshot().fresh || !!this.marginMonitor.snapshot().incidentId)))
           throw new TradingRuntimeError('managed_pairing_evidence_changed', 409);
     };
-    this.revision += 1;
+    if (!protecting) this.revision += 1;
+    const protectionPermit = protecting ? this.protection.permit(record, index, quantity,
+      { symbol: leg.symbol, side, type: 'MARKET', quantity: quantity.toString(), reduceOnly: true }) : undefined;
     const order = await this.bounded(this.runtime.createOrder({ symbol: leg.symbol, side, type: maker ? 'LIMIT' : 'MARKET',
       timeInForce: maker ? 'POC' : 'IOC', quantity: quantity.toString(), reduceOnly: true, ...(price ? { price } : {}) },
     { feePhase, strategyId: record.id, strategyLeg: index === 0 ? 'left' : 'right', strategyClip: batch?.id ? `margin:${batch.id}` : `managed-${this.now()}`,
+      ...(protectionPermit ? { protectionPermit } : {}),
       confirmedPairing: pairing, beforeSubmit: () => authorize(), beforeDispatch: authorize }), 'managed_submission_unknown');
     const state = readManagedState(this.db, record.id)!;
     this.save(record.id, { ...state, phase: maker ? 'EXITING' : 'BALANCING',

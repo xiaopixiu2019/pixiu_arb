@@ -6,3 +6,6 @@
 - [架构与执行机制](architecture.md)
 
 发行范围以对应版本README和实际工件为准。源码、部署成功和真实交易效果是不同证据。
+
+- [托管持仓与持续保护](managed-positions.md)
+- [保证金保护与恢复](margin-risk-management.md)

@@ -27,6 +27,9 @@ export const MarginRiskEventSchema = z.object({ id: z.number(), at: z.number(), 
   evidence: z.object({ metrics: MarginMetricsSchema.nullable(), policy: MarginPolicySchema, effectivePolicy: MarginPolicySchema }).nullable().optional() });
 export type MarginRiskEvent = z.infer<typeof MarginRiskEventSchema>;
 export const MarginSnapshotSchema = z.object({
+  continuousProtection: z.object({ enabled: z.boolean(), state: z.enum(['WATCHING', 'RECONCILING', 'EXECUTING', 'BLOCKED', 'DISABLED']),
+    coverage: z.array(z.object({ groupId: z.string(), strategyId: z.string(), enrolled: z.boolean(), reason: z.string().nullable() })).optional(),
+    groups: z.array(z.object({ strategyId: z.string(), state: z.string(), reason: z.string().nullable(), checkedAt: z.number() })) }).optional(),
   accountId: z.string().nullable(), accountLabel: z.string(), sampledAt: z.number().nullable(), ageMs: z.number().nullable(),
   status: z.enum(['unavailable', 'clear', 'warning', 'reducing', 'recovered', 'blocked']), reason: z.string().nullable(),
   fresh: z.boolean(), entryBlocked: z.boolean(), metrics: MarginMetricsSchema.nullable(),
@@ -45,6 +48,12 @@ export const MarginSnapshotSchema = z.object({
     targetQuantity: z.string().nullable(), apr: z.string().nullable(), fallback: z.boolean(), reason: z.string().nullable() }).nullable().optional(),
 });
 export type MarginSnapshot = z.infer<typeof MarginSnapshotSchema>;
+export const ContinuousProtectionResponseSchema = z.object({
+  accountId: z.string().nullable(),
+  authorization: z.object({ accountId: z.string(), profileId: z.string(), revision: z.number().int(), enabled: z.boolean(), groupIds: z.array(z.string()) }).nullable(),
+  protection: MarginSnapshotSchema.shape.continuousProtection.unwrap(), csrfToken: z.string(),
+});
+export type ContinuousProtectionResponse = z.infer<typeof ContinuousProtectionResponseSchema>;
 export const MarginHistorySchema = z.object({ points: z.array(z.object({ at: z.number(),
   initialPct: z.string().nullable(), maintenancePct: z.string().nullable(),
   initialMin: z.string().nullable(), initialMax: z.string().nullable(),

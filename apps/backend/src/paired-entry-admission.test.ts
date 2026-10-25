@@ -6,7 +6,7 @@ import { MemoryCredentialVault, DEFAULT_CREDENTIAL_PROFILE } from './credential-
 import { TradingSession } from './trading-session.js';
 import { createMarginRiskService } from './margin-risk-service.js';
 import { initialManagedState } from './managed-position-store.js';
-import { readEntryBudget } from './paired-entry-ledger.js';
+import { readEntryBudget, saveEntryBudget } from './paired-entry-ledger.js';
 import { GateApiError, type TradingCrossExGateway, type GateCrossExAccount } from './crossex-client.js';
 import type { ManagedAccountFacts, ManagedPositionManager } from './managed-position-manager.js';
 import type { StrategyEngine } from './strategy-engine.js';
@@ -90,6 +90,18 @@ async function reflectedMaker(h: Awaited<ReturnType<typeof harness>>, balance = 
   h.account.assets[1] = asset('KRAKEN', 'USD', '32', '8');
   await h.monitor.refresh();
 }
+
+it('does not revisit released entry responsibility or build full risk plans on ordinary position observations', async () => {
+  const h=await harness(), budget=readEntryBudget(h.db,'PAIR-TEST')!, key=h.monitor.snapshot().accountId!;
+  h.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id='PAIR-TEST'").run();
+  saveEntryBudget(h.db,'PAIR-TEST',key,h.config,{...budget,released:true});
+  const before=h.db.prepare('SELECT * FROM paired_entry_reservations').all();
+  const snapshot=vi.spyOn(h.monitor,'snapshot'),writes=h.writes.length;
+  h.observe({positions:[],openOrders:[]});
+  expect(snapshot).not.toHaveBeenCalled();
+  expect(h.db.prepare('SELECT * FROM paired_entry_reservations').all()).toEqual(before);
+  expect(h.writes).toHaveLength(writes);
+});
 
 function recordedFee(h: Awaited<ReturnType<typeof harness>>, fee = '0.2', pool = 'KRAKEN') {
   const store = new TransactionFeeStore(h.db), key = createHash('sha256').update('account:synthetic').digest('hex');

@@ -27,6 +27,24 @@ function fixture(){
   return {db,key,service,gateway,queries,fail:()=>{failed=true;},advance:()=>{now+=60000;},change:()=>{profile='b';now+=60000;},wait:(p:Promise<void>)=>{blocked=p;},repeat:()=>{repeat=true;},dense:()=>{dense=true;now=3*86400000;}};
 }
 describe('scoped read-only task accounting collector',()=>{
+  it('detects account switches in the background without making a page query start collection',async()=>{
+    vi.useFakeTimers();const h=fixture(),read=vi.spyOn(h.gateway,'queryAccount');
+    try {
+      h.service.start();await h.service.refresh();expect(read).toHaveBeenCalledTimes(1);
+      h.change();expect((await h.service.summary()).tasks).toEqual([]);expect(read).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);expect(read).toHaveBeenCalledTimes(2);
+      expect((await h.service.summary()).profileId).toBe('b');
+    } finally {await h.service.stop();vi.useRealTimers();}
+  });
+  it('serves ten ordinary queries without history scans, cache writes or gateway requests',async()=>{
+    const h=fixture();await h.service.refresh();
+    const queries=vi.spyOn(h.db,'prepare'), gateway=vi.spyOn(h.gateway,'queryAccount');
+    try {
+      for(let n=0;n<10;n++)await h.service.summary();
+      expect(queries.mock.calls.filter(([sql])=>/task_pnl_book|fee_trades|fee_book|fee_order_bindings|task_pnl_coverage\b|INSERT|UPDATE|DELETE/.test(sql))).toEqual([]);
+      expect(gateway).not.toHaveBeenCalled();
+    } finally {queries.mockRestore();await h.service.stop();}
+  });
   it('does not start a second physical valuation when an aborted gateway ignores cancellation',async()=>{
     const h=fixture();await h.service.refresh();const expired=new AbortController();const spy=vi.spyOn(AbortSignal,'timeout').mockReturnValue(expired.signal);
     const query=vi.fn(()=>new Promise<never>(()=>undefined));h.gateway.queryPositions=query;

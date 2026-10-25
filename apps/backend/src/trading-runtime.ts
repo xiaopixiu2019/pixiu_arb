@@ -16,6 +16,7 @@ import type { TradingSession } from './trading-session.js';
 
 /** Version 1 preserves paired-entry funds, dispatch authority, restart and retention responsibility. */
 export const PAIRED_ENTRY_RESPONSIBILITY_VERSION = 1;
+export const CONTINUOUS_PROTECTION_VERSION = 1;
 
 const decimalText = z.string().regex(/^\d+(?:\.\d+)?$/).refine((value) => new Decimal(value).gt(0));
 /** Premium levels may be negative (an ADR trading at a discount), so sign is allowed. */
@@ -230,6 +231,8 @@ export interface PlaceOrderMetadata {
    * locked ordinary trading. HTTP callers never construct metadata, so they cannot use it.
    */
   riskReducing?: boolean;
+  /** Opaque backend capability. A forged object never authorizes a protection order. */
+  protectionPermit?: object;
   /** Internal synchronous evidence check, after all awaits and before creating a submission. */
   beforeSubmit?: () => void;
   /** Revalidation at actual transport dispatch, after the local order row exists. */
@@ -264,6 +267,8 @@ export interface StrategyMarginPreflight {
 }
 
 export class TradingRuntime {
+  private protectionGuard: ((token: object, input: { symbol: string; side: string; quantity: string; reduceOnly: boolean; type: string }, strategyId?: string, exclude?: string) => void) | null = null;
+  setProtectionGuard(guard: NonNullable<TradingRuntime['protectionGuard']>): void { this.protectionGuard = guard; }
   private pairedEntry: PairedEntryController | null = null;
   private pairedPrivateStreamLive = false;
   setPairedEntry(controller: PairedEntryController): void { this.pairedEntry = controller; controller.stream?.(this.pairedPrivateStreamLive); }
@@ -839,11 +844,16 @@ export class TradingRuntime {
     referencePrice?: string,
   ): Promise<ExecutionOrder> {
     const input = CreateOrderInputSchema.parse(raw);
+    const protection = (exclude?: string): boolean => {
+      if (!metadata?.protectionPermit) return false;
+      if (!this.protectionGuard) throw new TradingRuntimeError('protection_guard_unavailable', 403);
+      this.protectionGuard(metadata.protectionPermit, input, metadata.strategyId, exclude); return true;
+    };
     const confirmedPairing = (exclude?: string) => metadata?.confirmedPairing?.(exclude)
       ?? (input.type === 'MARKET' && !!metadata && this.pairedEntry?.assertOrder(input, metadata, exclude) === true);
-    const managedBlock = managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
+    const managedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
     if (managedBlock) throw new TradingRuntimeError(managedBlock, 409);
-    if (!this.session.liveTradingEnabled && !metadata?.riskReducing) {
+    if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection()) {
       throw new TradingRuntimeError('live_trading_locked', 403);
     }
     const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
@@ -889,9 +899,9 @@ export class TradingRuntime {
     }
     // Recheck after credential/preflight awaits: a manager may have claimed this symbol or
     // raised a global risk lock while the ordinary order was preparing.
-    const finalManagedBlock = managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
+    const finalManagedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
     if (finalManagedBlock) throw new TradingRuntimeError(finalManagedBlock, 409);
-    if (!this.session.liveTradingEnabled && !metadata?.riskReducing) throw new TradingRuntimeError('live_trading_locked', 403);
+    if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection()) throw new TradingRuntimeError('live_trading_locked', 403);
     let releaseAdmission: void | (() => void) = undefined;
     const pairedAdmission = metadata ? this.pairedEntry?.assertOrder(input, metadata) === true : false;
     if (!input.reduceOnly && this.marginAdmission && !pairedAdmission) {
@@ -930,9 +940,9 @@ export class TradingRuntime {
     let accepted;
     try {
       accepted = await tradingGateway.createOrder(credentials, gateInput, () => {
-        const block = managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(id));
+        const block = protection(id) ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(id));
         if (block) throw new TradingRuntimeError(block, 409);
-        if (!this.session.liveTradingEnabled && !metadata?.riskReducing) throw new TradingRuntimeError('live_trading_locked', 403);
+        if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection(id)) throw new TradingRuntimeError('live_trading_locked', 403);
         metadata?.beforeDispatch?.(id);
         if (pairedAdmission && metadata) this.pairedEntry!.assertOrder(input, metadata, id);
       });

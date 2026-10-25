@@ -17,7 +17,11 @@ export function seedPairedPerformanceHistory(db: Database.Database): void {
     VALUES(?,?,?,'live',?,?,?,?,?,'0.01',?,?,? ,?,?,?, ?,?,?)`);
   const fill = db.prepare(`INSERT INTO execution_fills(id,order_id,symbol,venue,side,quantity,price,fee,realized_pnl,created_at,fee_coin)
     VALUES(?,?,?,?,?,'0.01',?,'0.00001',?,?,'USDT')`);
-  db.transaction(() => {
+  // Large synthetic setup otherwise spills trigger statement journals to Windows temp files.
+  // Restore the production setting before the measured hedge path; its 500 ms bound is unchanged.
+  const tempStore = db.pragma('temp_store', { simple: true }) as number;
+  db.pragma('temp_store=MEMORY');
+  try { db.transaction(() => {
     for (let i = 0; i < PAIRED_PERFORMANCE_SCALE.historicalTasks; i++) task.run(`HISTORY-${i}`, 'COMPLETED', JSON.stringify(config), at, at);
     for (let i = 0; i < PAIRED_PERFORMANCE_SCALE.historicalOrders; i++) {
       const executed = i < PAIRED_PERFORMANCE_SCALE.historicalFills, phase = i % 4, left = phase % 2 === 0;
@@ -38,5 +42,5 @@ export function seedPairedPerformanceHistory(db: Database.Database): void {
       for (const symbol of [`${leftVenue}_FUTURE_${asset}_USDC`, `KRAKEN_FUTURE_${asset}_USD`])
         db.prepare('INSERT INTO managed_position_claims VALUES(?,?,?)').run(symbol, 'account-1', id);
     }
-  })();
+  })(); } finally { db.pragma(`temp_store=${tempStore}`); }
 }

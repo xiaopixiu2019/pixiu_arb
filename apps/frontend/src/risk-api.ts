@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { MarginSnapshotSchema, MarginPolicySchema, MarginRiskEventSchema, TelegramStatusSchema, type MarginPolicy } from '@gate-crossex/shared-types';
+import { ContinuousProtectionResponseSchema, MarginSnapshotSchema, MarginPolicySchema, MarginRiskEventSchema, TelegramStatusSchema, type MarginPolicy } from '@gate-crossex/shared-types';
 
 async function read<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, signal: AbortSignal.timeout(15000),
@@ -12,6 +12,14 @@ async function read<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): 
   return schema.parse(payload);
 }
 export const riskApi = {
+  protection: () => read('/api/risk/protection', ContinuousProtectionResponseSchema),
+  saveProtection: async (accountId: string, revision: number, groupIds: string[], enabled: boolean) => {
+    const current = await riskApi.protection();
+    if (current.accountId !== accountId || (current.authorization?.revision ?? 0) !== revision) throw new Error('protection_configuration_changed');
+    return read('/api/risk/protection', ContinuousProtectionResponseSchema, { method: 'PUT',
+      headers: { 'x-gct-risk-intent': 'configure-protection' },
+      body: JSON.stringify({ accountId, revision, groupIds, enabled, acknowledge: true, csrfToken: current.csrfToken }) });
+  },
   modes: (symbols: string[]) => read(`/api/risk/margin/modes?symbols=${encodeURIComponent(symbols.join(','))}`,
     z.object({ profileId: z.string().nullable(), items: z.array(z.object({ symbol: z.string(), supportCross: z.boolean().nullable(),
       mode: z.enum(['CROSS', 'ISOLATED']).nullable(), checkedAt: z.number(), reason: z.string().nullable() })) })),

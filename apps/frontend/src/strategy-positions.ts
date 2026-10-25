@@ -18,6 +18,7 @@ export interface PositionTableRow {
   quantity: number;
   rawQuantity?: string;
   rawEntryPrice?: string;
+  rawMarkPrice?: string;
   value: number;
   initialMargin?: number | null;
   entryPrice: number;
@@ -80,7 +81,7 @@ function portfolioRows(portfolio: AuthenticatedPortfolioSnapshot): StrategyPosit
         asset: symbol.asset,
         quote: symbol.quote,
         side: position.positionSide.toUpperCase() === 'SHORT' || quantity < 0 ? 'Short' : 'Long',
-        quantity, rawQuantity: position.quantity, rawEntryPrice: position.entryPrice,
+        quantity, rawQuantity: position.quantity, rawEntryPrice: position.entryPrice, rawMarkPrice: position.markPrice,
         value: reportedValue > 0 ? reportedValue : Math.abs(quantity * markPrice),
         initialMargin: parseNumber(position.initialMargin),
         entryPrice: parseNumber(position.entryPrice) ?? 0,
@@ -133,7 +134,7 @@ export function prepareExecutionPositionRows(
         asset: symbol.asset,
         quote: symbol.quote,
         side: quantity < 0 ? 'Short' : 'Long',
-        quantity, rawQuantity: position.quantity, rawEntryPrice: position.entry_price,
+        quantity, rawQuantity: position.quantity, rawEntryPrice: position.entry_price, rawMarkPrice: position.mark_price,
         value: Math.abs(quantity * markPrice),
         initialMargin: parseNumber(marginPosition?.initialMargin),
         entryPrice,
@@ -165,8 +166,12 @@ function marketKey(row: StrategyPositionRow): string {
 export function prepareStrategyPositions(
   portfolio: AuthenticatedPortfolioSnapshot | null,
   tradingSnapshot: TradingSnapshot | null = null,
+  options: { retainStalePortfolio?: boolean } = {},
 ): StrategyPositionsView {
   const portfolioFresh = portfolio?.dataStatus === 'fresh' && portfolio.remoteStatus === 'healthy';
+  if (!portfolioFresh && options.retainStalePortfolio) return portfolio
+    ? { status: 'stale', rows: portfolioRows(portfolio).sort((a, b) => b.value - a.value) }
+    : { status: 'unavailable', rows: [] };
   if (!tradingSnapshot && !portfolio) return { status: 'unavailable', rows: [] };
   if (!tradingSnapshot && !portfolioFresh) return { status: 'stale', rows: [] };
 

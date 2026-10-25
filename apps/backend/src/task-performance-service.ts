@@ -6,10 +6,12 @@ import type { GateCrossExPosition, ReadOnlyCrossExGateway, PortfolioOperationsCr
 import { readAllPages } from './performance-ledger.js';
 import { TransactionFeeStore } from './transaction-fee-store.js';
 import { TaskPerformanceStore } from './task-performance-store.js';
-import { taskPerformanceReport } from './task-performance-report.js';
-import { taskTradingReport, type TradingValuation } from './task-trading-report.js';
+import type { TradingValuation } from './task-trading-report.js';
+import { TaskPerformanceProjection } from './task-performance-projection.js';
 import { TaskPerformanceCache, retainTradingResults } from './task-performance-cache.js';
 import { decimal } from './task-trading-groups.js';
+import { TaskPerformanceWorker } from './task-performance-worker-client.js';
+import { setImmediate as yieldTurn } from 'node:timers/promises';
 interface Options {
   database: Database.Database; gateway: ReadOnlyCrossExGateway; vault: CredentialVault;
   profile(): string | null; context(): string; now?: () => number; valuation?(): TradingValuation | undefined;
@@ -35,8 +37,6 @@ export class TaskPerformanceService {
   private stopped = false;
   private key: string | null = null;
   private scope: string | null = null;
-  private attemptedScope: string | null = null;
-  private attemptedAt = 0;
   private failure: string | null = 'task_collecting';
   private recheck = 0;
   private previous: TaskPerformanceSummary | null = null;
@@ -45,26 +45,39 @@ export class TaskPerformanceService {
   private physicalValuation: Promise<void> | null = null;
   private valuationController: AbortController | null = null;
   private valuationAttemptAt = -Infinity;
+  private projection: TaskPerformanceProjection | null = null;
+  private projectionTimer: ReturnType<typeof setInterval> | null = null;
+  private projectionPending: Promise<void> | null = null;
+  private projectionFailure: string | null = null;
+  private readonly projectionWorker: TaskPerformanceWorker | null;
+  private identityAttemptScope: string | null = null;
+  private identityAttemptAt = -Infinity;
   constructor(private readonly o: Options) {
     this.store = new TaskPerformanceStore(o.database); this.cache = new TaskPerformanceCache(o.database); this.now = o.now ?? Date.now;
+    this.projectionWorker = o.database.name === ':memory:' ? null : new TaskPerformanceWorker(o.database.name);
   }
   start(): void {
+    this.projectionTimer ??= setInterval(() => { void this.updateProjection(); }, 1000);
+    this.projectionTimer.unref?.();
     const tick = () => { if (!this.stopped) void this.refresh().finally(() => {
       if (!this.stopped) { this.timer = setTimeout(tick, 60000); this.timer.unref?.(); }
     }); }; tick();
   }
   async stop(): Promise<void> {
     this.stopped = true; if (this.timer) clearTimeout(this.timer); this.controller?.abort(); this.valuationController?.abort();
-    await Promise.all([this.pending, this.valuationPending]);
+    if (this.projectionTimer) clearInterval(this.projectionTimer); this.projectionTimer = null;
+    await this.projectionWorker?.stop();
+    await Promise.all([this.pending, this.valuationPending, this.projectionPending]);
   }
   private assert(scope: string, signal: AbortSignal): void {
     signal.throwIfAborted(); if (this.stopped || scope !== this.o.context()) throw new Error('account_changed');
   }
-  private invalidate(): void { this.key = null; this.scope = null; this.previous = null; this.valuation = undefined; }
+  private invalidate(): void { this.key = null; this.scope = null; this.previous = null; this.valuation = undefined; this.projection = null; this.projectionFailure = null; }
   async refresh(): Promise<void> {
     if (this.pending) return this.pending; if (this.stopped || this.physicalCapture) return;
     const scope = this.o.context(); if (this.scope !== scope) this.invalidate();
-    this.attemptedScope = scope; this.attemptedAt = this.now(); this.controller = new AbortController();
+    this.identityAttemptScope=scope;this.identityAttemptAt=this.now();
+    this.controller = new AbortController();
     const signal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(30000)]);
     let abort!: () => void;
     const interrupted = new Promise<void>((_, reject) => { abort = () => reject(signal.reason); signal.addEventListener('abort', abort, { once: true }); });
@@ -79,23 +92,50 @@ export class TaskPerformanceService {
   }
   async summary(): Promise<TaskPerformanceSummary> {
     const scope = this.o.context(); if (this.scope !== scope) this.invalidate();
-    if (!this.stopped && (scope !== this.attemptedScope || this.now() - this.attemptedAt >= 60000)) void this.refresh();
     const contextToken = createHash('sha256').update(`${this.boot}:${scope}:${this.key ?? 'unverified'}`).digest('hex');
     if (!this.key || this.scope !== scope) return { profileId: this.o.profile(), contextToken, checkedAt: null, reason: this.failure,
       stale: true, tasks: [], unallocated: { amount: null, native: {}, count: 0 } };
     const supplied = this.o.valuation?.();
     if (supplied?.profileId === this.o.profile() && supplied!.at > (this.valuation?.at ?? 0)) this.valuation = supplied;
     try {
-      const report = taskPerformanceReport(this.store, this.key, this.o.profile()!, this.now(), this.failure);
-      const trading = taskTradingReport(this.store, this.key, this.o.profile()!, this.now(), this.valuation);
-      if (Object.values(trading.results).some(t => t.valuationAt !== null || t.reasons.includes('valuation_pending'))) this.scheduleValuation(scope);
-      const next = retainTradingResults({ ...report, contextToken, stale: this.failure !== null, accountCosts: trading.accountCosts, unresolvedCashflows: trading.unresolvedCashflows,
-        tasks: report.tasks.map(t => ({ ...t, trading: trading.results[t.taskId] })) }, this.previous);
-      this.previous = next; this.cache.save(this.key, this.o.profile()!, next); return next;
+      const report = this.projection?.summary(this.now(), this.failure ?? this.projectionFailure, this.valuation);
+      if (!report) return this.previous ? { ...this.previous, contextToken, stale: true, reason: this.projectionFailure ?? this.failure ?? 'task_collecting' }
+        : { profileId: this.o.profile(), contextToken, checkedAt: null, stale: true, reason: this.projectionFailure ?? this.failure ?? 'task_collecting', tasks: [], unallocated: { amount: null, native: {}, count: 0 } };
+      return retainTradingResults({ ...report, contextToken }, this.previous);
     } catch {
       return this.previous ? { ...this.previous, contextToken, stale: true, reason: 'task_data_unavailable' }
         : { profileId: this.o.profile(), contextToken, checkedAt: null, stale: true, reason: 'task_data_unavailable', tasks: [], unallocated: { amount: null, native: {}, count: 0 } };
     }
+  }
+  private updateProjection(captureComplete = false): Promise<void> {
+    if (this.projectionPending) return this.projectionPending;
+    if(this.stopped)return Promise.resolve();
+    const context=this.o.context();
+    if(context!==this.scope){
+      this.invalidate();
+      if(context!==this.identityAttemptScope||this.now()-this.identityAttemptAt>=60000)void this.refresh();
+      return Promise.resolve();
+    }
+    const key = this.key, scope = this.scope, projection = this.projection;
+    if (!key || !scope || !projection || this.stopped || scope !== this.o.context()) return Promise.resolve();
+    if (this.physicalCapture && !captureComplete || !new TransactionFeeStore(this.o.database).epoch(key)) return Promise.resolve();
+    const valid = () => !this.stopped && key === this.key && scope === this.o.context();
+    this.projectionPending = (async () => {
+      if (this.projectionWorker) {
+        await this.projectionWorker.update(key,this.o.profile()!,this.now()); if (!valid()) return;
+        projection.reload(); // Also reconciles a committed publication whose prior worker reply was lost.
+      } else await projection.update(this.now(), valid);
+      if (!valid()) return;
+      this.projectionFailure = null;
+      const supplied = this.o.valuation?.();
+      if (supplied?.profileId === this.o.profile() && supplied.at > (this.valuation?.at ?? 0)) this.valuation = supplied;
+      const report = projection.summary(this.now(), this.failure, this.valuation); if (!report) return;
+      if (report.tasks.some(t => t.trading?.valuationAt != null || t.trading?.reasons.includes('valuation_pending'))) this.scheduleValuation(scope);
+      const next = retainTradingResults(report, this.previous);
+      this.cache.save(key, this.o.profile()!, next); this.previous = next;
+    })().catch(() => { if (valid()) this.projectionFailure = 'task_data_unavailable'; })
+      .finally(() => { this.projectionPending = null; });
+    return this.projectionPending;
   }
   private async capture(scope: string, signal: AbortSignal): Promise<void> {
     const profile = this.o.profile(), credentials = await this.o.vault.get(DEFAULT_CREDENTIAL_PROFILE); this.assert(scope, signal);
@@ -103,12 +143,13 @@ export class TaskPerformanceService {
     const account = await this.o.gateway.queryAccount(credentials, undefined, signal); this.assert(scope, signal);
     if (!account.user_id) throw new Error('identity_unverified');
     const key = createHash('sha256').update(`${profile}:${account.user_id}`).digest('hex');
-    if (key !== this.key) { this.previous = this.cache.read(key, profile); this.valuation = undefined; }
+    if (key !== this.key) { this.previous = this.cache.read(key, profile); this.valuation = undefined;
+      this.projection = new TaskPerformanceProjection(this.o.database, key, profile, undefined, this.projectionWorker !== null); }
     this.key = key; this.scope = scope;
     const fees = new TransactionFeeStore(this.o.database), epoch = fees.epoch(key);
     if (!epoch) { this.failure = 'task_collecting'; return; }
     const at = this.now(), earliest = Math.max(epoch.started_at, Math.min(at, ...fees.tasks(profile).map(t => Date.parse(t.created_at)).filter(Number.isFinite)));
-    const through = this.store.through(key, earliest);
+    const through = this.store.knownThrough(key, earliest);
     const historical = through < at - HOUR ? through : earliest + (this.recheck++ % Math.max(1, Math.ceil((at - earliest) / (24 * HOUR)))) * 24 * HOUR;
     const windows = [{ from: Math.max(earliest, at - HOUR), to: at }, { from: Math.max(earliest, historical - 60000), to: Math.min(at, historical + 24 * HOUR) }];
     let failed = false;
@@ -117,6 +158,7 @@ export class TaskPerformanceService {
       catch (error) { this.assert(scope, signal); if (denied(error)) throw error; failed = true; }
     }
     this.assert(scope, signal); this.failure = failed ? 'task_data_unavailable' : null;
+    await this.updateProjection(true); this.assert(scope, signal);
   }
   private async captureWindow(credentials: GateCredentials, key: string, scope: string, window: { from: number; to: number }, signal: AbortSignal): Promise<void> {
     const gateway = this.o.gateway as ReadOnlyCrossExGateway & Partial<PortfolioOperationsCrossExGateway>;
@@ -135,7 +177,11 @@ export class TaskPerformanceService {
         new TransactionFeeStore(this.o.database).rates(key, this.now(), rates);
       } catch { this.assert(scope, signal); }
     }
-    this.store.save(key, captured.records, captured.window.from, captured.window.to);
+    for (let i=0;i<captured.records.length;i+=200) {
+      this.assert(scope,signal);this.store.save(key,captured.records.slice(i,i+200),captured.window.from,captured.window.to,false);
+      await yieldTurn();
+    }
+    this.assert(scope,signal);this.store.save(key,[],captured.window.from,captured.window.to);
   }
   private scheduleValuation(scope: string): void {
     if (this.stopped || this.valuationPending || this.physicalValuation || this.now() - this.valuationAttemptAt < 5000 || this.valuation && this.now() - this.valuation.at < 5000) return;

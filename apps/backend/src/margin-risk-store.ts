@@ -42,6 +42,8 @@ export class MarginRiskStore {
   }
   reservedCost(key: string): string { return this.pendingCosts(key).reduce((s, r) => s.plus(r.amount), new Decimal(0)).toString(); }
   private row(key: string): Row {
+    const existing = this.db.prepare('SELECT * FROM margin_risk_accounts WHERE account_key = ?').get(key) as Row | undefined;
+    if (existing) return existing;
     this.db.prepare('INSERT OR IGNORE INTO margin_risk_accounts(account_key, policy_json) VALUES (?, ?)')
       .run(key, JSON.stringify(MarginPolicySchema.parse({})));
     return this.db.prepare('SELECT * FROM margin_risk_accounts WHERE account_key = ?').get(key) as Row;
