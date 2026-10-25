@@ -9,6 +9,13 @@ const snapshot = () => MarginSnapshotSchema.parse({ accountId: 'a', accountLabel
   policy: {}, effectivePolicy: {}, groups: [], uncoveredSymbols: [] });
 
 describe('risk page evidence and human-readable meaning', () => {
+  it('discloses reconciling continuous protection without claiming paused ordinary trading resumed', () => {
+    const s = snapshot();
+    const next = { ...s, liveEnabled: false, continuousProtection: { enabled: true, state: 'RECONCILING' as const, groups: [] } };
+    expect(protectionCopy(next, true, true).title).toContain('持续保护正在核对');
+    expect(protectionCopy(next, true, true).title).not.toContain('未启用实盘');
+    expect(protectionCopy(next, false, true).title).toContain('待核实');
+  });
   it('never converts missing or invalid financial data into zero', () => {
     for (const value of [null, undefined, '', 'NaN', 'Infinity', ' ']) expect(riskAmount(value)).toBe('—');
     expect(riskAmount('0')).toBe('0');
@@ -26,6 +33,8 @@ describe('risk page evidence and human-readable meaning', () => {
   });
   it('separates recovery from permission to enter and execution from triggering', () => {
     expect(riskEventCopy('recovered', true).action).toContain('增仓仍锁定');
+    expect(riskEventCopy('entry_auto_recovered', true)).toMatchObject({ label: '已恢复', tone: 'green' });
+    expect(riskEventCopy('entry_auto_recovered', true).action).toContain('继续监控剩余仓位');
     expect(riskEventCopy('reduction_triggered', true).action).toContain('等待');
     expect(riskEventCopy('entry_reviewed', true).action).toContain('其他');
     expect(riskEventCopy('clear', true).title).toBe('本次检查未触发预警');

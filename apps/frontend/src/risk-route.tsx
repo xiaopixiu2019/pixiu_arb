@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { ContinuousProtectionSettings } from './risk-continuous-protection.js';
 import { type MarginSnapshot } from '@gate-crossex/shared-types';
 import { useLanguage } from './i18n.js';
 import { riskApi } from './risk-api.js';
@@ -38,6 +39,7 @@ function RiskWorkspace({ snapshot, onSnapshot, tasks }: Props) {
     <ExecutionNotice snapshot={snapshot} fresh={fresh} tasks={tasks} zh={zh} />
     <RiskStatus snapshot={snapshot} fresh={fresh} zh={zh} onSaved={accept} />
     <RiskMetrics snapshot={snapshot} fresh={fresh} zh={zh} />
+    {snapshot && <ContinuousProtectionSettings key={snapshot.accountId} snapshot={snapshot} zh={zh} />}
     {snapshot?.protection && <MarginProtectionStatus snapshot={snapshot} />}
     <div className="risk-workspace-grid"><RiskEvents key={accountId} accountId={accountId} /><ProtectionSummary snapshot={snapshot} fresh={fresh} zh={zh} onSettings={openSettings} /></div>
     {snapshot && <RiskSettings snapshot={snapshot} onSaved={accept} fresh={fresh} open={settings} onToggle={setSettings} />}
@@ -55,6 +57,7 @@ function ExecutionNotice({ snapshot, fresh, tasks, zh }: { snapshot: MarginSnaps
   return <section className="risk-execution-notice" data-state={execution.state} role={unknown ? 'status' : 'alert'}>
     <h2>{title}</h2>
     <p>{unknown ? (zh ? '等待新鲜账户证据，不能据旧状态判断保护已恢复。' : 'Await fresh account evidence; previous state cannot confirm restored protection.')
+      : snapshot?.continuousProtection?.enabled ? (zh ? '普通策略保持暂停；已授权的账户保护独立核对并按条件减仓，详见持续保护状态。' : 'Ordinary strategies remain paused. Authorized account protection reconciles independently; inspect its current state below.')
       : execution.locked ? (zh ? '自动下单与自动减仓已停止；保证金数据正常不代表任务正在执行。' : 'Automatic orders and reductions are stopped. Healthy margin does not mean tasks are executing.')
         : (zh ? '实盘模式已启用，但这些暂停任务的自动执行尚未恢复。请逐一核对任务。' : 'Live mode is enabled, but these paused tasks have not resumed. Review each task.')}</p>
     {!!execution.paused.length && <ul>{execution.paused.map(task => <li key={task.id}><strong>{task.asset} · {task.id}</strong> — {task.reason ? riskReason(task.reason, zh) : (zh ? '请在任务详情核实暂停原因' : 'Inspect task details for the pause reason')}</li>)}</ul>}
@@ -68,12 +71,13 @@ const statusLabels = {
 };
 function RiskStatus({ snapshot, fresh, zh, onSaved }: { snapshot: MarginSnapshot | null; fresh: boolean; zh: boolean; onSaved: Props['onSnapshot'] }) {
   const status = fresh && snapshot ? snapshot.status : 'unavailable';
+  const confirming = status === 'reducing' && snapshot?.protection?.stage === 'confirming_recovery';
   const detail = !fresh ? (zh ? '数据不可用或已过期；下方旧值仅供参考。' : 'Data unavailable or stale; previous values below are reference only.')
     : snapshot?.reason ? riskReason(snapshot.reason, zh) : status === 'clear' ? (zh ? '这里只反映保证金状态；任务执行情况请查看执行提示与任务详情。' : 'This describes margin only. See execution notices and task details for trading status.')
       : status === 'recovered' ? (zh ? '停止继续减仓不代表恢复交易。复核后只解除保证金增仓锁。' : 'Stopping reduction does not restore trading. Review clears only the margin entry lock.')
         : (zh ? '系统持续核对账户与订单；处理进度和原因会在下方显示。' : 'The system continues to reconcile account and orders; progress and reasons are shown below.');
   return <section className={`risk-status ${status}`} aria-label={zh ? '当前风险状态' : 'Current risk status'}><div className="risk-status-icon" aria-hidden="true">◇</div>
-    <div className="risk-status-copy"><h2>{statusLabels[status][zh ? 0 : 1]}</h2><p>{detail}</p>
+    <div className="risk-status-copy"><h2>{confirming ? (zh ? '保证金恢复核对中' : 'Verifying margin recovery') : statusLabels[status][zh ? 0 : 1]}</h2><p>{detail}</p>
       {!!snapshot?.costAccounting?.pendingBatches && <p>{zh ? '费用明细待对账，已预留约 ' : 'Fee details pending; reserved approximately '}{amount(snapshot.costAccounting.reserved)} USDT</p>}
       {snapshot && ['recovered', 'blocked'].includes(status) && <EntryReview key={`${snapshot.incidentId}:${snapshot.status}:${snapshot.reason}`} snapshot={snapshot} fresh={fresh} zh={zh} onSaved={onSaved} />}</div>
     <div className="risk-health"><span>{zh ? '新增仓位' : 'New exposure'}</span><strong>{!fresh || snapshot?.entryBlocked ? (zh ? '已阻止' : 'Blocked') : !snapshot?.liveEnabled ? (zh ? '实盘锁定' : 'Trading locked') : snapshot.groups.some(g => ['RISK_PAUSED', 'PAUSED'].includes(g.phase)) ? (zh ? '按任务限制' : 'Task restrictions apply') : (zh ? '逐单校验' : 'Checked per order')}</strong><small>{fresh ? (zh ? '数据有效' : 'Fresh data') : (zh ? '等待有效数据' : 'Awaiting data')}</small></div>
@@ -106,7 +110,7 @@ function ProtectionSummary({ snapshot, fresh, zh, onSettings }: { snapshot: Marg
   return <aside className="risk-panel risk-sidebar"><h2>{zh ? '保护与通知' : 'Protection and notifications'}</h2><p className="risk-caption">{zh ? '保护范围、规则和通知，一处查看。' : 'Scope, rules and delivery in one place.'}</p>
     <div className="risk-side-item"><div className="risk-section-heading"><h3>{zh ? '自动减仓范围' : 'Automatic reduction scope'}</h3><button disabled={!snapshot} className="risk-text-button" onClick={onSettings}>{zh ? '管理 ›' : 'Manage ›'}</button></div>
       <strong className={`risk-scope-status ${copy.tone}`}>{copy.title}</strong><p>{copy.detail}</p>
-      <p>{snapshot ? snapshot.liveEnabled ? (zh ? '实盘权限已启用' : 'Live permission enabled') : (zh ? '无实盘权限，不执行自动减仓' : 'Trading locked · no automatic reduction') : (zh ? '实盘权限待核实' : 'Live permission unverified')}</p>
+      <p>{snapshot ? snapshot.liveEnabled ? (zh ? '实盘权限已启用' : 'Live permission enabled') : snapshot.continuousProtection?.enabled ? (zh ? '普通交易锁定；持续保护按独立授权执行' : 'Ordinary trading locked; continuous protection has separate authority') : (zh ? '无实盘权限，不执行自动减仓' : 'Trading locked · no automatic reduction') : (zh ? '实盘权限待核实' : 'Live permission unverified')}</p>
       {!!snapshot?.uncoveredSymbols.length && <details><summary>{zh ? `${snapshot.uncoveredSymbols.length} 个合约未被运行中的托管组覆盖` : `${snapshot.uncoveredSymbols.length} contracts outside active managed coverage`}</summary><p>{snapshot.uncoveredSymbols.join(', ')}</p></details>}
       {!!debts.length && <p className="risk-inline-warning">{zh ? '存在币种负债，相关组可能无法形成减仓计划。请查看账户明细。' : 'Currency liabilities may prevent reduction plans for affected groups. Inspect account details.'}</p>}</div>
     <div className="risk-side-item"><div className="risk-section-heading"><h3>{zh ? '保护阈值' : 'Protection thresholds'}</h3><button disabled={!snapshot} className="risk-text-button" onClick={onSettings}>{zh ? '设置 ›' : 'Settings ›'}</button></div>

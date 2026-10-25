@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import type WebSocketDefault from 'ws';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,9 @@ import { GateApiError, type CrossExOrderRequest, type GateCrossExAccount, type G
 import { openDatabase } from './database.js';
 import { CrossExMarketHub } from './market-hub.js';
 import { TradingSession } from './trading-session.js';
+import { ContinuousProtection } from './continuous-protection.js';
+import { MarginRiskMonitor } from './margin-risk-monitor.js';
+import { MarginSnapshotSchema } from '@gate-crossex/shared-types';
 
 const accountFixture: GateCrossExAccount = {
   available_margin: '1200',
@@ -507,6 +510,60 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('sends protection completion through the real stream and releases disconnected subscribers', async () => {
+    const callbacks = new Set<() => void>();
+    const subscription = vi.spyOn(ContinuousProtection.prototype, 'subscribeCompletion').mockImplementation(listener => {
+      callbacks.add(listener); return () => { callbacks.delete(listener); };
+    });
+    const { app, gateway } = await createTestApp();
+    let current = MarginSnapshotSchema.parse({ accountId: 'synthetic-a', accountLabel: 'Synthetic', fresh: false,
+      sampledAt: Date.now() - 6000, ageMs: 6000, status: 'unavailable', reason: 'margin_data_stale', entryBlocked: true,
+      liveEnabled: false, incidentId: null, metrics: null, policy: {}, effectivePolicy: {}, groups: [], uncoveredSymbols: [],
+      continuousProtection: { enabled: true, state: 'RECONCILING', groups: [] } });
+    const snapshot = vi.spyOn(MarginRiskMonitor.prototype, 'snapshot').mockImplementation(() => current);
+    const refresh = vi.spyOn(MarginRiskMonitor.prototype, 'refresh');
+    const clients: WebSocketDefault[] = [];
+    try {
+      const address = await app.listen({ host: '127.0.0.1', port: 0 });
+      const client = new WebSocket(address.replace('http:', 'ws:') + '/ws/stream');
+      clients.push(client);
+      const frames: Array<{ type: string; payload: unknown }> = [];
+      client.on('message', data => { frames.push(JSON.parse(data.toString())); });
+      await waitFor(() => callbacks.size === 1 && frames.some(m => m.type === 'risk.margin'));
+      expect(frames.filter(m => m.type === 'risk.margin').at(-1)?.payload).toEqual(current);
+      for (const state of ['WATCHING', 'BLOCKED', 'RECONCILING'] as const) {
+        current = { ...current, continuousProtection: { enabled: true, state,
+          groups: [{ strategyId: 'PAIR-TEST', state, reason: state === 'BLOCKED' ? 'protection_order_unresolved' : null, checkedAt: Date.now() }] } };
+        const before = frames.length; for (const notify of callbacks) notify();
+        await waitFor(() => frames.length > before);
+        expect(frames.at(-1)).toEqual({ type: 'risk.margin', payload: current });
+        expect(current.fresh).toBe(false); // Completion cannot renew expired margin data.
+      }
+      const peers = new Set(app.websocketServer.clients);
+      const slow = new WebSocket(address.replace('http:', 'ws:') + '/ws/stream'); clients.push(slow);
+      await waitFor(() => callbacks.size === 2);
+      const slowPeer = [...app.websocketServer.clients].find(peer => !peers.has(peer))!;
+      Object.defineProperty(slowPeer, 'bufferedAmount', { configurable: true, get: () => 5 * 1024 * 1024 });
+      const beforeSlow = frames.length;
+      for (const notify of callbacks) notify();
+      await waitFor(() => callbacks.size === 1 && frames.length > beforeSlow);
+      expect(frames.at(-1)).toEqual({ type: 'risk.margin', payload: current });
+      client.close(); await waitFor(() => callbacks.size === 0);
+      const oldCount = frames.length;
+      current = { ...current, accountId: 'synthetic-b', continuousProtection: { enabled: false, state: 'DISABLED', groups: [] } };
+      const second = new WebSocket(address.replace('http:', 'ws:') + '/ws/stream');
+      clients.push(second); const next: Array<{ type: string; payload: unknown }> = [];
+      second.on('message', data => { next.push(JSON.parse(data.toString())); });
+      await waitFor(() => callbacks.size === 1);
+      await waitFor(() => next.some(m => m.type === 'risk.margin'));
+      expect(next.filter(m => m.type === 'risk.margin').at(-1)?.payload).toEqual(current);
+      expect(frames).toHaveLength(oldCount); expect(refresh).not.toHaveBeenCalled();
+      expect(gateway.createdOrders).toHaveLength(0); expect(gateway.cancelledOrders).toHaveLength(0);
+    } finally {
+      for (const client of clients) client.terminate();
+      await app.close(); subscription.mockRestore(); snapshot.mockRestore(); refresh.mockRestore();
+    }
+  });
   it.each([undefined, '999.0.0'])('reports its installed package version when the launcher version is %s', async (launcherVersion) => {
     const original = process.env.npm_package_version;
     if (launcherVersion === undefined) delete process.env.npm_package_version;
@@ -571,7 +628,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 32, currentMigration: '0032_paired_entry_reservations.sql' },
+      database: { migrationCount: 34, currentMigration: '0034_task_performance_projection.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',

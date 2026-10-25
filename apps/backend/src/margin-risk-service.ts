@@ -59,8 +59,9 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
     .filter((s) => s.management?.phase !== 'TRANSFERRED').map((s) => {
       const state = readManagedState(o.db, s.id), legs = managedLegs(s.config);
       const modeKnown = positionContext === o.context() && Date.now() - positionsAt < 5000 && legs.every((l) => positions.find((p) => p.symbol === l.symbol)?.margin_mode === 'CROSS');
-      const eligible = accountMode === 'CROSS_EXCHANGE' && s.status === 'RUNNING' && (!!state && ['MONITORING', 'EXITING', 'BALANCING'].includes(state.phase) || !!state?.marginBatch)
-        && state?.stopIntent !== 'KEEP' && !state?.protectionIncident && modeKnown;
+      const continuous = o.manager.protection?.owns(s.id) === true;
+      const eligible = accountMode === 'CROSS_EXCHANGE' && (continuous || s.status === 'RUNNING' && (!!state && ['MONITORING', 'EXITING', 'BALANCING'].includes(state.phase) || !!state?.marginBatch))
+        && state?.stopIntent !== 'KEEP' && (continuous || !state?.protectionIncident) && modeKnown;
       const readiness = eligible && currentAccount ? groupReadiness(o.db, evidence, o.markets, currentAccount, s, positions)
         : { status: 'unknown' as const, reason: 'position_margin_mode_unverified', maxBatchQuantity: null, checkedAt: Date.now() };
       return { id: state?.groupId ?? s.id, strategyId: s.id, asset: s.config.asset, phase: state?.phase ?? s.status,
@@ -69,6 +70,10 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
   const monitor = new MarginRiskMonitor(store, {
     onStop: () => o.runtime.stopPairedEntries(),
     context: o.context, live: o.live, groups,
+    normalRecoveryAuthority: () => o.manager.normalMarginRecoveryAuthority?.() ?? null,
+    protectionEnabled: id => o.manager.protection?.owns(id) === true,
+    protectionReady: id => o.manager.protection?.ready(id) === true && remoteOpenOrders === 0 && !o.runtime.listOpenOrders().length,
+    continuousProtection: () => o.manager.protection?.view(),
     onReadFault: (fields) => o.readFailure?.({ ...fields, stage: readStage, startedAt: readStartedAt, endedAt: Date.now(), context: accountContext, elapsedMs: Date.now() - readStartedAt, requestId: readSequence }),
     valuation: () => { const value = evidence.valuation(); return value ? { ...value, profileId: o.profile()?.id ?? null } : null; },
     proposal: (record, facts, metrics, policy) => {
@@ -123,12 +128,14 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
       try {
         return o.runtime.listStrategies().filter((s) => s.accountProfileId === o.profile()?.id && s.config.management && !['TRANSFERRED', 'COMPLETED'].includes(s.management?.phase ?? ''))
           .every((s) => { const state = readManagedState(o.db, s.id), q = pairedQuantities(positions, managedLegs(s.config));
-            return !state?.marginBatch && !state?.positionSettlementSince && !state?.protectionIncident && new Decimal(q[0]).eq(q[1]); });
+            return !!state && !state.marginBatch && !state.positionSettlementSince
+              && (!state.protectionIncident || o.manager.protection?.ready(s.id)) && new Decimal(q[0]).eq(q[1])
+              && q.every((quantity, i) => new Decimal(quantity).eq((i === 0 ? state.leftQuantity : state.rightQuantity) ?? '-1')); });
       } catch { return false; }
     },
     uncovered: () => {
       if (positionContext !== o.context()) return [];
-      const symbols = new Set(o.runtime.listStrategies().filter((s) => s.accountProfileId === o.profile()?.id && s.status === 'RUNNING' && s.config.management)
+      const symbols = new Set(o.runtime.listStrategies().filter((s) => s.accountProfileId === o.profile()?.id && (s.status === 'RUNNING' || o.manager.protection?.owns(s.id)) && s.config.management)
         .flatMap((s) => managedLegs(s.config).map((l) => l.symbol)));
       return positions.filter((p) => !new Decimal(p.position_qty).isZero() && !symbols.has(p.symbol)).map((p) => p.symbol);
     },

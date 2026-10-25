@@ -2432,7 +2432,7 @@ export class StrategyEngine {
       }
       if (error instanceof StrategyEngineError && error.code === 'strategy_repair_quote_unavailable') {
         // A filled leg already belongs to this task. Restored quotes cannot authorize another attempt.
-        this.session.set('readonly');
+        this.session.pause();
         if (!actor.config.management) this.positionManager?.failAll(error.code);
         await this.pause(actor, error.code);
       }

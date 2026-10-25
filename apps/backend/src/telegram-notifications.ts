@@ -176,9 +176,11 @@ export class TelegramNotifications {
   private async deliver(): Promise<void> {
     const s = this.pending, settings = this.settings;
     if (!s?.accountId || !settings || this.inFlight || this.now() < this.retryAt || !s.effectivePolicy.notificationsEnabled) return;
-    const previous = this.delivered.get(s.accountId) ?? this.deliveryStore?.get(s.accountId), state = `${s.status}:${s.reason ?? ''}:${s.incidentId ?? ''}`;
-    if (s.status === 'clear' && !previous) return;
-    if (previous?.state === state && (s.status === 'clear' || s.status === 'recovered' || this.now() - previous.at < s.effectivePolicy.reminderMinutes * 60000)) return;
+    const protection = s.continuousProtection;
+    const obstructed = protection?.enabled && ['BLOCKED', 'RECONCILING'].includes(protection.state);
+    const previous = this.delivered.get(s.accountId) ?? this.deliveryStore?.get(s.accountId), state = `${s.status}:${s.reason ?? ''}:${s.incidentId ?? ''}:${protection?.enabled ? JSON.stringify(protection.groups.map(g => [g.strategyId, g.state, g.reason])) : ''}`;
+    if (s.status === 'clear' && !previous && !obstructed) return;
+    if (previous?.state === state && ((!obstructed && (s.status === 'clear' || s.status === 'recovered')) || this.now() - previous.at < s.effectivePolicy.reminderMinutes * 60000)) return;
     if (s.status === 'unavailable' && this.now() - (this.unavailableSince.get(s.accountId) ?? this.now()) < 25000) return;
     this.inFlight = true; const revision = this.revision;
     try {
@@ -186,7 +188,8 @@ export class TelegramNotifications {
         `时间：${new Date(this.now()).toISOString()}`, `IMR：${s.metrics?.initialPct ?? '不可用'}% / MMR：${s.metrics?.maintenancePct ?? '不可用'}%`,
         `预警 / 减仓 / 恢复：IMR ${s.effectivePolicy.initial.warn}/${s.effectivePolicy.initial.reduce}/${s.effectivePolicy.initial.recover}%`,
         `MMR ${s.effectivePolicy.maintenance.warn}/${s.effectivePolicy.maintenance.reduce}/${s.effectivePolicy.maintenance.recover}%`,
-        `新增风险：${s.entryBlocked ? '已阻止' : '按准入检查'}`, `实盘权限：${s.liveEnabled ? '已启用' : '未启用，不能自动减仓'}`,
+        `新增风险：${s.entryBlocked ? '已阻止' : '按准入检查'}`, `实盘权限：${s.liveEnabled ? '已启用' : s.continuousProtection?.enabled ? `仅账户保护：${s.continuousProtection.state}` : '未启用，不能自动减仓'}`,
+        ...(protection?.enabled ? protection.groups.map(g => `持续保护 ${g.strategyId}：${g.state}${g.reason ? `；${g.reason}` : ''}`) : []),
         s.reason ? `待处理：${s.reason}` : '请在风险管理页面查看授权覆盖与处理进度。'].join('\n');
       await this.request(settings, 'sendMessage', { chat_id: settings.chatId, text });
       if (revision === this.revision) { this.delivered.set(s.accountId, { state, at: this.now() }); this.deliveryStore?.set(s.accountId, state, this.now()); }

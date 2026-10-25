@@ -103,7 +103,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     ? historicalStrategies.slice(historyStart, historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE)
     : runningStrategies;
   const positionsView = useMemo(
-    () => prepareStrategyPositions(authenticatedPortfolio, tradingSnapshot),
+    () => prepareStrategyPositions(authenticatedPortfolio, tradingSnapshot, { retainStalePortfolio: true }),
     [authenticatedPortfolio, tradingSnapshot],
   );
   const selectedLogStrategy = strategies.find((strategy) => strategy.id === selectedLogStrategyId) ?? null;
@@ -236,9 +236,15 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         {' '}{Object.entries(taskPerformance.unresolvedCashflows.native).map(([coin,value])=>`${Number(value).toFixed(4)} ${coin}`).join(' / ')}
       </div>}
       {showingPositions ? <>
-        {positionsView.status === 'fresh' && positionsView.rows.length > 0 && <PositionsTable rows={positionsView.rows} profileId={profileId} accountMarginBalance={freshPortfolioMarginBalance(authenticatedPortfolio)} key={profileId} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog} onChanged={async () => { await onStrategiesChanged(); await onPositionsRefresh(); }} />}
+        {positionsView.status === 'stale' && positionsView.rows.length > 0 && <p role="status" className="stale-strategy-positions">
+          {language === 'zh' ? `持仓快照已过期，以下为上次确认的 ${positionsView.rows.length} 条持仓；依赖实时数据的操作已禁用。数据时间：` : `Position snapshot is stale. Showing ${positionsView.rows.length} last-confirmed positions; actions requiring fresh data are disabled. Data time: `}
+          <time dateTime={authenticatedPortfolio?.snapshot.fetchedAt}>{authenticatedPortfolio?.snapshot.fetchedAt ?? '—'}</time>
+        </p>}
+        {positionsView.rows.length > 0 && <PositionsTable rows={positionsView.rows} profileId={profileId} accountMarginBalance={freshPortfolioMarginBalance(authenticatedPortfolio)} key={profileId} tradingMode={tradingMode} onOpenModeDialog={onOpenModeDialog}
+          staleReason={positionsView.status === 'fresh' ? undefined : t('Position snapshot is stale')}
+          onChanged={async () => { await onStrategiesChanged(); await onPositionsRefresh(); }} />}
         {positionsView.status === 'fresh' && positionsView.rows.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t('No open positions')}</strong><small>{t('The live account has no open futures positions.')}</small></div>}
-        {positionsView.status === 'stale' && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
+        {positionsView.status === 'stale' && positionsView.rows.length === 0 && <div className="no-strategies stale-strategy-positions"><span>!</span><strong>{t('Position snapshot is stale')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
         {positionsView.status === 'unavailable' && <div className="no-strategies"><span>◎</span><strong>{t('Position data unavailable')}</strong><small>{t('Waiting for a fresh account snapshot.')}</small></div>}
       </> : <>
         <div tabIndex={0} role="region" aria-label={language==='zh'?'任务及交易盈亏':'Strategy results'} className={`running-table with-trading ${showingHistory ? 'historical' : ''} ${feesEnabled ? 'with-fees' : ''}`}><div className="running-head">{showingHistory && <span>{t('Start time')}</span>}<span>{t('Strategy')}</span><span>{t('Market name')}</span><span>{t('Exchanges')}</span><span>{t('Entry / Exit')}</span><span>{language === 'zh' ? '交易净盈亏' : 'Trading net PnL'}</span><span>{t('Size limits')}</span><span>{t('Method')}</span><span>{t('Execution log')}</span>{feesEnabled && <span>{language === 'zh' ? '本任务手续费' : 'Task fees'}</span>}<span>{t(showingHistory ? 'Duration' : 'Runtime')}</span><span>{t('Status')}</span>{!showingHistory && <span />}</div>{visibleStrategies.map((strategy) => {

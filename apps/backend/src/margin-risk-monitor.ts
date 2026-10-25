@@ -5,7 +5,7 @@ import { DEFAULT_MARGIN_POLICY, MarginPolicySchema, type MarginMetrics, type Mar
 import { GateApiError, type GateCrossExAccount, type GateCrossExPosition } from './crossex-client.js';
 import type { StrategyRecord } from './trading-runtime.js';
 import { marginBelow, marginMetrics, marginRecovered, projectedMarginAllowed } from './margin-risk-model.js';
-import { MarginRiskStore, type CostReservation } from './margin-risk-store.js';
+import { MarginRiskStore, type CostReservation, type MarginIncident } from './margin-risk-store.js';
 import { rankMarginCandidates } from './margin-reduction-plan.js';
 import type { ManagedMarginBatch } from './managed-position-store.js';
 export interface MarginProposal { quantity: string; target: string | null; apr: string | null; firstLeg: 0 | 1; initial: string; maintenance: string;
@@ -22,7 +22,11 @@ export interface MarginEntryCheck {
 export interface MarginMonitorSources {
   context(): string; account(signal: AbortSignal): Promise<MarginAccountRead>;
   live(): boolean; groups(): MarginSnapshot['groups']; uncovered(): string[];
+  protectionReady?(strategyId?: string): boolean;
+  protectionEnabled?(strategyId: string): boolean;
+  continuousProtection?(): MarginSnapshot['continuousProtection'];
   reviewReady?(): boolean;
+  normalRecoveryAuthority?(): string | null;
   settlementReady?(quantities: Record<string, string>, proof?: { approximate?: boolean; batchId?: string; parametersId?: string; feeRules?: Array<{ symbol: string; pool: string; bookVenue?: string }> }): boolean;
   proposal?(record: StrategyRecord, positions: GateCrossExPosition[], metrics: MarginMetrics, policy: MarginSnapshot['policy']): MarginProposal | null;
   proposalFailure?(strategyId: string): string | null;
@@ -52,13 +56,16 @@ export class MarginRiskMonitor {
   private readEpoch = 0;
   private readonly now: () => number;
   private readonly listeners = new Set<(snapshot: MarginSnapshot) => void>();
+  // Deliberately process-local: persisted/legacy incidents never acquire automatic permission on restart.
+  private normalRecovery: { incidentId: string; authority: string; revision: number } | null = null;
+  invalidateNormalRecovery(): void { this.normalRecovery = null; }
   constructor(readonly store: MarginRiskStore, readonly sources: MarginMonitorSources) { this.now = sources.now ?? Date.now; }
   start(): void {
     this.stopped = false;
     this.timer ??= setInterval(() => { void this.refresh(); }, 2000); this.timer.unref?.(); void this.refresh();
   }
   async stop(): Promise<void> {
-    this.stopped = true;
+    this.stopped = true; this.invalidateNormalRecovery();
     if (this.timer) clearInterval(this.timer); this.timer = null; this.controller?.abort(); await this.inFlight;
     await this.sources.onStop?.();
   }
@@ -117,11 +124,16 @@ export class MarginRiskMonitor {
     let incident = this.store.incident(latest.key);
     const policy = incident?.policy ?? this.store.policy(latest.key);
     if (incident?.batch && this.sources.groups().some((g) => g.strategyId === incident!.batch!.strategyId
-      && ['STOPPED', 'STOPPING', 'TRANSFERRED', 'RISK_PAUSED'].includes(g.phase))) {
+      && ['STOPPED', 'STOPPING', 'TRANSFERRED', 'RISK_PAUSED'].includes(g.phase) && !this.sources.protectionEnabled?.(g.strategyId))) {
       this.blockIncident('margin_group_not_active'); incident = this.store.incident(latest.key);
     }
-    if (!incident && latest.units.some((u) => u.metrics && marginBelow(u.metrics, policy, 'reduce'))) incident = this.store.startIncident(latest.key, this.now());
+    if (!incident && latest.units.some((u) => u.metrics && marginBelow(u.metrics, policy, 'reduce'))) {
+      incident = this.beginIncident(latest.key, policy);
+    }
     if (!incident) return;
+    if (this.normalRecovery && (this.normalRecovery.incidentId !== incident.id || !this.sources.live()
+      || this.normalRecovery.authority !== this.sources.normalRecoveryAuthority?.()
+      || this.normalRecovery.revision !== this.store.policy(latest.key).revision || incident.blocked)) this.invalidateNormalRecovery();
     const mmr = latest.units.some(u => u.metrics?.maintenancePct !== null && u.metrics && new Decimal(u.metrics.maintenancePct!).lt(policy.maintenance.reduce));
     incident = { ...incident, cause: incident.cause === 'MMR' || mmr ? 'MMR' : 'IMR' };
     const settled = !incident.settlement || latest.at > incident.settlement.completedAt
@@ -144,10 +156,25 @@ export class MarginRiskMonitor {
     const priorRecovery = healthy ? incident.recovery ?? { firstAt: latest.at, confirmations: 1 } : null;
     const recovery = priorRecovery && latest.at - priorRecovery.firstAt >= 2000 ? { ...priorRecovery, confirmations: 2 } : priorRecovery;
     this.store.saveIncident(latest.key, { ...incident, recovery });
-    if (recovery?.confirmations === 2 && !incident.blocked) {
-      this.store.event(latest.key, 'recovered', 'Both recovery thresholds reached; new entry remains locked until explicit review', incident.policy.revision, this.now());
-      this.store.saveIncident(latest.key, null);
-    }
+    if (recovery?.confirmations === 2 && !incident.blocked) this.finishRecovery(latest.key, incident);
+  }
+  private beginIncident(key: string, policy: MarginSnapshot['policy']): MarginIncident {
+    const monitoring = this.sources.groups().some(g => g.eligible && ['MONITORING', 'BALANCING'].includes(g.phase));
+    const authority = monitoring && !this.store.latched(key) && this.sources.live() ? this.sources.normalRecoveryAuthority?.() : null;
+    const incident = this.store.startIncident(key, this.now());
+    this.normalRecovery = authority ? { incidentId: incident.id, authority, revision: policy.revision } : null;
+    return incident;
+  }
+  private finishRecovery(key: string, incident: MarginIncident): void {
+    const automatic = this.normalRecovery?.incidentId === incident.id;
+    this.store.transaction(() => {
+      if (automatic) this.store.latch(key, false);
+      this.store.event(key, automatic ? 'entry_auto_recovered' : 'recovered', automatic
+        ? 'Normal margin episode reconciled; its entry hold released; remaining holdings continue monitoring'
+        : 'Both recovery thresholds reached; new entry remains locked until explicit review', incident.policy.revision, this.now());
+      this.store.saveIncident(key, null);
+    });
+    this.invalidateNormalRecovery();
   }
   private withReserve(metrics: MarginMetrics, exclude?: string): MarginMetrics {
     const reserve = this.latest ? this.store.pendingCosts(this.latest.key).filter(r => r.batchId !== exclude).reduce((s, r) => s.plus(r.amount), new Decimal(0)).toString() : '0';
@@ -202,6 +229,7 @@ export class MarginRiskMonitor {
       groups, uncoveredSymbols: this.sources.uncovered(), units: latest?.units.map((u) => ({ ...u, metrics: u.metrics ? rebased(u.metrics) : null })) ?? [],
       valuation: this.sources.valuation?.() ?? null,
       costAccounting: { pendingBatches: latest ? this.store.pendingCosts(latest.key).length : 0, reserved: latest ? this.store.reservedCost(latest.key) : '0' },
+      continuousProtection: this.sources.continuousProtection?.(),
       protection: incident ? { cause: incident.cause ?? 'IMR', stage: incident.blocked ? 'blocked' : incident.batch ? 'pairing' : incident.recovery ? 'confirming_recovery' : incident.settlement ? 'settlement_pending' : 'planning',
         confirmations: incident.recovery?.confirmations ?? 0, batchId: incident.batch?.id ?? null, strategyId: incident.batch?.strategyId ?? null,
         plannedQuantity: incident.plan?.quantity ?? null, targetQuantity: incident.plan?.target ?? null, apr: incident.plan?.apr ?? null,
@@ -296,10 +324,26 @@ export class MarginRiskMonitor {
     if (!projectedMarginAllowed(this.withReserve(metrics), s.effectivePolicy, initial, maintenance)) throw new Error('margin_projected_below_warning');
   }
   blockIncident(reason: string): void {
+    this.invalidateNormalRecovery();
     const s = this.snapshot(); if (!s.accountId) return;
     const incident = this.store.incident(s.accountId); if (!incident || incident.blocked === reason) return;
     this.store.saveIncident(s.accountId, { ...incident, blocked: reason });
     this.store.event(s.accountId, 'protection_blocked', reason, incident.policy.revision, this.now()); this.emit();
+  }
+  /** Revalidation removes an execution obstruction, never the ordinary entry/review latch. */
+  reconcileProtection(): void {
+    const s = this.snapshot();
+    if (!s.accountId || !s.fresh || !this.sources.protectionReady?.() || !this.sources.reviewReady?.()) return;
+    const incident = this.store.incident(s.accountId);
+    if (!incident?.blocked || incident.batch) return;
+    const costs = this.store.pendingCosts(s.accountId);
+    if (costs.some(item => this.sources.costProof?.(item)?.exceeded
+      || !new Decimal(item.amount).isFinite() || new Decimal(item.amount).lt(0)
+      || new Decimal(item.amount).gt(item.originalAmount))) return;
+    // Delayed fee detail retains its reserve in withReserve(); it is not an unknown order.
+    if (incident.settlement && this.sources.settlementReady?.(incident.settlement.quantities, incident.settlement) !== true) return;
+    this.store.event(s.accountId, 'protection_revalidated', incident.blocked, incident.policy.revision, this.now());
+    this.store.saveIncident(s.accountId, { ...incident, blocked: null, recovery: null });
   }
   batchComplete(strategyId: string, remaining: string, remoteAfter = '0', quantities: Record<string, string> = {}): void {
     const s = this.snapshot(); if (!s.accountId) return;
@@ -316,8 +360,11 @@ export class MarginRiskMonitor {
     void (this.inFlight ?? Promise.resolve()).then(() => this.refresh());
   }
   planBatch(record: StrategyRecord, positions: GateCrossExPosition[], records: StrategyRecord[], lot: string, marketMax: string | null): string | null {
+    // A healthy monitoring tick has no reduction work. Avoid building every group's capacity just to discover that.
+    const latest=this.latest?.context===this.sources.context()?this.latest:null;
+    if (!latest || !this.store.incident(latest.key)) return null;
     const s = this.snapshot();
-    if (!s.fresh || !s.accountId || !s.metrics || !this.sources.live() || s.metrics.accountMode !== 'CROSS_EXCHANGE') return null;
+    if (!s.fresh || !s.accountId || !s.metrics || (!this.sources.live() && !this.sources.protectionReady?.(record.id)) || s.metrics.accountMode !== 'CROSS_EXCHANGE') return null;
     const incident = this.store.incident(s.accountId); if (!incident || incident.blocked || incident.batch || incident.recovery) return null;
     if (incident.settlement && (incident.settlement.approximate && !incident.settlement.verified || this.latest!.at <= incident.settlement.completedAt
       || new Decimal(s.metrics.remoteUpdatedAt).lt(incident.settlement.remoteAfter)

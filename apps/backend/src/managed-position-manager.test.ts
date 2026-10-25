@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Decimal } from 'decimal.js';
+import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -15,6 +17,7 @@ import type { LiveMarket } from './market-hub.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { MarginRiskStore } from './margin-risk-store.js';
 import { ownedQuoteSymbols } from './owned-market-demand.js';
+import { knownMarginOrder, knownMarginPosition } from './managed-margin-batch.js';
 
 const directories: string[] = [];
 const managers: ManagedPositionManager[] = [];
@@ -98,11 +101,384 @@ async function harness(asset = 'BTC', leftVenue = 'BINANCE', book?: { bid: strin
     unavailable: (value = true) => { unavailable = value; }, missingFunding: (value: boolean) => { missingFunding = value; },
     setRead: (value: typeof read) => { read = value; }, changeAccount: () => { account = 'account-2'; },
     missingQuote: (symbol: string, missing = true) => { if (missing) missingQuotes.add(symbol); else missingQuotes.delete(symbol); },
-    holdCancel: () => { cancelHeld = true; }, failSubmit: () => { failSubmit = true; },
+    holdCancel: () => { cancelHeld = true; }, failSubmit: (value = true) => { failSubmit = value; },
     setSubmitWait: (wait: (() => Promise<void>) | null) => { submitWait = wait; } };
 }
 
 describe('generic adopted position groups and explicit stop intent', () => {
+  async function continuous(h: Awaited<ReturnType<typeof harness>>, id: string, enroll = true) {
+    let balance = '240';
+    const store = new MarginRiskStore(h.db);
+    const monitor = new MarginRiskMonitor(store, {
+      context: () => 'account-1', live: () => h.session.liveTradingEnabled, uncovered: () => [],
+      account: async () => ({ profileId: 'account-1', label: 'Synthetic', userId: 'synthetic', account: {
+        user_id: 'synthetic', available_margin: balance, margin_balance: balance, initial_margin: '10', maintenance_margin: '100',
+        initial_margin_rate: new Decimal(balance).div(10).toString(), maintenance_margin_rate: new Decimal(balance).div(100).toString(),
+        assets: [], account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', position_mode: 'SINGLE', update_time: String(Date.now()),
+      } }),
+      groups: () => h.runtime.listStrategies().filter(r => r.config.management).map(r => ({ id: r.management?.groupId ?? r.id,
+        strategyId: r.id, asset: r.config.asset, phase: r.management!.phase,
+        eligible: r.status === 'RUNNING' || h.manager.protection.owns(r.id), authorized: false, reason: null })),
+      protectionEnabled: key => h.manager.protection.owns(key),
+      protectionReady: key => h.manager.protection.ready(key) && !h.runtime.listOpenOrders().length,
+      reviewReady: () => !h.runtime.listOpenOrders().length && !readManagedState(h.db, id)?.marginBatch,
+      normalRecoveryAuthority: () => h.manager.normalMarginRecoveryAuthority(),
+      settlementReady: () => true,
+      proposal: () => ({ quantity: '10', target: '10', initial: '1', maintenance: '10', firstLeg: 0, apr: '0',
+        approximate: true, parametersValidUntil: Date.now() + 60_000 }),
+    });
+    await monitor.refresh(); const groupIds = monitor.snapshot().groups.map(g => g.id);
+    monitor.savePolicy({ ...monitor.snapshot().policy, protectedGroupIds: groupIds });
+    h.manager.setMarginMonitor(monitor);
+    if (enroll) await h.manager.protection.configure(monitor.snapshot().accountId!, groupIds, 0, true);
+    h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) }));
+    return { monitor, low: () => { balance = '149'; }, recovered: () => { balance = '240'; } };
+  }
+  async function protectTicks(h: Awaited<ReturnType<typeof harness>>, count = 4) {
+    for (let i = 0; i < count; i++) { await vi.advanceTimersByTimeAsync(1100); await h.manager.tick(); }
+  }
+  it('keeps paused protection readable when the profit worker publishes after the planning read snapshot', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    const { monitor } = await continuous(h, id);
+    h.manager.failAll('synthetic review'); await protectTicks(h);
+    expect(h.manager.protection.view().state).toBe('WATCHING');
+    const worker = new Database(h.db.name), incident = monitor.store.incident.bind(monitor.store);
+    let interleaved = false;
+    const spy = vi.spyOn(monitor.store, 'incident').mockImplementation(key => {
+      if (h.db.inTransaction && !interleaved) {
+        interleaved = true;
+        worker.prepare('INSERT INTO task_pnl_projection_work VALUES (?,?,?,?)').run(key, 1, 'isolated-worker-publication', '{}');
+      }
+      return incident(key);
+    });
+    try {
+      await protectTicks(h, 1);
+      expect(interleaved).toBe(true);
+      expect(h.manager.protection.view().groups[0]).toMatchObject({ state: 'WATCHING', reason: null });
+      expect(h.created).toHaveLength(0);
+      expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+      expect(managedRiskReason(h.db)).toBe('synthetic review');
+    } finally { spy.mockRestore(); worker.close(); }
+  });
+  it('does not invalidate protection when an unrelated writer holds the risk snapshot read', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    const { monitor } = await continuous(h, id);
+    h.manager.failAll('synthetic review'); await protectTicks(h);
+    const worker = new Database(h.db.name), snapshot = monitor.snapshot.bind(monitor);
+    h.db.pragma('busy_timeout = 0');
+    let holdNextSnapshot = false, interleaved = false;
+    h.setRead(async () => {
+      holdNextSnapshot = true;
+      return { ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) };
+    });
+    const spy = vi.spyOn(monitor, 'snapshot').mockImplementation(() => {
+      if (!holdNextSnapshot) return snapshot();
+      holdNextSnapshot = false; interleaved = true; worker.exec('BEGIN IMMEDIATE');
+      try { return snapshot(); } finally { worker.exec('ROLLBACK'); }
+    });
+    try {
+      await protectTicks(h, 1);
+      expect(interleaved).toBe(true);
+      expect(h.manager.protection.view().groups[0]).toMatchObject({ state: 'WATCHING', reason: null });
+      expect(h.created).toHaveLength(0);
+      expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+      expect(managedRiskReason(h.db)).toBe('synthetic review');
+    } finally { spy.mockRestore(); worker.close(); }
+  });
+  it('retains only still-fresh completed protection evidence during a routine read and invalidates it on failure',async()=>{
+    const h=await harness(),id=await h.task();await h.manager.tick();await continuous(h,id);
+    h.manager.failAll('synthetic review');await protectTicks(h);
+    const before=h.manager.protection.view().groups[0];expect(before.state).toBe('WATCHING');
+    let during:ReturnType<typeof h.manager.protection.view>|undefined;
+    h.setRead(async()=>{during=h.manager.protection.view();throw new Error('synthetic read failure');});
+    await protectTicks(h,1);
+    expect(during?.groups[0]).toEqual(before);
+    expect(h.manager.protection.view().state).toBe('RECONCILING');expect(h.created).toHaveLength(0);
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');expect(managedRiskReason(h.db)).toBe('synthetic review');
+  });
+  it('does not retain a watching verdict after its evidence expires or confirmed holdings change',async()=>{
+    const h=await harness(),id=await h.task();await h.manager.tick();await continuous(h,id);
+    h.manager.failAll('synthetic review');await protectTicks(h);
+    const before=h.manager.protection.view().groups[0];
+    vi.setSystemTime(before.checkedAt+5001);
+    expect(h.manager.protection.view().groups[0]).toMatchObject({state:'RECONCILING',reason:'protection_observation_stale',checkedAt:before.checkedAt});
+    await protectTicks(h,1);expect(h.manager.protection.view().state).toBe('WATCHING');
+    h.quantities('90','100');await protectTicks(h,1);
+    expect(h.manager.protection.view().state).toBe('RECONCILING');expect(h.created).toHaveLength(0);
+  });
+  it('delivers completed protection observations without reentering risk control or renewing evidence', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    const { monitor } = await continuous(h, id);
+    monitor.sources.continuousProtection = () => h.manager.protection.view();
+    const control = vi.fn(); monitor.subscribe(control);
+    const account = vi.spyOn(monitor.sources, 'account'), frames: ReturnType<typeof monitor.snapshot>[] = [];
+    const eventCount = () => (h.db.prepare('SELECT count(*) n FROM margin_risk_events').get() as { n: number }).n;
+    const evidence: Array<{ before: unknown; after: unknown }> = [];
+    const counters = () => [control.mock.calls.length, account.mock.calls.length, eventCount(), monitor.snapshot().sampledAt];
+    h.manager.protection.subscribeCompletion(() => { throw new Error('synthetic disconnected observer'); });
+    const unsubscribe = h.manager.protection.subscribeCompletion(() => {
+      const before = counters(); frames.push(monitor.snapshot()); evidence.push({ before, after: counters() });
+    });
+    h.manager.failAll('synthetic review'); await protectTicks(h);
+    expect(frames.at(-1)?.continuousProtection?.state).toBe('WATCHING');
+    expect(frames.at(-1)).toEqual(monitor.snapshot());
+    expect(account).toHaveBeenCalledTimes(5); // One failAll wake and four explicit ticks.
+    expect(control).toHaveBeenCalledTimes(5); // UI completion must not emit a second control snapshot.
+    h.quantities('110', '100'); await protectTicks(h, 2);
+    expect(frames.at(-1)?.continuousProtection?.groups[0]).toMatchObject({ state: 'BLOCKED', reason: 'protection_holdings_unverified' });
+    h.unavailable(); await protectTicks(h, 1);
+    expect(frames.at(-1)?.continuousProtection?.state).toBe('RECONCILING');
+    const sampledAt = monitor.snapshot().sampledAt;
+    monitor.sources.account = async () => { throw new Error('synthetic margin outage'); };
+    await protectTicks(h, 1);
+    expect(frames.at(-1)?.fresh).toBe(false); expect(frames.at(-1)?.sampledAt).toBe(sampledAt);
+    for (const item of evidence) expect(item.after).toEqual(item.before);
+    const count = frames.length; unsubscribe(); await protectTicks(h, 1); expect(frames).toHaveLength(count);
+    expect(h.created).toHaveLength(0); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    expect(managedRiskReason(h.db)).toBe('synthetic review');
+  });
+  it.each(['account', 'revocation'] as const)('publishes current scope when %s changes during protection reads', async change => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    const { monitor } = await continuous(h, id); monitor.sources.continuousProtection = () => h.manager.protection.view();
+    h.manager.failAll('synthetic review'); await protectTicks(h);
+    const frames: ReturnType<typeof h.manager.protection.view>[] = [];
+    h.manager.protection.subscribeCompletion(() => { frames.push(h.manager.protection.view()); });
+    h.setRead(async () => {
+      if (change === 'account') h.changeAccount(); else h.session.set('readonly');
+      return h.facts();
+    });
+    await protectTicks(h, 1);
+    expect(frames.at(-1)).toEqual({ enabled: false, state: 'DISABLED', groups: [], coverage: change === 'account' ? [] : [
+      { groupId: id, strategyId: id, enrolled: false, reason: 'protection_readonly' },
+    ] });
+    expect(h.created).toHaveLength(0); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('continues a second external reduction without resuming the paused ordinary strategy', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); h.missingFunding(true);
+    await continuous(h, id); h.quantities('100', '90'); await h.manager.tick();
+    expect(h.created).toHaveLength(1); h.ack(1, 'FILLED', '10'); h.quantities('90', '90'); await protectTicks(h);
+    expect(h.session.current).toBe('protect_only'); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    h.quantities('90', '80'); await protectTicks(h);
+    expect(h.created).toHaveLength(2); expect(h.created[1]).toMatchObject({ side: 'SELL', qty: '10', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '10'); h.quantities('80', '80'); await protectTicks(h);
+    expect(h.created).toHaveLength(2); expect(managedRiskReason(h.db)).toBe('managed_external_reduction');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('automatically completes two live margin cycles including a fill during the account read', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    h.missingFunding(true); // Isolate margin recovery from the independent timed economic exit.
+    for (let cycle = 0; cycle < 2; cycle++) {
+      m.low(); await m.monitor.refresh(); await h.manager.tick(); expect(h.created).toHaveLength(cycle * 2 + 1);
+      let complete!: (facts: ManagedAccountFacts) => void;
+      h.setRead(() => new Promise(resolve => { complete = resolve; })); const pending = h.manager.tick();
+      h.ack(cycle * 2 + 1, 'FILLED', '10'); h.quantities(String(90 - cycle * 10), String(100 - cycle * 10));
+      h.manager.notifyPosition({ symbol: h.legs[0].symbol, position_qty: String(90 - cycle * 10), update_time: String(Date.now()) });
+      expect(managedRiskReason(h.db)).toBeNull();
+      h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) }));
+      complete(h.facts()); await pending; await protectTicks(h, 2);
+      expect(h.created).toHaveLength(cycle * 2 + 2);
+      h.ack(cycle * 2 + 2, 'FILLED', '10'); h.quantities(String(90 - cycle * 10), String(90 - cycle * 10));
+      m.recovered(); await protectTicks(h, 3); await m.monitor.refresh();
+      await vi.advanceTimersByTimeAsync(2100); await m.monitor.refresh(); await h.manager.tick();
+      expect(m.monitor.snapshot().incidentId).toBeNull(); expect(m.monitor.snapshot().entryBlocked).toBe(false);
+      expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');
+      expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+      expect(readManagedState(h.db, id)).toMatchObject({ phase: 'MONITORING', leftQuantity: String(90 - cycle * 10), rightQuantity: String(90 - cycle * 10) });
+      expect(h.created.every(o => o.reduce_only === 'true')).toBe(true);
+    }
+    await protectTicks(h, 3); expect(h.created).toHaveLength(4);
+  });
+  it('keeps temporary live read recovery with the ordinary manager even during an incident', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    m.low(); await m.monitor.refresh(); h.unavailable(); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.manager.protection.needsTick()).toBe(false);
+    h.unavailable(false); await protectTicks(h, 4);
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+  });
+  it('finishes a fully reduced group without reviving it when margin recovers', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); h.missingFunding(true);
+    h.quantities('10', '10');
+    h.db.prepare("UPDATE managed_positions SET state_json=json_set(state_json,'$.leftQuantity','10','$.rightQuantity','10','$.maxLeft','10','$.maxRight','10') WHERE strategy_id=?").run(id);
+    const m = await continuous(h, id); m.low(); await m.monitor.refresh(); await h.manager.tick();
+    h.ack(1, 'FILLED', '10'); h.quantities('0', '10'); await protectTicks(h, 2);
+    expect(h.created).toHaveLength(2); h.ack(2, 'FILLED', '10'); h.quantities('0', '0');
+    m.recovered(); await protectTicks(h, 3); await m.monitor.refresh();
+    await vi.advanceTimersByTimeAsync(2100); await m.monitor.refresh();
+    expect(h.runtime.getStrategy(id).management?.phase).toBe('COMPLETED');
+    expect(hasManagedClaims(h.db)).toBe(false); expect(m.monitor.snapshot().entryBlocked).toBe(false);
+    await protectTicks(h, 3); expect(h.created).toHaveLength(2);
+  });
+  it.each(['side', 'symbol', 'remote', 'reduce-only', 'budget', 'claim', 'batch'])('rejects invalid margin event proof (%s)', async change => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    m.low(); await m.monitor.refresh(); await h.manager.tick();
+    const order = h.runtime.listOpenOrders(id)[0];
+    const known = () => knownMarginOrder(h.db, h.runtime.getStrategy(id), readManagedState(h.db, id), 'account-1', h.legs, h.runtime.getOrder(order.id));
+    expect(known()).toBe(true);
+    if (change === 'side') h.db.prepare("UPDATE execution_orders SET side='BUY' WHERE id=?").run(order.id);
+    if (change === 'symbol') h.db.prepare("UPDATE execution_orders SET symbol='FOREIGN' WHERE id=?").run(order.id);
+    if (change === 'remote') h.db.prepare('UPDATE execution_orders SET remote_order_id=NULL WHERE id=?').run(order.id);
+    if (change === 'reduce-only') h.db.prepare('UPDATE execution_orders SET reduce_only=0 WHERE id=?').run(order.id);
+    if (change === 'budget') h.db.prepare("UPDATE execution_orders SET quantity='11' WHERE id=?").run(order.id);
+    if (change === 'claim') h.db.prepare('DELETE FROM managed_position_claims WHERE symbol=?').run(h.legs[0].symbol);
+    if (change === 'batch') h.db.prepare("UPDATE execution_orders SET strategy_clip='margin:foreign' WHERE id=?").run(order.id);
+    expect(known()).toBe(false);
+    expect(knownMarginPosition(h.db, h.runtime.getStrategy(id), readManagedState(h.db, id), 'account-1', h.legs,
+      { symbol: h.legs[0].symbol, position_qty: '90' })).toBe(false);
+  });
+  it('executes a bounded MMR batch while ordinary strategy review remains locked', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    h.manager.failAll('synthetic strategy review'); m.low(); await protectTicks(h);
+    expect(h.created).toHaveLength(1); expect(h.created[0]).toMatchObject({ qty: '10', reduce_only: 'true' });
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100'); await protectTicks(h);
+    expect(h.created).toHaveLength(2); h.ack(2, 'FILLED', '10'); h.quantities('90', '90'); m.recovered();
+    await protectTicks(h, 6);
+    expect(h.created).toHaveLength(2); expect(readManagedState(h.db, id)?.marginBatch).toBeNull();
+    expect(m.monitor.snapshot().incidentId).toBeNull(); expect(m.monitor.snapshot().entryBlocked).toBe(true);
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    await expect(h.runtime.createOrder({ symbol: h.legs[0].symbol, side: 'BUY', type: 'MARKET', quantity: '1' }))
+      .rejects.toMatchObject({ code: 'managed_global_risk_paused' });
+  });
+  it('keeps an already-filled margin pairing responsibility when new-batch group permission is removed', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    h.manager.failAll('synthetic review'); m.low(); await protectTicks(h); expect(h.created).toHaveLength(1);
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100');
+    m.monitor.savePolicy({ ...m.monitor.snapshot().policy, protectedGroupIds: [] }); await protectTicks(h);
+    expect(h.created).toHaveLength(2); expect(h.created[1]).toMatchObject({ symbol: h.legs[1].symbol, qty: '10', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '10'); h.quantities('90', '90'); await protectTicks(h, 6);
+    expect(h.created).toHaveLength(2); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('preserves a delayed fee reservation without making known account protection wait for a bill', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    h.manager.failAll('synthetic review'); m.low(); await m.monitor.refresh();
+    const key = m.monitor.snapshot().accountId!;
+    m.monitor.store.reserveCost(key, { batchId: 'older-fee', amount: '0.1', originalAmount: '0.1', quantity: '1', legs: [] }, Date.now());
+    m.monitor.blockIncident('synthetic ordinary strategy review'); await protectTicks(h);
+    expect(h.created).toHaveLength(1); expect(m.monitor.store.reservedCost(key)).toBe('0.1');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('automatically rechecks after prolonged data failure but never revives an explicitly revoked grant', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic read outage'); h.unavailable(); await protectTicks(h, 28);
+    expect(h.created).toHaveLength(0); h.unavailable(false); h.quantities('100', '90'); await protectTicks(h);
+    expect(h.created).toHaveLength(1); h.ack(1, 'FILLED', '10'); h.quantities('90', '90'); await protectTicks(h);
+    h.session.set('readonly'); h.quantities('90', '80'); await protectTicks(h);
+    expect(h.created).toHaveLength(1); expect(h.manager.protection.authority.grant()?.enabled).toBe(false);
+  });
+  it('preserves explicit live selection so the official manual strategy resume remains possible', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic strategy review'); await protectTicks(h); expect(h.session.current).toBe('protect_only');
+    h.session.set('live'); await protectTicks(h);
+    expect(h.session.current).toBe('live'); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    await h.manager.resume(id, 'account-1'); await h.manager.tick();
+    expect(h.session.current).toBe('live'); expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+    expect(h.created).toHaveLength(0);
+  });
+  it('gives protection its own bounded read after the ordinary invalidation deadline has expired', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id); h.missingFunding(true);
+    let release!: (facts: ManagedAccountFacts) => void;
+    h.setRead(() => new Promise(resolve => { release = resolve; })); const ordinary = h.manager.tick();
+    for (let i = 0; i < 20 && !release; i++) await Promise.resolve();
+    h.manager.notifyPosition({ symbol: h.legs[0].symbol, position_side: 'LONG', position_qty: '100', update_time: String(Date.now() + 1) });
+    release(h.facts()); await ordinary; h.setRead(null);
+    vi.setSystemTime(Date.now() + 26000); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+    h.quantities('100', '90'); h.setRead(() => new Promise(resolve => setTimeout(() => resolve(h.facts()), 20)));
+    for (let i = 0; i < 4; i++) {
+      vi.setSystemTime(Date.now() + 1100); const reading = h.manager.tick(); await vi.advanceTimersByTimeAsync(50); await reading;
+    }
+    expect(h.created).toHaveLength(1); expect(h.created[0]).toMatchObject({ qty: '10', reduce_only: 'true' });
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED'); expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+  });
+  it('cancels a proven owned resting maker once before continuing paused protection', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.requestExit(id); await h.manager.tick(); expect(h.created[0].type).toBe('LIMIT');
+    h.manager.failAll('synthetic review'); await protectTicks(h, 6);
+    expect(h.cancelled).toEqual(['remote-1']); expect(h.remote.get('remote-1')?.state).toBe('CANCELLED');
+    h.quantities('100', '90'); await protectTicks(h);
+    expect(h.created).toHaveLength(2); expect(h.created[1]).toMatchObject({ type: 'MARKET', qty: '10', reduce_only: 'true' });
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('reconciles an unknown protection submission instead of replaying it, then handles the next incident', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic review'); h.quantities('100', '90'); h.failSubmit(); await protectTicks(h, 8);
+    expect(h.created).toHaveLength(1); const pending = h.runtime.listOpenOrders(id)[0];
+    expect(pending.failureReason).toBe('ORDER_SUBMISSION_UNKNOWN'); await protectTicks(h, 8); expect(h.created).toHaveLength(1);
+    h.runtime.ingestPrivateEvent({ channel: 'order', payload: { text: pending.clientOrderId, order_id: 'remote-1', state: 'FILLED',
+      executed_qty: '10', executed_avg_price: '100', update_time: String(Date.now()) } });
+    h.quantities('90', '90'); h.failSubmit(false); await protectTicks(h);
+    h.quantities('90', '80'); await protectTicks(h);
+    expect(h.created).toHaveLength(2); expect(h.created[1].qty).toBe('10');
+  });
+  it.each(['readonly', 'account', 'KEEP'])('invalidates an enqueued protection permit on %s before transport dispatch', async change => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic review'); h.quantities('100', '90');
+    vi.setSystemTime(Date.now() + 1100); await h.manager.tick();
+    let release: (() => void) | undefined; h.setSubmitWait(() => new Promise<void>(resolve => { release = resolve; }));
+    vi.setSystemTime(Date.now() + 1100); const queued = h.manager.tick();
+    for (let i = 0; i < 100 && !release; i++) await Promise.resolve();
+    expect(release).toBeTypeOf('function');
+    if (change === 'readonly') h.session.set('readonly');
+    else if (change === 'account') h.changeAccount();
+    else h.manager.beginStop(id, false);
+    release!(); await queued; expect(h.created).toHaveLength(0);
+    if (change === 'readonly') expect(h.manager.protection.authority.grant()?.enabled).toBe(false);
+  });
+  it('restores only enrolled protection after restart and finishes the original first-leg responsibility', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
+    h.manager.failAll('synthetic review'); m.low(); await protectTicks(h);
+    expect(h.created).toHaveLength(1); h.ack(1, 'FILLED', '10'); h.quantities('90', '100');
+    await h.manager.stop();
+    const session = new TradingSession(), runtime = new TradingRuntime(h.db, session, h.vault, h.gateway);
+    const manager = new ManagedPositionManager(h.db, session, runtime, { market: symbol => ({ symbol, source: 'gate_crossex_websocket',
+      bidPrice: '100', askPrice: '101', updatedAt: new Date().toISOString(), receivedAt: new Date().toISOString() } as LiveMarket) }, h.sources);
+    managers.push(manager); const restarted = { ...h, session, runtime, manager };
+    const nextMargin = await continuous(restarted, id, false); nextMargin.low();
+    expect(session.current).toBe('unset'); await protectTicks(restarted, 6);
+    expect(session.current).toBe('protect_only'); expect(h.created).toHaveLength(2);
+    expect(h.created[1]).toMatchObject({ symbol: h.legs[1].symbol, qty: '10', reduce_only: 'true' });
+    expect(runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('does not round protection dust up or trade a stale quote and re-evaluates when evidence changes', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic review'); h.quantities('100', '99.5'); await protectTicks(h);
+    expect(h.created).toHaveLength(0); expect(h.manager.protection.view().state).toBe('BLOCKED');
+    h.quantities('100', '99'); h.missingQuote(h.legs[0].symbol); await protectTicks(h);
+    expect(h.created).toHaveLength(0); h.missingQuote(h.legs[0].symbol, false); await protectTicks(h);
+    expect(h.created).toHaveLength(1); expect(h.created[0].qty).toBe('1');
+  });
+  it('isolates an unknown group order while another group balances and waits for account proof before new margin risk', async () => {
+    const h = await harness(), first = await h.task(); await h.manager.tick(); const second = 'PAIR-SECOND';
+    const config = { ...h.config, asset: 'ETH' }, legs = managedLegs(config), stamp = new Date().toISOString();
+    h.db.prepare(`INSERT INTO execution_strategies (id,kind,environment,status,config_json,progress,filled_quantity,
+      filled_left,filled_right,open_position,credential_profile_id,created_at,updated_at)
+      VALUES (?,'position','live','RUNNING',?,100,'100','100','100','100','account-1',?,?)`).run(second, JSON.stringify(config), stamp, stamp);
+    h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run(second, 'account-1',
+      JSON.stringify({ ...readManagedState(h.db, first), groupId: second }), stamp);
+    for (const leg of legs) {
+      h.db.prepare('INSERT INTO managed_position_claims VALUES (?,?,?)').run('account-1', leg.symbol, second);
+      h.db.prepare(`INSERT INTO crossex_instruments (symbol,exchange_type,business_type,state,min_size,lot_size,tick_size,max_num_orders,default_leverage,delist_time,fetched_at)
+        VALUES (?,?,'FUTURE','live','1','1','0.01','100','1','0',?)`).run(leg.symbol, leg.symbol.split('_')[0], stamp);
+    }
+    const m = await continuous(h, first); let q = ['100', '90'];
+    h.setRead(async () => ({ ...h.facts(), positions: [...h.facts().positions, ...legs.map((leg, i) => ({ symbol: leg.symbol,
+      position_side: leg.side === 'BUY' ? 'LONG' : 'SHORT', position_qty: q[i] } as GateCrossExPosition))].map(p => ({ ...p, margin_mode: 'CROSS' })) }));
+    h.failSubmit();
+    await expect(h.runtime.createOrder({ symbol: h.legs[0].symbol, side: 'SELL', type: 'MARKET', quantity: '1', reduceOnly: true },
+      { strategyId: first, strategyLeg: 'left' })).rejects.toBeInstanceOf(Error);
+    h.failSubmit(false); const unknown = h.runtime.listOpenOrders(first)[0]; await protectTicks(h, 6);
+    expect(h.created).toHaveLength(2); expect(h.created[1]).toMatchObject({ symbol: legs[0].symbol, qty: '10', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '10'); q = ['90', '90']; m.low(); await protectTicks(h);
+    expect(h.created).toHaveLength(2); // unresolved shared-account responsibility is not assumed to cost zero
+    h.runtime.ingestPrivateEvent({ channel: 'order', payload: { text: unknown.clientOrderId, order_id: 'remote-1',
+      state: 'CANCELLED', executed_qty: '0', executed_avg_price: '0', update_time: String(Date.now()) } });
+    m.monitor.sources.proposal = record => record.id === second ? { quantity: '10', target: '10', initial: '1', maintenance: '10',
+      firstLeg: 0, apr: '0', approximate: true, parametersValidUntil: Date.now() + 60_000 } : null;
+    await protectTicks(h, 6);
+    expect(h.created).toHaveLength(3); expect(h.created[2]).toMatchObject({ symbol: legs[0].symbol, qty: '10', reduce_only: 'true' });
+    expect(h.runtime.getStrategy(first).status).toBe('PAUSED'); expect(h.runtime.getStrategy(second).status).toBe('PAUSED');
+  });
   it('keeps public data demand during a hard risk pause but withdraws it for explicit KEEP', async () => {
     const h = await harness(), id = await h.task();
     h.manager.failAll('managed_order_unresolved');
@@ -401,7 +777,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
   });
   it('rechecks official account freshness at the actual queued exit dispatch', async () => {
     const h = await harness(), id = await h.task(); await h.manager.tick(); h.manager.requestExit(id); await h.manager.tick();
-    const observedAt = Date.now(); h.manager.setMarginMonitor({ blockIncident: vi.fn(), snapshot: () => ({ fresh: Date.now() - observedAt <= 5000, incidentId: null }) } as unknown as MarginRiskMonitor);
+    const observedAt = Date.now(); h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), blockIncident: vi.fn(), snapshot: () => ({ fresh: Date.now() - observedAt <= 5000, incidentId: null }) } as unknown as MarginRiskMonitor);
     let release!: () => void; h.setSubmitWait(() => new Promise<void>(resolve => { release = resolve; }));
     h.ack(1, 'PARTIALLY_FILLED', '3'); for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(release).toBeDefined(); vi.setSystemTime(Date.now() + 6000); release(); await h.manager.waitForIdle();
@@ -411,7 +787,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
     const h = await harness(); const id = await h.task(); h.missingFunding(true);
     h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) }));
     await h.manager.tick(); const store = new MarginRiskStore(h.db), incident = store.startIncident('atomic-test', Date.now());
-    h.manager.setMarginMonitor({ snapshot: () => ({ incidentId: incident.id }), blockIncident: vi.fn(), assertFirstLeg: vi.fn(),
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), snapshot: () => ({ incidentId: incident.id }), blockIncident: vi.fn(), assertFirstLeg: vi.fn(),
       planBatch: () => { store.saveIncident('atomic-test', { ...incident, batch: { id: 'atomic-batch', firstLeg: 0,
         strategyId: id, before: '100', target: '90', at: Date.now() } }); return '10'; },
       preparedBatch: () => ({ version: 2, id: 'atomic-batch', incidentId: incident.id, before: '100', quantity: '10', firstLeg: 0 }),
@@ -428,7 +804,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
     h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) }));
     await h.manager.tick();
     h.db.prepare("UPDATE crossex_instruments SET lot_size = '0.1', min_size = '0.1' WHERE symbol = ?").run(h.legs[0].symbol);
-    h.manager.setMarginMonitor({ planBatch: () => '10', preparedBatch: () => ({ version: 2, id: 'precision-batch',
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), planBatch: () => '10', preparedBatch: () => ({ version: 2, id: 'precision-batch',
       incidentId: 'incident', before: '100', quantity: '10', firstLeg: 0 }), assertFirstLeg: vi.fn(),
       snapshot: () => ({ incidentId: 'incident' }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
     await h.manager.tick(); h.ack(1, 'CANCELLED', '0.6'); h.quantities('99.4', '100');
@@ -463,7 +839,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
     const h = await harness(); const id = await h.task(); h.missingFunding(true);
     h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map((p) => ({ ...p, margin_mode: 'CROSS' })) }));
     await h.manager.tick(); h.db.prepare("UPDATE crossex_instruments SET min_size = '5'").run();
-    h.manager.setMarginMonitor({ preparedBatch: () => ({ version: 2, id: 'test-batch', incidentId: 'incident', firstLeg: 0, before: '100', quantity: '10' }), assertFirstLeg: vi.fn(), planBatch: () => '10', snapshot: () => ({ incidentId: 'incident' }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), preparedBatch: () => ({ version: 2, id: 'test-batch', incidentId: 'incident', firstLeg: 0, before: '100', quantity: '10' }), assertFirstLeg: vi.fn(), planBatch: () => '10', snapshot: () => ({ incidentId: 'incident' }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
     await h.manager.tick(); expect(h.created[0].qty).toBe('10');
     h.ack(1, 'CANCELLED', '1'); h.quantities('99', '100'); await h.manager.tick(); await h.manager.tick();
     expect(h.created).toHaveLength(1); expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED');
@@ -506,7 +882,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
     h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map((p) => ({ ...p, margin_mode: 'CROSS' })) }));
     await h.manager.tick();
     const blockIncident = vi.fn();
-    h.manager.setMarginMonitor({ preparedBatch: () => ({ version: 2, id: 'test-batch', incidentId: 'incident', firstLeg: 0, before: '100', quantity: '10' }), assertFirstLeg: vi.fn(), planBatch: () => '10', snapshot: () => ({ incidentId: 'incident' }), blockIncident } as unknown as MarginRiskMonitor);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), preparedBatch: () => ({ version: 2, id: 'test-batch', incidentId: 'incident', firstLeg: 0, before: '100', quantity: '10' }), assertFirstLeg: vi.fn(), planBatch: () => '10', snapshot: () => ({ incidentId: 'incident' }), blockIncident } as unknown as MarginRiskMonitor);
     h.failSubmit(); await h.manager.tick(); await h.manager.tick();
     expect(h.created).toHaveLength(1); expect(h.session.current).toBe('readonly');
     expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED'); expect(blockIncident).toHaveBeenCalled();
@@ -514,7 +890,7 @@ describe('generic adopted position groups and explicit stop intent', () => {
   it('never lets margin protection override KEEP or missing cross-margin evidence', async () => {
     const h = await harness(); const id = await h.task(); h.missingFunding(true); await h.manager.tick();
     const planBatch = vi.fn(() => '10');
-    h.manager.setMarginMonitor({ planBatch, snapshot: () => ({ incidentId: null }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), planBatch, snapshot: () => ({ incidentId: null }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
     await h.manager.tick(); expect(planBatch).not.toHaveBeenCalled();
     h.manager.beginStop(id, false); await h.manager.finishStop(id); await h.manager.tick();
     expect(h.created).toHaveLength(0);

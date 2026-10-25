@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.3 — source candidate
+
+- Disclose intentional KEEP exclusions without marking other verified protection as perpetually reconciling.
+
+- Update Zod to 4.6.6, Fastify to 5.12.6, and fast-uri resolutions to 3.1.9/4.2.3 for current security advisories.
+
+- Atomically enroll newly launched managed groups for protection during pauses/restarts, including adoption and transfer under stable group identity.
+- Preserve revocation, KEEP, explicit read-only, unknown-order reconciliation and exact confirmed fill responsibility; disclose enrolled, verified and uncovered groups.
+- Continue independent authorized protection during ordinary risk pauses; complete only verified normal margin episodes automatically, without clearing legacy/manual locks or rebuilding exposure.
+- Publish durable group performance stages outside ordinary page queries, retain historical evidence and use current prices only for floating valuation.
+- Show exact per-leg entry/mark prices with settlement currencies; keep expired position snapshots visible with timestamps and disable stale-data actions.
+- Preserve existing migration bytes and upgrade by adding continuous-protection and performance-projection tables.
+
+This candidate contains source and deployment documentation, not precompiled desktop installers. Local acceptance is separate from publication and live trading.
+
 ## 1.0.2 — source release
 
 - Patch Vite to 7.3.7 and Vitest to 4.1.12, including the affected development mocker components.

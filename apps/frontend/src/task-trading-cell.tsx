@@ -7,6 +7,7 @@ const messages: Record<string, string> = {
   invalid_or_unpriced_evidence: '账单或历史汇率待核对', unallocated_trade_evidence: '存在未核实的任务账务',
   settlement_pending: '清仓后账单继续核对', last_confirmed_value: '保留上次可信结果', order_reconciliation_pending: '订单正在核对',
   funding_not_booked: '截至覆盖时点未见部分资金费账单，后续继续核对',
+  task_recalculating: '账务证据已更新，正在重新核对',
 };
 export function TaskTradingCell({ value, zh, stale = false }: { value: TaskTradingResult; zh: boolean; stale?: boolean }) {
   if (value.status === 'transferred') return <div className="strategy-realized-pnl"><strong>{zh ? '已并入后续任务' : 'Transferred'}</strong><small>{value.transferredTo}</small></div>;

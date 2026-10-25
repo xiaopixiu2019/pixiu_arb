@@ -9,7 +9,7 @@ export interface TradingValuation {
   profileId: string; at: number;
   positions: Array<{ symbol: string; quantity: string; unrealizedPnl: string }>;
 }
-function unrealized(g: TradingGroup, fees: TransactionFeeStore, key: string, profile: string, now: number, valuation?: TradingValuation): string | null {
+export function unrealized(g: Pick<TradingGroup, 'quantities' | 'latestFillAt'>, fees: TransactionFeeStore, key: string, profile: string, now: number, valuation?: TradingValuation): string | null {
   const held = Object.entries(g.quantities).filter(([, q]) => !decimal(q)?.isZero());
   if (!held.length) return '0';
   if (!valuation || valuation.profileId !== profile || valuation.at > now + 2000 || now - valuation.at > 15000 || valuation.at < g.latestFillAt) return null;
@@ -23,7 +23,7 @@ function unrealized(g: TradingGroup, fees: TransactionFeeStore, key: string, pro
   }
   return total.toFixed();
 }
-function adoptedBaseline(g: TradingGroup, fees: TransactionFeeStore, key: string): string | null {
+export function adoptedBaseline(g: TradingGroup, fees: TransactionFeeStore, key: string): string | null {
   if (!g.external) return '0';
   const root = g.tasks.find(t => t.id === g.id)!, at = Date.parse(root.state.adoptedAt ?? '');
   if (!Number.isFinite(at) || !root.state.adoptionBaseline?.length) return null;
@@ -35,7 +35,7 @@ function adoptedBaseline(g: TradingGroup, fees: TransactionFeeStore, key: string
   }
   return total.toFixed();
 }
-function baseResult(g: TradingGroup): TaskTradingResult {
+export function baseResult(g: TradingGroup): TaskTradingResult {
   return { amount: null, confirmed: null, unrealized: null, status: 'unavailable', scope: g.executionOnly ? 'execution' : g.external ? 'since_adoption' : g.tasks.length > 1 ? 'group' : 'task',
     groupId: g.id, members: g.tasks.map(t => t.id), reasons: [...g.issues], checkedAt: null, ledgerThrough: null, valuationAt: null,
     stale: false, adjustment: '0', maxError: null, maxErrorPct: null };

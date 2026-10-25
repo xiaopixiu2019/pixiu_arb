@@ -35,6 +35,27 @@ function tradingSnapshot(positions: TradingSnapshot['positions']): TradingSnapsh
 }
 
 describe('strategy positions', () => {
+  it('retains only the account portfolio cache as explicitly stale display evidence', () => {
+    const cached = portfolio({ dataStatus: 'stale', remoteStatus: 'unavailable' });
+    cached.snapshot.futuresPositions = [{ positionId: 'held', symbol: 'GATE_FUTURE_HYPE_USDT', positionSide: 'LONG',
+      quantity: '2', entryPrice: '50', markPrice: '51', value: '102', unrealizedPnl: '2', unrealizedPnlRate: '0',
+      initialMargin: '10', maintenanceMargin: '1', leverage: '1', maxLeverage: '20', riskLimit: '1', fee: '0',
+      fundingFee: '0', fundingTime: '', createdAt: '', updatedAt: '', realizedPnl: '0' }];
+    const before = structuredClone(cached);
+    const view = prepareStrategyPositions(cached, tradingSnapshot([]), { retainStalePortfolio: true });
+    expect(view.status).toBe('stale'); expect(view.rows).toHaveLength(1);
+    expect(view.rows[0]).toMatchObject({ quantity: 2, rawEntryPrice: '50', rawMarkPrice: '51', marginMode: null });
+    expect(cached).toEqual(before);
+    expect(prepareStrategyPositions(null, tradingSnapshot([]), { retainStalePortfolio: true })).toEqual({ status: 'unavailable', rows: [] });
+    expect(prepareStrategyPositions(portfolio(), tradingSnapshot([]), { retainStalePortfolio: true })).toEqual({ status: 'fresh', rows: [] });
+  });
+  it('retains missing price evidence without changing the existing numeric model', () => {
+    const positions = tradingSnapshot([{ position_id: 'missing', symbol: 'BYBIT_FUTURE_HYPE_USDT', venue: 'BYBIT',
+      quantity: '1', entry_price: '', mark_price: '', realized_pnl: '0', updated_at: '' }]);
+    expect(prepareExecutionPositionRows(positions, null)[0]).toMatchObject({
+      rawEntryPrice: '', rawMarkPrice: '', entryPrice: 0, markPrice: 0, valueAvailable: false, unrealizedAvailable: false,
+    });
+  });
   it('does not label an unverified execution cache as fresh', () => {
     expect(prepareStrategyPositions(null,tradingSnapshot([])).status).toBe('stale');
     expect(prepareStrategyPositions(portfolio({dataStatus:'stale'}),tradingSnapshot([])).status).toBe('stale');
@@ -74,8 +95,8 @@ describe('strategy positions', () => {
     expect(prepareStrategyPositions(snapshot)).toEqual({
       status: 'fresh',
       rows: [
-        expect.objectContaining({ id: 'BINANCE:large', asset: 'SKHY', side: 'Long', value: 3187.6 }),
-        expect.objectContaining({ id: 'GATE:small', asset: 'SKHYNIX', side: 'Short', value: 1546.7 }),
+        expect.objectContaining({ id: 'BINANCE:large', asset: 'SKHY', side: 'Long', value: 3187.6, rawEntryPrice: '158', rawMarkPrice: '159.38' }),
+        expect.objectContaining({ id: 'GATE:small', asset: 'SKHYNIX', side: 'Short', value: 1546.7, rawEntryPrice: '1185', rawMarkPrice: '1189.77' }),
       ],
     });
   });
@@ -97,8 +118,8 @@ describe('strategy positions', () => {
     expect(prepareStrategyPositions(portfolio(), snapshot)).toEqual({
       status: 'fresh',
       rows: [
-        expect.objectContaining({ id: 'DERIBIT:deribit-hype', asset: 'HYPE', quote: 'USDC', side: 'Short', quantity: -100 }),
-        expect.objectContaining({ id: 'BYBIT:bybit-hype', asset: 'HYPE', quote: 'USDT', side: 'Long', quantity: 100 }),
+        expect.objectContaining({ id: 'DERIBIT:deribit-hype', asset: 'HYPE', quote: 'USDC', side: 'Short', quantity: -100, rawMarkPrice: '51.818' }),
+        expect.objectContaining({ id: 'BYBIT:bybit-hype', asset: 'HYPE', quote: 'USDT', side: 'Long', quantity: 100, rawMarkPrice: '51.768' }),
       ],
     });
   });

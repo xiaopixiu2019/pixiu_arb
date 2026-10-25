@@ -12,3 +12,6 @@ This repository contains the public PIXIU ARB product source. Keep changes scope
 - Review partial fills, duplicates, unknown responses, stale data and concurrent control changes.
 - Retain AGPL-3.0-only, SOURCE_NOTICES.md, THIRD_PARTY_NOTICES.md and associated licenses.
 - Build success, deployment success and live trading outcomes are separate evidence.
+
+- New managed-task launch atomically enrolls only its stable group for pause/restart protection before any order. Do not migrate old grants by polling or revive revoked unrelated groups. Enrollment never replaces fresh holdings/order proof.
+- Preserve continuous-protection scope, fee responsibility and normal margin-episode recovery. Healthy ratios alone never clear old/manual locks or restore reduced exposure. See docs/managed-positions.md and docs/margin-risk-management.md.

@@ -22,6 +22,59 @@ function harness() {
   return { db, store, monitor, account, advance: (ms: number) => { now += ms; }, balance: (n: number) => { balance = n; },
     fail: () => { fail = true; }, changeContext: () => { context = 'profile:2'; }, pending: (p: Promise<MarginAccountRead> | null) => { pending = p; } };
 }
+
+it('does not generate group plans when no margin incident exists and still evaluates a later incident',async()=>{
+  const h=harness();await h.monitor.refresh();
+  const record={id:'s',config:{management:{perOrderQuantity:'10'}},management:{leftQuantity:'10'}} as unknown as Parameters<typeof h.monitor.planBatch>[0];
+  const groups=vi.spyOn(h.monitor.sources,'groups');
+  expect(h.monitor.planBatch(record,[],[record],'1',null)).toBeNull();expect(groups).not.toHaveBeenCalled();
+  h.monitor.sources.live=()=>true;h.balance(50);h.advance(2000);await h.monitor.refresh();groups.mockClear();
+  expect(h.monitor.planBatch(record,[],[record],'1',null)).toBeNull();expect(groups).toHaveBeenCalled();
+});
+describe('normal margin recovery authority', () => {
+  function automatic(h: ReturnType<typeof harness>) {
+    h.monitor.sources.live = () => true;
+    h.monitor.sources.groups = () => [{ id: 'g', strategyId: 's', asset: 'TEST', phase: 'MONITORING', eligible: true, authorized: true, reason: null }];
+    Object.assign(h.monitor.sources, { normalRecoveryAuthority: () => 'same-process-control' });
+  }
+  it('automatically releases only a new live incident after two recovered reads', async () => {
+    const h = harness(); automatic(h); await h.monitor.refresh();
+    h.balance(104); h.advance(2000); await h.monitor.refresh();
+    expect(h.monitor.snapshot().entryBlocked).toBe(true);
+    h.balance(200); h.advance(2000); await h.monitor.refresh();
+    expect(h.monitor.snapshot().entryBlocked).toBe(true);
+    h.advance(2000); await h.monitor.refresh();
+    expect(h.monitor.snapshot().incidentId).toBeNull(); expect(h.monitor.snapshot().entryBlocked).toBe(false);
+    expect(h.store.events(h.monitor.snapshot().accountId!).some(e => e.kind === 'entry_auto_recovered')).toBe(true);
+  });
+  it.each(['authority', 'policy', 'blocked', 'old-latch', 'restart', 'revoked-restored', 'blocked-revalidated'])('retains manual review after %s', async cause => {
+    const h = harness(); automatic(h); await h.monitor.refresh(); const key = h.monitor.snapshot().accountId!;
+    if (cause === 'old-latch') h.store.latch(key, true);
+    h.balance(104); h.advance(2000); await h.monitor.refresh();
+    if (cause === 'authority') Object.assign(h.monitor.sources, { normalRecoveryAuthority: () => 'changed-control' });
+    if (cause === 'policy') h.monitor.savePolicy({ ...h.monitor.snapshot().policy, reminderMinutes: 11 });
+    if (cause === 'blocked') h.monitor.blockIncident('synthetic hard fault');
+    if (cause === 'revoked-restored') h.monitor.invalidateNormalRecovery();
+    if (cause === 'blocked-revalidated') {
+      h.monitor.blockIncident('synthetic hard fault');
+      h.store.saveIncident(key, { ...h.store.incident(key)!, blocked: null });
+    }
+    const monitor = cause === 'restart' ? new MarginRiskMonitor(h.store, h.monitor.sources) : h.monitor;
+    h.balance(200); h.advance(2000); await monitor.refresh(); h.advance(2000); await monitor.refresh();
+    expect(monitor.snapshot().entryBlocked).toBe(true);
+  });
+  it('resets confirmations after a relapse and handles an MMR-only trigger', async () => {
+    const h = harness(); automatic(h); h.balance(200); await h.monitor.refresh();
+    h.monitor.savePolicy({ ...h.monitor.snapshot().policy, maintenance: { warn: 1110, reduce: 1100, recover: 1120 } });
+    h.balance(109); h.advance(2000); await h.monitor.refresh();
+    expect(h.store.incident(h.monitor.snapshot().accountId!)?.cause).toBe('MMR');
+    h.balance(120); h.advance(2000); await h.monitor.refresh();
+    h.balance(111); h.advance(2000); await h.monitor.refresh();
+    h.balance(120); h.advance(2000); await h.monitor.refresh(); expect(h.monitor.snapshot().entryBlocked).toBe(true);
+    h.advance(2000); await h.monitor.refresh(); expect(h.monitor.snapshot().entryBlocked).toBe(false);
+  });
+});
+
 describe('margin monitoring and persisted incidents', () => {
   it('reuses one full snapshot only inside one synchronous entry check', async () => {
     const h = harness(); await h.monitor.refresh();

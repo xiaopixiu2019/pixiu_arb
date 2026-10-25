@@ -274,10 +274,17 @@ export class PairedEntryAdmission implements PairedEntryController {
     }
   }
   private reconcile(): void {
-    const facts = this.facts, snapshot = this.monitor.snapshot();
-    if (!facts || facts.context !== this.o.context() || Date.now() - facts.at > 5000 || !snapshot.fresh || !snapshot.accountId) return;
-    const rows = this.o.db.prepare('SELECT strategy_id FROM paired_entry_reservations WHERE account_id=?').all(snapshot.accountId) as Array<{ strategy_id: string }>;
-    for (const { strategy_id: id } of rows) {
+    const facts = this.facts;
+    if (!facts || facts.context !== this.o.context() || Date.now() - facts.at > 5000) return;
+    const rows = (this.o.db.prepare('SELECT strategy_id,account_id FROM paired_entry_reservations').all() as Array<{ strategy_id: string; account_id:string }>)
+      .filter(row => {
+        try { return readEntryBudget(this.o.db,row.strategy_id)?.released !== true; }
+        catch { return true; } // Only a validated released commitment may be skipped; current-account corruption still fails below.
+      });
+    if (!rows.length) return;
+    const snapshot = this.monitor.snapshot();
+    if (!snapshot.fresh || !snapshot.accountId) return;
+    for (const { strategy_id: id } of rows.filter(r=>r.account_id===snapshot.accountId)) {
       const record = this.o.runtime.listStrategies().find(r => r.id === id);
       if (!record) continue;
       const orders = entryOrders(this.o.db, id), last = Math.max(0, ...orders.map(o => Date.parse(o.updated_at)));
@@ -285,7 +292,7 @@ export class PairedEntryAdmission implements PairedEntryController {
       const budget = readEntryBudget(this.o.db, id)!;
       let quantities: [string, string];
       try { quantities = pairedQuantities(facts.positions, managedLegs(record.config)); } catch { continue; }
-      if (!this.coverageReady(budget, orders, quantities)) continue;
+      if (!this.coverageReady(budget, orders, quantities, snapshot)) continue;
       if (this.canRelease(record.id, orders, budget, quantities, facts.openOrders)) {
         const covered = budget.legs.map(leg => ({ ...leg, covered: Object.fromEntries(orders
           .filter(o => o.symbol === leg.symbol && !o.reduce_only && o.side === leg.side).map(o => [o.id, o.executed_quantity])) }));
@@ -297,8 +304,7 @@ export class PairedEntryAdmission implements PairedEntryController {
       if (covered) saveEntryBudget(this.o.db, id, snapshot.accountId, record.config, covered);
     }
   }
-  private coverageReady(budget: PairedEntryBudget, orders: ReturnType<typeof entryOrders>, quantities: [string, string]): boolean {
-    const snapshot = this.monitor.snapshot();
+  private coverageReady(budget: PairedEntryBudget, orders: ReturnType<typeof entryOrders>, quantities: [string, string], snapshot: MarginSnapshot): boolean {
     return budget.legs.every((leg, index) => {
       const metrics = snapshot.metrics?.accountMode === 'CROSS_EXCHANGE' ? snapshot.metrics
         : snapshot.units?.find(unit => unit.exchangeType === leg.symbol.split('_')[0])?.metrics;

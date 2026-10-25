@@ -10,8 +10,9 @@ export function emptyFeeSummary(profileId: string | null, reason: string): FeeSu
   const missing: FeeMetric = { amount: null, status: 'unavailable', pending: 0, reason };
   return { profileId, currency: 'USDT', since: null, checkedAt: null, total: missing, today: missing, yesterday: missing, assigned: missing, unassigned: missing, tasks: [] };
 }
-function context(store: TransactionFeeStore, key: string, now: number) {
-  const epoch = store.epoch(key)!;
+function context(store: TransactionFeeStore, key: string, now: number, historyOnly = false) {
+  const actual = store.epoch(key)!;
+  const epoch = historyOnly ? { ...actual, checked_at: now, book_reason: null, trade_reason: null } : actual;
   const trades = store.trades(key), retained = store.bindings(key);
   const rows = resolveFeeBooks(store.book(key), retained, trades);
   const bindings = new Map(retained.map((b) => [feeOrderKey(b.venue, b.order_id), b]));
@@ -28,8 +29,8 @@ function dated(rows: FeeBookRow[], epoch: FeeEpoch, reason: string | null, from:
   if (epoch.checked_at === null || epoch.covered_to < from) return feeMetric([], 'fee_collecting');
   return feeMetric(rows.filter((r) => r.at >= from && r.at < to), reason ?? (epoch.started_at > from || (closed && epoch.covered_to < to) ? 'fee_partial_day' : null));
 }
-export function feeSummary(store: TransactionFeeStore, key: string, now: number): FeeSummary {
-  const c = context(store, key, now), day = dayStart(now);
+export function feeSummary(store: TransactionFeeStore, key: string, now: number, historyOnly = false): FeeSummary {
+  const c = context(store, key, now, historyOnly), day = dayStart(now);
   const taskStarts = new Map(store.tasks(c.epoch.profile_id).map((t) => [t.id, Date.parse(t.created_at)]));
   for (const b of c.bindings.values()) taskStarts.set(b.task_id, b.task_started_at);
   const assigned = c.rows.filter((r) => c.bindings.has(feeOrderKey(r.venue, r.order_id)));

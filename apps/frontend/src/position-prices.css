@@ -1,0 +1,9 @@
+.positions-table .position-price-cell { padding-top: 9px; padding-bottom: 9px; white-space: nowrap; }
+.positions-table .position-price-line { display: flex; align-items: baseline; justify-content: flex-end; gap: 8px; line-height: 1.6; }
+.positions-table .position-price-source { font-size: 11px; color: #8996a7; }
+.positions-table .position-price-value { color: var(--text); font-variant-numeric: tabular-nums; }
+.positions-table .position-price-missing { color: #8996a7; }
+html[data-theme='light'] .positions-table .position-price-source,
+html[data-theme='light'] .positions-table .position-price-missing { color: #5f6f7d; }
+.positions-table .position-price-expand { font: inherit; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 4px; padding: 4px 7px; cursor: pointer; }
+.positions-table .position-price-expand:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }

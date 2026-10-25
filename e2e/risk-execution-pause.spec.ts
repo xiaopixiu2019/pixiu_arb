@@ -61,8 +61,19 @@ test('healthy margin never conceals paused tasks, readonly, partial recovery or 
   current = { ...current, groups: current.groups.map(g => ({ ...g, phase: 'MONITORING' })) };
   stream!.send(JSON.stringify({ type: 'risk.margin', payload: current }));
   await expect(page.locator('.risk-execution-notice')).toHaveCount(0);
+  current = { ...current, continuousProtection: { enabled: true, state: 'RECONCILING',
+    coverage: tasks.map((task, i) => ({ groupId: task.id, strategyId: task.id, enrolled: i !== 0,
+      reason: i === 0 ? 'protection_group_not_enrolled' : null })),
+    groups: tasks.slice(1).map(task => ({ strategyId: task.id, state: 'WATCHING', reason: null, checkedAt: at })),
+  } };
+  stream!.send(JSON.stringify({ type: 'risk.margin', payload: current }));
+  const protection = page.getByRole('region', { name: '暂停期间持续保护' });
+  await expect(protection).toContainText('当前托管组 4 · 已登记 3 · 已核实保护 3');
+  await expect(protection).toContainText('PAIR-XMR · 未覆盖');
+  await expect(protection).toContainText('此组尚未登记，请核实并授权');
   expect(pausedBadgeWidth).toBeLessThanOrEqual((await page.locator('.risk-topbar').boundingBox())!.width);
   await page.clock.fastForward(6000);
+  await expect(protection).toContainText('已核实保护 0');
   await expect(page.locator('.risk-execution-notice h2')).toHaveText('执行状态待核实');
   await expect(page.locator('.risk-topbar')).toHaveAttribute('data-execution-state', 'unavailable');
   current = { ...current, accountId: 'risk-b', sampledAt: at + 6000, groups: [], liveEnabled: false };

@@ -68,8 +68,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 32,
-      currentMigration: '0032_paired_entry_reservations.sql',
+      migrationCount: 34,
+      currentMigration: '0034_task_performance_projection.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -83,6 +83,8 @@ describe('database migrations', () => {
     expect(commitmentColumns.map((column) => column.name)).toEqual([
       'strategy_id', 'account_id', 'config_hash', 'payload_json', 'created_at', 'updated_at',
     ]);
+    expect(first.prepare('SELECT count(*) AS count FROM continuous_protection_authority').get()).toEqual({ count: 0 });
+    expect(first.prepare('SELECT count(*) AS count FROM continuous_protection_status').get()).toEqual({ count: 0 });
     if (process.platform !== 'win32') {
       expect(statSync(location.directory).mode & 0o777).toBe(0o700);
       expect(statSync(location.path).mode & 0o777).toBe(0o600);
@@ -90,7 +92,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(32);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(34);
     reopened.close();
   });
 
@@ -186,7 +188,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0032_paired_entry_reservations.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0034_task_performance_projection.sql');
     database.close();
   });
 

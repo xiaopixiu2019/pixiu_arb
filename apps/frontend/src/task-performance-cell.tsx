@@ -5,7 +5,7 @@ const reasons: Record<string,string>={history_incomplete:'历史账单尚未补�
   adopted_basis_unverified:'接管旧仓成本待核对',transferred_basis_unverified:'交接成本待核对',conflicting_evidence:'账务证据冲突',
   fee_evidence_pending:'手续费证据待核对',price_evidence_pending:'成交盈亏账单待核对',funding_evidence_pending:'资金费结算待核对',
   unallocated_account_cost:'存在未归属账务或账户成本',settlement_pending:'等待结算账单',fill_coverage_incomplete:'成交覆盖不完整',
-  task_data_unavailable:'账务读取失败',unclassified_ledger:'存在待分类账务',late_funding_attribution_pending:'迟到资金费归属待核对',invalid_trade_evidence:'成交数据格式异常'};
+  task_data_unavailable:'账务读取失败',task_recalculating:'账务证据已更新，正在重新核对',unclassified_ledger:'存在待分类账务',late_funding_attribution_pending:'迟到资金费归属待核对',invalid_trade_evidence:'成交数据格式异常'};
 const money=(v:string|null)=>v===null?'—':Number(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:8});
 export function TaskPerformanceCell({value,zh,stale=false}:{value:TaskPerformance|undefined;zh:boolean;stale?:boolean}) {
   if(value?.trading)return <TaskTradingCell value={value.trading} zh={zh} stale={stale} />;

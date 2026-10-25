@@ -19,6 +19,8 @@ function render(busy = false, managed = false): string {
 describe('strategy launch confirmation', () => {
   it('discloses launch authorization only for managed tasks', () => {
     expect(render(false, true)).toContain('Starting authorizes account IMR/MMR reduction for this managed group');
+    expect(render(false, true)).toContain('continuous protection during pauses and restarts');
+    expect(render(false, true)).toContain('does not reauthorize other revoked groups');
     expect(render()).not.toContain('Starting authorizes');
   });
   it('requires an explicit confirmation and has no preference bypass', () => {

@@ -17,6 +17,7 @@ const events: Record<string, [string, string, string, string, string, string, Co
   batch_completed: ['本批双腿减仓完成', '本批已核对平衡；账户风险是否恢复需另行确认。', '本批完成', 'Paired reduction batch completed', 'Batch balanced; account recovery is checked separately.', 'Batch complete', 'green'],
   recovered: ['保证金已回到恢复线', '已停止继续减仓；增仓仍锁定，等待人工复核。', '待复核', 'Margin recovery confirmed', 'Further reduction stopped; new exposure remains locked pending review.', 'Review needed', 'amber'],
   entry_reviewed: ['已人工复核', '保证金增仓锁已解除；其他交易限制仍单独校验。', '已复核', 'Margin entry lock reviewed', 'Margin entry lock cleared; other trading restrictions still apply.', 'Reviewed', 'green'],
+  entry_auto_recovered: ['保证金保护已自动恢复', '成交与剩余仓位已核实，两项保证金恢复线已确认；本次冻结解除，继续监控剩余仓位。', '已恢复', 'Margin protection automatically recovered', 'Fills, remaining holdings and both recovery thresholds verified; this episode hold is released and remaining holdings stay monitored.', 'Recovered', 'green'],
   blocked: ['风险处理需要关注', '自动处理条件未满足，请查看原因并核实当前状态。', '处理受阻', 'Risk handling needs attention', 'Automatic handling conditions are unmet; inspect the reason and current state.', 'Blocked', 'red'],
   protection_blocked: ['自动保护处理受阻', '保留未清风险责任，请核对订单与仓位后处理。', '需处理', 'Automatic protection blocked', 'Unresolved responsibility is retained. Reconcile orders and positions.', 'Action needed', 'red'],
   unavailable: ['保证金数据不可用', '已阻止新增仓位；旧值仅供参考。', '数据中断', 'Margin data unavailable', 'New exposure blocked; previous values are reference only.', 'Unavailable', 'red'],
@@ -63,7 +64,10 @@ export function riskReason(reason: string, zh: boolean): string {
 }
 export function protectionCopy(s: MarginSnapshot | null, fresh: boolean, zh: boolean): { title: string; detail: string; tone: string } {
   if (!s || !fresh) return { title: zh ? '保护状态待核实' : 'Protection unverified', detail: zh ? '等待有效账户数据。' : 'Awaiting fresh account data.', tone: 'amber' };
-  if (!s.liveEnabled) return { title: zh ? '未启用实盘执行' : 'Live execution disabled', detail: zh ? '监控仍运行，不执行自动减仓。' : 'Monitoring continues; no automatic reduction.', tone: 'amber' };
+  if (s.continuousProtection?.enabled && ['BLOCKED', 'RECONCILING'].includes(s.continuousProtection.state)) return {
+    title: zh ? '持续保护正在核对' : 'Continuous protection is reconciling',
+    detail: zh ? '监控继续；请查看持续保护中的阻断原因与各组执行状态。' : 'Monitoring continues. Inspect the protection constraints and group states.', tone: 'amber' };
+  if (!s.liveEnabled && !s.continuousProtection?.enabled) return { title: zh ? '未启用实盘执行' : 'Live execution disabled', detail: zh ? '监控仍运行，不执行自动减仓。' : 'Monitoring continues; no automatic reduction.', tone: 'amber' };
   if (s.metrics && s.metrics.accountMode !== 'CROSS_EXCHANGE') return { title: zh ? '分所模式，仅监控' : 'Separate venues: monitoring only', detail: zh ? '当前账户模式不支持自动减仓。' : 'Automatic reduction is unsupported in this mode.', tone: 'amber' };
   const authorized = s.groups.filter(g => g.authorized), eligible = authorized.filter(g => g.eligible);
   if (!authorized.length) return { title: zh ? '未授权自动减仓' : 'Automatic reduction not authorized', detail: zh ? '仅监控与拦截新增；请在保护设置中选择托管组。' : 'Monitoring and entry checks only. Select groups in settings.', tone: 'amber' };

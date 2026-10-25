@@ -4,6 +4,8 @@ export type Language = 'en' | 'zh';
 export type Theme = 'dark' | 'light';
 
 const chinese: Record<string, string> = {
+  'leg prices': '腿价格',
+  Expand: '展开', Collapse: '收起',
   'Register on Gate · Enjoy trading-fee rebates': '注册 Gate，享受交易手续费返佣',
   'Gate settles eligible rebates. Existing accounts keep their current invitation relationship.': '返佣由 Gate 按适用规则结算；已有账户保持原有邀请关系。',
   'Order book snapshot; excludes fees, slippage and USD/USDT/USDC conversion.': '盘口快照；未扣手续费、滑点，未换算 USD/USDT/USDC 汇率。',

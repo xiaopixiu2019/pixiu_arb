@@ -20,8 +20,10 @@ export class PerformanceStore {
     return null;
   }
   saveSample(key: string, sample: PerformanceSample, balances: unknown): void {
-    this.db.prepare('INSERT OR REPLACE INTO performance_samples VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(key, sample.at, sample.equity, sample.available, sample.reason, JSON.stringify(sample.rates), JSON.stringify(balances));
+    this.db.prepare(`INSERT INTO performance_samples VALUES (?,?,?,?,?,?,?) ON CONFLICT(account_key,at) DO UPDATE SET
+      equity=excluded.equity,available=excluded.available,reason=excluded.reason,rates_json=excluded.rates_json,balances_json=excluded.balances_json`)
+      .run(key, sample.at, sample.equity, sample.available, sample.reason,
+        JSON.stringify(Object.fromEntries(Object.entries(sample.rates).sort(([a], [b]) => a.localeCompare(b)))), JSON.stringify(balances));
   }
   flows(key: string): PerformanceFlow[] {
     return this.db.prepare('SELECT at, amount, reason FROM performance_flows WHERE account_key = ? ORDER BY at').all(key) as PerformanceFlow[];

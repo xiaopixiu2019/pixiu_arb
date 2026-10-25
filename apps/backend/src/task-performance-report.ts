@@ -8,9 +8,9 @@ import { strictDecimal, type FeeBinding, type FeeBookRow } from './transaction-f
 import { boundedTaskEstimate } from './task-performance-tolerance.js';
 
 interface TaskRow { id: string; status: string; created_at: string; stopped_at: string | null; config_json: string; state_json: string | null }
-interface Proof { task: TaskRow; bindings: FeeBinding[]; trades: StoredFeeTrade[]; symbols: string[]; from: number; to: number; closed: boolean; reasons: string[] }
+export interface Proof { task: TaskRow; bindings: FeeBinding[]; trades: StoredFeeTrade[]; symbols: string[]; from: number; to: number; closed: boolean; reasons: string[] }
 const kinds: Record<string,PnlKind> = {TRANSACTION:'price',FUNDING_FEE:'funding',TRADING_FEE:'fees',LIQUIDATION_FEE:'other',INTEREST_ISOLATED:'other',BANKRUPT_COMPENSATION:'other'};
-const kindOf=(type:string):PnlKind|undefined=>Object.hasOwn(kinds,type)?kinds[type]:undefined;
+export const kindOf=(type:string):PnlKind|undefined=>Object.hasOwn(kinds,type)?kinds[type]:undefined;
 const transfers = new Set(['TRANSFER_IN','TRANSFER_OUT']);
 function validTrade(t:StoredFeeTrade):boolean {
   try {return ['BUY','SELL'].includes(t.side) && strictDecimal(t.qty).gt(0) && strictDecimal(t.rpnl).isFinite();}
@@ -21,10 +21,9 @@ function venueMatches(r: PnlBook, b: FeeBinding): boolean {
   return r.exchange_type === b.venue || r.exchange_type === 'CROSSEX' && r.coin === 'USDT'
     && ['GATE','BINANCE','OKX','BYBIT'].includes(b.venue);
 }
-function proofs(fees: TransactionFeeStore, key: string, profile: string, now: number): Proof[] {
+export function proofs(fees: TransactionFeeStore, key: string, profile: string, now: number): Proof[] {
   const bindings = fees.bindings(key), trades = fees.trades(key);
-  const tasks = fees.db.prepare(`SELECT s.id,s.status,s.created_at,s.stopped_at,s.config_json,m.state_json
-    FROM execution_strategies s LEFT JOIN managed_positions m ON m.strategy_id=s.id WHERE s.credential_profile_id=?`).all(profile) as TaskRow[];
+  const tasks = fees.reportTasks(profile);
   return tasks.map(task => {
     const own = bindings.filter(b=>b.task_id===task.id), fills = trades.filter(t=>own.some(b=>b.venue===t.exchange_type && b.order_id===t.order_id && b.symbol===t.symbol && b.client_order_id===t.text));
     const state = task.state_json ? JSON.parse(task.state_json) : null;
@@ -45,17 +44,17 @@ function proofs(fees: TransactionFeeStore, key: string, profile: string, now: nu
       to:closed?Date.parse(task.stopped_at ?? ''):now,closed,reasons};
   });
 }
-function entry(r: PnlBook, fees: TransactionFeeStore, key: string, feeBooks: Map<string,FeeBookRow>): PnlEntry {
+export function entry(r: PnlBook, fees: TransactionFeeStore, key: string, feeBooks: Map<string,FeeBookRow>): PnlEntry {
   const fee=r.statement_type==='TRADING_FEE'?feeBooks.get(r.id):undefined;
   return {id:r.id,kind:kindOf(r.statement_type) ?? 'other',coin:r.coin,change:r.change,
     rate:fee?.rate ?? fees.rateAt(key,r.coin,Number(r.create_time)),conflict:r.conflict || !!fee?.conflict};
 }
-function directOwner(r: PnlBook, all: Proof[]): Proof[] {
+export function directOwner(r: PnlBook, all: Proof[]): Proof[] {
   if (!r.symbol) return [];
   return all.filter(p=>p.bindings.some(b=>b.symbol===r.symbol && b.order_id===r.business_id && venueMatches(r,b)));
 }
 /** A verified flat-to-flat lifecycle and unique fills are required; names/time alone never establish ownership. */
-function fundingOwner(r: PnlBook, all: Proof[], trades: StoredFeeTrade[], links: Map<string,Set<string>>): Proof[] {
+export function fundingOwner(r: PnlBook, all: Proof[], trades: StoredFeeTrade[], links: Map<string,Set<string>>): Proof[] {
   const at=Number(r.create_time);
   const candidates=all.filter(p=>p.symbols.includes(r.symbol ?? '') && at>=p.from && at<=p.to
     && p.bindings.some(b=>b.symbol===r.symbol && venueMatches(r,b)));
@@ -69,7 +68,7 @@ function fundingOwner(r: PnlBook, all: Proof[], trades: StoredFeeTrade[], links:
     && !p.trades.some(own=>own.transaction_id===t.transaction_id && own.exchange_type===t.exchange_type));
   return interfering?[]:candidates;
 }
-function fundingLinks(rows:PnlBook[],all:Proof[]):Map<string,Set<string>> {
+export function fundingLinks(rows:PnlBook[],all:Proof[]):Map<string,Set<string>> {
   const links=new Map<string,Set<string>>();
   for(const r of rows.filter(r=>r.statement_type==='FUNDING_FEE')){
     const prefix=r.business_id.slice(0,r.business_id.lastIndexOf('_')),key=`${r.symbol}:${prefix}`,owners=links.get(key)??new Set<string>();
@@ -78,7 +77,7 @@ function fundingLinks(rows:PnlBook[],all:Proof[]):Map<string,Set<string>> {
   }
   return links;
 }
-function priceCoverage(p: Proof, rows: PnlBook[]): boolean {
+export function priceCoverage(p: Proof, rows: PnlBook[]): boolean {
   if(p.trades.some(t=>!validTrade(t)))return false;
   return p.bindings.every(b=>{
     const fills=p.trades.filter(t=>t.exchange_type===b.venue && t.order_id===b.order_id);

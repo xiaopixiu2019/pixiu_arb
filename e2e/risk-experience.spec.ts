@@ -28,6 +28,26 @@ async function pauseRiskClock(page: Page): Promise<number> {
   return at;
 }
 
+test('normal margin recovery shows reconciliation then releases only its entry hold', async ({ page }) => {
+  await setup(page);
+  let confirming = true;
+  await page.route('**/api/risk/margin', r => r.fulfill({ json: current(confirming ? { status: 'reducing', entryBlocked: true,
+    incidentId: 'normal-incident', protection: { cause: 'MMR', stage: 'confirming_recovery', confirmations: 1,
+      batchId: null, strategyId: null, plannedQuantity: null, targetQuantity: null, apr: null, fallback: false, reason: null } } : {}) }));
+  await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId: 'risk-a', hasMore: false,
+    events: confirming ? [] : [{ id: 1, at: Date.now(), kind: 'entry_auto_recovered', detail: 'synthetic verified recovery', revision: 0 }] } }));
+  await open(page);
+  await expect(page.locator('.risk-status h2')).toHaveText('保证金恢复核对中');
+  await expect(page.locator('.risk-health')).toContainText('已阻止');
+  confirming = false; await page.getByRole('button', { name: '刷新数据', exact: true }).click();
+  await expect(page.locator('.risk-status')).toHaveClass('risk-status clear');
+  await expect(page.locator('.risk-health')).toContainText('逐单校验');
+  await open(page); // Reopen with fresh account evidence; risk refresh and 30-second history polling are independent.
+  await expect(page.locator('.risk-events')).toContainText('保证金保护已自动恢复');
+  await expect(page.locator('.risk-events')).toContainText('继续监控剩余仓位');
+  await expect(page.getByRole('button', { name: '查看并复核', exact: true })).toHaveCount(0);
+});
+
 test('approximate protection and delayed fee details preserve healthy official risk and authorization', async ({ page }) => {
   await setup(page); const policy = { ...current().policy, protectedGroupIds: ['g'] };
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current({ policy, effectivePolicy: policy,
@@ -52,8 +72,8 @@ test('saved authorization does not claim borrowing protection when model evidenc
   await expect(page.locator('.risk-scope-status')).toHaveText('已授权，规划证据待核实');
   await expect(page.locator('.risk-sidebar')).toContainText('借币');
   await page.locator('.risk-settings summary').click();
-  await expect(page.locator('.risk-group').filter({ hasText: 'TEST' })).toContainText('暂不可规划');
-  await expect(page.locator('.risk-group').filter({ hasText: 'TEST' }).locator('input')).toBeChecked();
+  await expect(page.locator('.risk-settings .risk-group').filter({ hasText: 'TEST' })).toContainText('暂不可规划');
+  await expect(page.locator('.risk-settings .risk-group').filter({ hasText: 'TEST' }).locator('input')).toBeChecked();
 });
 
 test('fresh stream observations stay valid between clock ticks and expire without another message', async ({ page }) => {
