@@ -11,6 +11,6 @@
     "test": "vitest run --config ../../vitest.config.ts"
   },
   "dependencies": {
-    "zod": "4.1.12"
+    "zod": "4.6.6"
   }
 }
