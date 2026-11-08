@@ -3,7 +3,7 @@ import type { MarginServiceOptions } from './margin-risk-service.js';
 import type { MarginEntryCheck, MarginRiskMonitor } from './margin-risk-monitor.js';
 import type { MarginSnapshot } from '@gate-crossex/shared-types';
 import type { GateCrossExOrder, GateCrossExPosition, TradingCrossExGateway } from './crossex-client.js';
-import { readCrossMarginEvidence } from './cross-margin-admission.js';
+import { admissionReadFailure, readCrossMarginEvidence } from './cross-margin-admission.js';
 import { freshManagedQuote, pairedQuantities } from './managed-position-model.js';
 import { managedLegs } from './managed-position-manager.js';
 import { managedRiskReason, readManagedState } from './managed-position-store.js';
@@ -27,13 +27,20 @@ export interface PairedEntryController {
   event?(event: { channel: string; payload: Record<string, unknown> }): void;
 }
 const eligible = (c: CreateStrategyInput) => c.kind === 'position' && c.executionMethod === 'MAKER_TAKER' && !!c.management && !c.reduceOnly;
-const fail = (reason: string): never => { throw new TradingRuntimeError(reason, 409); };
+const fail = (reason: string, detail?: Record<string, unknown>): never => {
+  throw new TradingRuntimeError(reason, 409, detail ? JSON.stringify(detail) : undefined);
+};
+async function entryRead<T>(stage: string, read: Promise<T>, signal?: AbortSignal): Promise<T> {
+  try { return await read; }
+  catch (error) { return fail('paired_entry_read_failed', { ...admissionReadFailure(error, stage, undefined, signal) }); }
+}
 
 /** Durable task commitments; HTTP preparation happens before a maker, never on its hedge path. */
 export class PairedEntryAdmission implements PairedEntryController {
   private tail: Promise<unknown> = Promise.resolve();
   private stopped = false;
-  private readonly pending = new Set<string>();
+  private preparationEpoch = 0;
+  private readonly pending = new Map<string, { key: string; work: Promise<void> }>();
   private readonly certificates = new Map<string, { context: string; hash: string; at: number }>();
   private ordinary: () => Array<{ initial: Decimal; maintenance: Decimal; venue: string }> = () => [];
   private facts: { positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[]; at: number; context: string } | null = null;
@@ -42,7 +49,7 @@ export class PairedEntryAdmission implements PairedEntryController {
     this.pools = new PairedEntryPool(o, user);
   }
   setOrdinaryReservations(read: typeof this.ordinary): void { this.ordinary = read; }
-  invalidate(): void { this.certificates.clear(); this.pools.invalidate(); }
+  invalidate(): void { this.preparationEpoch++; this.certificates.clear(); this.pools.invalidate(); }
   stream(live: boolean): void { this.pools.stream(live); }
   event(event: { channel: string; payload: Record<string, unknown> }): void {
     try { this.pools.event(event); }
@@ -88,49 +95,85 @@ export class PairedEntryAdmission implements PairedEntryController {
       if (!eligible(record.config) || record.status !== 'RUNNING' || record.management?.phase !== 'OPENING'
         || !readEntryBudget(this.o.db, record.id) || this.pending.has(record.id)) continue;
       if (Date.now() - (this.certificates.get(record.id)?.at ?? 0) < 4000) continue;
-      void this.prepare(record.id, record.config, record.accountProfileId).catch(() => { this.certificates.delete(record.id); });
+      const certificate = this.certificates.get(record.id);
+      void this.prepare(record.id, record.config, record.accountProfileId).catch(() => {
+        // Preserve the existing background invalidation without erasing a newer proof.
+        if (this.certificates.get(record.id) === certificate) this.certificates.delete(record.id);
+      });
     }
     this.reconcile();
   }
   prepare(id: string, config: CreateStrategyInput, account: string | null): Promise<void> {
     if (!eligible(config)) return Promise.resolve();
     if (this.stopped) return Promise.reject(new TradingRuntimeError('paired_entry_stopped', 409));
-    if (this.ready(id) && this.certificates.get(id)?.hash === entryConfigHash(config)
-      && Date.now() - this.certificates.get(id)!.at < 4000) return Promise.resolve();
-    this.pending.add(id);
-    const work = this.tail.then(() => this.prepareOnce(id, config, account)).finally(() => { this.pending.delete(id); });
-    this.tail = work.catch(() => undefined); return work;
+    if (!account || account !== this.o.profile()?.id || !this.o.live())
+      return Promise.reject(new TradingRuntimeError('paired_entry_account_changed', 409));
+    const requested = structuredClone(config), hash = entryConfigHash(requested), context = this.o.context(), epoch = this.preparationEpoch;
+    const key = JSON.stringify([account, context, hash, epoch]), pending = this.pending.get(id);
+    if (pending?.key === key) return pending.work;
+    if (this.preparedRecently(id, hash)) return Promise.resolve();
+    let drained = Promise.resolve();
+    const work: Promise<void> = this.tail.then(async () => {
+      if (this.stopped || epoch !== this.preparationEpoch || context !== this.o.context()
+        || account !== this.o.profile()?.id || !this.o.live()) fail('paired_entry_account_changed');
+      if (!this.preparedRecently(id, hash)) await this.prepareOnce(id, requested, account, epoch, reads => {
+        drained = Promise.allSettled(reads).then(() => undefined);
+      });
+    }).finally(() => {
+      // Completed failures must not be counted again by a later Maker attempt.
+      if (this.pending.get(id)?.work === work) this.pending.delete(id);
+    });
+    this.pending.set(id, { key, work });
+    // Report the first failure promptly, but keep its reads owned until the entire batch drains.
+    this.tail = work.catch(() => undefined).then(() => drained);
+    return work;
   }
-  private async prepareOnce(id: string, config: CreateStrategyInput, account: string | null): Promise<void> {
+  private preparedRecently(id: string, hash: string): boolean {
+    return this.ready(id) && this.certificates.get(id)?.hash === hash && Date.now() - this.certificates.get(id)!.at < 4000;
+  }
+  private async prepareOnce(id: string, config: CreateStrategyInput, account: string | null, epoch: number,
+    track: (reads: readonly Promise<unknown>[]) => void): Promise<void> {
     const context = this.o.context(), legs = managedLegs(config), preparedAt = Date.now(), generation = this.pools.generation;
     if (this.stopped || !account || account !== this.o.profile()?.id || !this.o.live()) fail('paired_entry_account_changed');
     await this.monitor.refresh();
     const credentials = await this.o.credentials(), gateway = this.o.gateway as TradingCrossExGateway;
     if (!credentials) fail('paired_entry_account_changed');
     const proofEnabled = this.pools.enabled && !!this.monitor.snapshot().metrics?.assets.length;
-    const factsRead = proofEnabled && gateway.queryManagedState
-      ? gateway.queryManagedState(credentials!, AbortSignal.timeout(4000))
+    const factsSignal = proofEnabled && gateway.queryManagedState ? AbortSignal.timeout(4000) : undefined;
+    const factsRead: Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] | null }> = proofEnabled && gateway.queryManagedState
+      ? gateway.queryManagedState(credentials!, factsSignal!)
       : gateway.queryPositions(credentials!).then(positions => ({ positions, openOrders: null }));
-    const [cross, limits, leverages, facts, rates] = await Promise.all([
-      readCrossMarginEvidence(gateway, credentials!, legs.map(l => l.symbol), AbortSignal.timeout(4000)),
-      gateway.queryRiskLimits(legs.map(l => l.symbol)),
-      Promise.all(legs.map(l => gateway.queryLeverages(credentials!, [l.symbol]))), factsRead,
+    const reads = [
+      entryRead('catalog', readCrossMarginEvidence(gateway, credentials!, legs.map(l => l.symbol), AbortSignal.timeout(4000))),
+      entryRead('risk_limits', gateway.queryRiskLimits(legs.map(l => l.symbol))),
+      entryRead('leverage', gateway.queryLeverages(credentials!, legs.map(l => l.symbol))), entryRead('positions_orders', factsRead, factsSignal),
       proofEnabled ? gateway.queryValuationRates?.([...new Set(legs.map(l => l.symbol.split('_').at(-1)!))], AbortSignal.timeout(4000))
         .catch(() => ({})) ?? {} : {},
-    ]);
-    if (this.stopped || context !== this.o.context() || !this.o.live() || account !== this.o.profile()?.id) fail('paired_entry_account_changed');
+    ] as const;
+    track(reads.map(read => Promise.resolve(read)));
+    const [cross, limits, leverages, facts, rates] = await Promise.all(reads);
+    if (this.stopped || epoch !== this.preparationEpoch || context !== this.o.context() || !this.o.live() || account !== this.o.profile()?.id)
+      fail('paired_entry_account_changed');
     const snapshot = this.monitor.snapshot();
     if (!snapshot.fresh || !snapshot.accountId || snapshot.entryBlocked || snapshot.incidentId) fail('paired_entry_account_unavailable');
     const old = readEntryBudget(this.o.db, id), baseline = pairedQuantities(facts.positions, legs);
     const prepared = legs.map((leg, index) => {
       const leverage = index === 0 ? config.leftLeverage : config.rightLeverage;
-      if (cross[index].reason || !new Decimal(leverages[index][leg.symbol] ?? '0').eq(leverage)) fail('paired_entry_parameters_changed');
+      if (cross[index].reason) fail('paired_entry_margin_mode_unverified', {
+        symbol: leg.symbol, reason: cross[index].reason, ...(cross[index].failure ?? {}), expected: 'CROSS', actual: cross[index].mode });
+      const actual = leverages[leg.symbol];
+      if (typeof actual !== 'string' || !/^\d+(?:\.\d+)?$/.test(actual) || !new Decimal(actual).isFinite() || new Decimal(actual).lte(0))
+        fail('paired_entry_leverage_unavailable', { symbol: leg.symbol, expected: leverage });
+      if (!new Decimal(actual).eq(leverage)) fail('paired_entry_leverage_mismatch', { symbol: leg.symbol, expected: leverage, actual });
       const rates = limits.find(l => l.symbol === leg.symbol)?.tiers.map(t => t.maintenance_rate);
       if (!rates?.length) fail('margin_estimate_unavailable');
       const quote = this.o.markets.market(leg.symbol);
       if (!freshManagedQuote(quote, Date.now())) fail('margin_quote_unavailable');
       const price = quote!.askPrice, rate = Decimal.max(...rates!).toString();
-      if (old && (old.legs[index].leverage !== leverage || old.legs[index].maintenanceRate !== rate)) fail('paired_entry_parameters_changed');
+      if (old && old.legs[index].leverage !== leverage) fail('paired_entry_leverage_mismatch',
+        { symbol: leg.symbol, expected: old.legs[index].leverage, actual: leverage });
+      if (old && old.legs[index].maintenanceRate !== rate) fail('paired_entry_risk_tier_changed',
+        { symbol: leg.symbol, expected: old.legs[index].maintenanceRate, actual: rate });
       return old?.legs[index] ?? { ...leg, target: config.totalAmount!, leverage, maintenanceRate: rate, price,
         initialBudget: entryCosts(config.totalAmount!, price, leverage, rate, true).initial.toString(), baseline: baseline[index], covered: {} };
     });

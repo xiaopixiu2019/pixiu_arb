@@ -301,6 +301,7 @@ export interface FundingRatePoint {
 }
 
 export interface PublicMarketDataGateway {
+  queryHyperliquidOpenInterestCap?(crossExSymbol: string): Promise<boolean>;
   querySnapshot(crossExSymbol: string): Promise<PublicMarketSnapshot>;
   queryReferenceBook?(crossExSymbol: string): Promise<{ bidPrice?: string; askPrice?: string; bookObservedAt?: string }>;
   /** Optional candle backfill for supported perpetual venues. */
@@ -624,6 +625,16 @@ export class VenuePublicMarketDataClient implements PublicMarketDataGateway {
     throw new PublicMarketDataError(hasCandidate
       ? 'AMBIGUOUS_HYPERLIQUID_MARKET'
       : 'UNKNOWN_HYPERLIQUID_MARKET');
+  }
+
+  async queryHyperliquidOpenInterestCap(crossExSymbol: string): Promise<boolean> {
+    const symbol = parseCrossExFutureSymbol(crossExSymbol);
+    if (symbol.venue !== 'HYPERLIQUID' || symbol.quote !== 'USDC') throw new PublicMarketDataError('UNSUPPORTED_CAP_MARKET');
+    const coin = await this.resolveHyperliquidNativeName(symbol.base);
+    const payload = await fetchJson(this.fetchImplementation, 'https://api.hyperliquid.xyz/info', 100_000,
+      { body: JSON.stringify({ type: 'perpsAtOpenInterestCap', dex: hyperliquidDex(coin) }) }, AbortSignal.timeout(3000));
+    const capped = parsePayload(z.array(z.string().min(1).max(120)).max(10_000), payload);
+    return capped.includes(coin);
   }
 
   async queryReferenceBook(crossExSymbol: string) {

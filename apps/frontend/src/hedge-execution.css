@@ -351,3 +351,10 @@
   .hedge-execution .strategy-launch .start-strategy { align-self:stretch; }
   .hedge-execution .hedge-review-heading .hedge-step-number { font-size:38px; }
 }
+
+/* The strategy editor is portaled; placement is measured against the visual viewport. */
+.strategy-leverage-popover { position:fixed; right:auto; z-index:120; box-sizing:border-box; overflow:auto; overscroll-behavior:contain; }
+.strategy-leverage-popover .leverage-stepper label { display:flex; gap:0; }
+.strategy-leverage-popover .leverage-stepper input { text-align:right; min-width:0; }
+.strategy-leverage-popover .leverage-position-cap dd { flex-wrap:wrap; overflow-wrap:anywhere; }
+.strategy-leverage-warning { margin:0; color:var(--red, #ef91a0); font-size:12px; overflow-wrap:anywhere; }

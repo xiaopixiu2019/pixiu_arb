@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
@@ -32,7 +32,11 @@ export function loadTelegramAlertSettings(path: string): TelegramAlertSettings |
 interface RiskLock { reason: string; created_at: string }
 interface TaskRow { id: string; asset: string; left_quantity: string | null; right_quantity: string | null; checked_at: string | null }
 interface SignalRow extends TaskRow { signal_reason: string; missing_since: number }
-interface Alert { key: string; type: string; reason: string; text: string; taskCount: number }
+interface AlertEvent { key: string; type: string; reason: string; taskCount: number }
+interface Alert extends AlertEvent { text: string; summary?: string; events?: AlertEvent[] }
+const QUOTE_ALERT_GRACE_MS = 10_000;
+const SIGNAL_ALERT_GRACE_MS = 300_000;
+const TELEGRAM_TEXT_LIMIT = 3_900;
 
 export class ManagedRiskTelegramAlerts {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -70,9 +74,15 @@ export class ManagedRiskTelegramAlerts {
     if (!this.settings || this.inFlight) return;
     const lock = this.db.prepare('SELECT reason, created_at FROM managed_risk_lock WHERE singleton = 1')
       .get() as RiskLock | undefined;
-    const alert = lock?.reason === MANAGED_ACCOUNT_RECHECKING
-      ? this.now() - Date.parse(lock.created_at) >= MANAGED_RECOVERY_WINDOW_MS ? this.stalledRecheckAlert(lock) : null
-      : lock ? this.hardAlert(lock) : [...this.signalAlerts(), ...this.recoveryAlerts()].find((candidate) => !this.wasSent(candidate)) ?? null;
+    let alert: Alert | null;
+    if (lock?.reason === MANAGED_ACCOUNT_RECHECKING)
+      alert = this.now() - Date.parse(lock.created_at) >= MANAGED_RECOVERY_WINDOW_MS ? this.stalledRecheckAlert(lock) : null;
+    else if (lock) alert = this.hardAlert(lock);
+    else {
+      const signal = this.batch(this.signalAlerts().filter((candidate) => !this.wasSent(candidate)), false);
+      const recovery = this.batch(this.recoveryAlerts().filter((candidate) => !this.wasSent(candidate)), true);
+      alert = signal ?? recovery;
+    }
     if (!alert || this.wasSent(alert)) return;
     if (this.retryKey !== alert.key) { this.retryKey = alert.key; this.retryAt = 0; this.failures = 0; }
     if (this.now() < this.retryAt) return;
@@ -84,8 +94,29 @@ export class ManagedRiskTelegramAlerts {
     await this.inFlight;
   }
   private wasSent(alert: Alert): boolean {
-    return Boolean(this.db.prepare(`SELECT 1 FROM audit_events
-      WHERE type = ? AND correlation_id = ? LIMIT 1`).get(alert.type, alert.key));
+    const events = alert.events ?? [alert];
+    return events.every((event) => Boolean(this.db.prepare(`SELECT 1 FROM audit_events
+      WHERE type = ? AND correlation_id = ? LIMIT 1`).get(event.type, event.key)));
+  }
+  private batch(alerts: Alert[], recovered: boolean): Alert | null {
+    if (!alerts.length) return null;
+    if (alerts.length === 1) return alerts[0];
+    const title = recovered ? '✅ 自动退出数据已恢复' : '⚠️ 自动退出数据持续不可用';
+    const footer = recovered ? '退出条件持续时间分别重新计算；交易权限仍取决于账户核对、风险锁和原授权。'
+      : '持仓核对与失衡保护仍在运行；经济退出条件无法确认。请检查对应行情或费率数据源。';
+    const selected: Alert[] = []; let length = title.length + footer.length + 2;
+    for (const alert of alerts) {
+      const line = `- ${alert.summary ?? alert.reason}`;
+      if (selected.length && length + line.length + 1 > TELEGRAM_TEXT_LIMIT) break;
+      selected.push(alert); length += line.length + 1;
+    }
+    if (selected.length === 1) return selected[0];
+    const events = selected.flatMap((alert) => alert.events ?? [alert]);
+    const key = `batch:${createHash('sha256').update(events.map((event) => `${event.type}:${event.key}`).sort().join('|')).digest('hex')}`;
+    return { key, type: recovered ? 'managed_signal_recovered_telegram_batch' : 'managed_signal_telegram_batch',
+      reason: recovered ? 'signal_data_recovered' : 'multiple_signal_incidents', taskCount: events.length, events,
+      text: [recovered ? `✅ ${events.length} 个任务的自动退出数据已恢复` : `⚠️ ${events.length} 个任务的自动退出数据持续不可用`,
+        ...selected.map((alert) => `- ${alert.summary ?? alert.reason}`), footer].join('\n') };
   }
   private tasks(): TaskRow[] {
     return this.db.prepare(`SELECT s.id, json_extract(s.config_json, '$.asset') AS asset,
@@ -139,15 +170,19 @@ export class ManagedRiskTelegramAlerts {
       json_extract(m.state_json, '$.signalMissingSince') AS missing_since
       FROM managed_positions m JOIN execution_strategies s ON s.id = m.strategy_id
       WHERE s.status = 'RUNNING' AND json_extract(m.state_json, '$.signalReason') IS NOT NULL
-        AND (json_extract(m.state_json, '$.signalMissingSince') <= ? OR json_extract(m.state_json, '$.signalReason') LIKE 'managed_quote_unavailable:%')
-      ORDER BY missing_since`).all(this.now() - 300_000) as SignalRow[];
-    return rows.map((row): Alert => ({ key: `signal:${row.id}:${row.missing_since}`,
-      type: this.now() - row.missing_since < 300000 ? 'managed_quote_unavailable_telegram_sent' : 'managed_signal_telegram_sent',
+        AND ((json_extract(m.state_json, '$.signalReason') LIKE 'managed_quote_unavailable:%'
+              AND json_extract(m.state_json, '$.signalMissingSince') <= ?)
+          OR (json_extract(m.state_json, '$.signalReason') NOT LIKE 'managed_quote_unavailable:%'
+              AND json_extract(m.state_json, '$.signalMissingSince') <= ?))
+      ORDER BY missing_since`).all(this.now() - QUOTE_ALERT_GRACE_MS, this.now() - SIGNAL_ALERT_GRACE_MS) as SignalRow[];
+    return rows.map((row): Alert => { const quote = row.signal_reason.startsWith('managed_quote_unavailable:'); const event = { key: `signal:${row.id}:${row.missing_since}`,
+      type: quote ? 'managed_quote_unavailable_telegram_sent' : 'managed_signal_telegram_sent',
       reason: row.signal_reason, taskCount: 1,
-      text: [this.now() - row.missing_since < 300000 ? '⚠️ 自动退出所需报价不可用，正在持续探测主备来源' : '⚠️ Gate CrossEx 自动退出信号持续缺失', `${row.asset} ${row.id}`,
+    }; return { ...event, events: [event], summary: `${row.asset} ${row.id}：${row.signal_reason}；开始 ${new Date(row.missing_since).toISOString()}`,
+      text: [quote ? '⚠️ 自动退出所需报价不可用，正在持续探测主备来源' : '⚠️ Gate CrossEx 自动退出信号持续缺失', `${row.asset} ${row.id}`,
         `缺失：${row.signal_reason}`, `开始：${new Date(row.missing_since).toISOString()} UTC`,
         `最后持仓核对：${row.checked_at ?? '未知'}；A ${row.left_quantity ?? '未知'} / B ${row.right_quantity ?? '未知'}`,
-        '持仓核对与失衡保护仍在运行；经济退出条件无法确认。请检查对应行情或费率数据源。'].join('\n') }));
+        '持仓核对与失衡保护仍在运行；经济退出条件无法确认。请检查对应行情或费率数据源。'].join('\n') }; });
   }
   private recoveryAlerts(): Alert[] {
     const events = this.db.prepare("SELECT correlation_id,payload_json FROM audit_events WHERE type='managed_signal_recovered' AND created_at>=? ORDER BY created_at DESC LIMIT 100")
@@ -157,10 +192,18 @@ export class ManagedRiskTelegramAlerts {
       const parsed = z.object({ strategyId: z.string(), asset: z.string(), startedAt: z.number(), endedAt: z.number() }).safeParse(JSON.parse(event.payload_json));
       if (!parsed.success) return [];
       const value = parsed.data;
-      if (seen.has(value.strategyId)) return []; seen.add(value.strategyId);
+      if (seen.has(value.strategyId)) return [];
+      const recoverySent = this.db.prepare(`SELECT 1 FROM audit_events WHERE correlation_id = ?
+        AND type = 'managed_signal_recovered_telegram_sent' LIMIT 1`).get(event.correlation_id);
+      if (recoverySent) { seen.add(value.strategyId); return []; }
+      const outageSent = this.db.prepare(`SELECT 1 FROM audit_events WHERE correlation_id = ?
+        AND type IN ('managed_quote_unavailable_telegram_sent','managed_signal_telegram_sent') LIMIT 1`).get(event.correlation_id);
+      if (!outageSent) return [];
       const state = this.db.prepare('SELECT state_json FROM managed_positions WHERE strategy_id=?').get(value.strategyId) as { state_json: string } | undefined;
-      if (!state || JSON.parse(state.state_json).signalReason) return [];
-      return [{ key: event.correlation_id, type: 'managed_signal_recovered_telegram_sent', reason: 'signal_data_recovered', taskCount: 1,
+      if (!state || JSON.parse(state.state_json).signalReason) { seen.add(value.strategyId); return []; }
+      seen.add(value.strategyId);
+      const sent = { key: event.correlation_id, type: 'managed_signal_recovered_telegram_sent', reason: 'signal_data_recovered', taskCount: 1 };
+      return [{ ...sent, events: [sent], summary: `${value.asset} ${value.strategyId}：${new Date(value.startedAt).toISOString()} — ${new Date(value.endedAt).toISOString()}`,
         text: [`${value.asset} ${value.strategyId} 自动退出所需价格与费率数据已恢复`,
           `缺失窗口：${new Date(value.startedAt).toISOString()} — ${new Date(value.endedAt).toISOString()}`,
           '退出条件持续时间重新计算；交易是否允许仍取决于账户核对、风险锁和原授权。'].join('\n') }];
@@ -175,9 +218,11 @@ export class ManagedRiskTelegramAlerts {
     });
     const parsed = z.object({ ok: z.boolean() }).safeParse(await response.json());
     if (!response.ok || !parsed.success || !parsed.data.ok) throw new Error('telegram_send_rejected');
-    this.db.prepare(`INSERT INTO audit_events (id, created_at, type, correlation_id, payload_json)
-      VALUES (?, ?, ?, ?, ?)`).run(randomUUID(), new Date(this.now()).toISOString(),
-      alert.type, alert.key, JSON.stringify({ reason: alert.reason, taskCount: alert.taskCount }));
+    const events = alert.events ?? [alert];
+    this.db.transaction(() => { for (const event of events) this.db.prepare(`INSERT INTO audit_events
+      (id, created_at, type, correlation_id, payload_json) VALUES (?, ?, ?, ?, ?)`).run(randomUUID(),
+      new Date(this.now()).toISOString(), event.type, event.key,
+      JSON.stringify({ reason: event.reason, taskCount: event.taskCount })); })();
     this.failures = 0; this.retryAt = 0;
     this.log({ incidentKey: alert.key }, 'managed risk Telegram alert delivered');
   }

@@ -43,19 +43,21 @@ function useEvents(accountId: string | null) {
 
 export function RiskEvents({ accountId }: { accountId: string | null }) {
   const { language } = useLanguage(), zh = language === 'zh';
-  const page = useEvents(accountId), [all, setAll] = useState(false);
+  const page = useEvents(accountId), [all, setAll] = useState(false), [expanded, setExpanded] = useState(false);
   const visible = page.events.filter(e => all || e.kind !== 'clear');
+  const displayed = expanded ? visible : visible.slice(0, 5);
   return <section className="risk-panel risk-records" aria-label={zh ? '风险与处理' : 'Risk and actions'}>
     <div className="risk-section-heading"><div><h2>{zh ? '风险与处理' : 'Risk and actions'}</h2><p>{zh ? '看清发生了什么，以及系统采取的措施。' : 'What happened and how the system responded.'}</p></div>
-      <div className="risk-tabs" aria-label={zh ? '记录筛选' : 'Event filter'}>{[false, true].map(value => <button key={String(value)} aria-pressed={all === value} onClick={() => setAll(value)}>{value ? (zh ? '全部记录' : 'All records') : (zh ? '重要记录' : 'Important')}</button>)}</div></div>
+      <div className="risk-tabs" aria-label={zh ? '记录筛选' : 'Event filter'}>{[false, true].map(value => <button key={String(value)} aria-pressed={all === value} onClick={() => { setAll(value); setExpanded(true); }}>{value ? (zh ? '全部记录' : 'All records') : (zh ? '重要记录' : 'Important')}</button>)}</div></div>
     {page.error && <p className="risk-notice error" role="alert">{zh ? '记录加载失败，不能据此判断没有风险。' : 'Records could not load; this does not mean no risk.'} {riskReason(page.error, zh)}</p>}
     {!accountId ? <p className="risk-empty">{zh ? '连接账户后查看记录。' : 'Connect an account to view records.'}</p>
       : !page.loaded && !page.error ? <p className="risk-empty">{zh ? '正在读取风险记录…' : 'Loading risk records…'}</p>
         : page.loaded && !visible.length && !page.error ? <div className="risk-empty"><strong>{zh ? '已加载记录中暂无此类事项' : 'No matching items in loaded records'}</strong><p>{zh ? '普通检查可在“全部记录”中查看；更早记录按需加载。' : 'Routine checks are in All records; older records can be loaded below.'}</p></div> : null}
     {!!visible.length && <><div className="risk-event-columns" aria-hidden="true"><span>{zh ? '时间' : 'Time'}</span><span>{zh ? '发生事项 / 系统动作' : 'Event / system action'}</span><span>{zh ? '当时状态' : 'Status then'}</span></div>
-      <ol className="risk-events">{visible.map(event => <EventRow key={event.id} event={event} zh={zh} />)}</ol></>}
+      <ol className="risk-events">{displayed.map(event => <EventRow key={event.id} event={event} zh={zh} />)}</ol></>}
+    {visible.length > 5 && <button className="risk-text-button" onClick={() => setExpanded(!expanded)}>{expanded ? (zh ? '收起为最近5条' : 'Show latest 5') : (zh ? `查看全部已加载记录（${visible.length}）` : `View all loaded records (${visible.length})`)}</button>}
     <div className="risk-events-footer"><span>{zh ? '历史状态不代表当前仍需处理。' : 'Historical status does not imply current action is needed.'}</span>
-      {page.hasMore && <button disabled={page.busy} onClick={() => void page.more()}>{page.busy ? (zh ? '加载中…' : 'Loading…') : (zh ? '加载更早记录' : 'Load older events')}</button>}</div>
+      {page.hasMore && <button disabled={page.busy} onClick={() => { setExpanded(true); void page.more(); }}>{page.busy ? (zh ? '加载中…' : 'Loading…') : (zh ? '加载更早记录' : 'Load older events')}</button>}</div>
   </section>;
 }
 function EventRow({ event, zh }: { event: MarginRiskEvent; zh: boolean }) {

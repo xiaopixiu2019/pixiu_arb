@@ -13,6 +13,9 @@ async function open(page: Page) {
   await page.getByRole('button', { name: '刷新数据', exact: true }).click();
 }
 async function setup(page: Page) {
+  // These cases own synthetic HTTP risk facts; the unconfigured test server's stream is unrelated.
+  // Cases exercising the stream install their specific route after this default isolation.
+  await page.routeWebSocket('**/ws/stream', () => {});
   await page.addInitScript(() => localStorage.setItem('crossex-language', 'zh'));
   await page.route('**/api/preferences', r => r.fulfill({ json: { preferences: { language: 'zh' } } }));
   await page.route('**/api/notifications/telegram', r => r.fulfill({ json: { configured: false, botName: null, chatId: null, testedAt: null,
@@ -71,9 +74,9 @@ test('saved authorization does not claim borrowing protection when model evidenc
   await expect(page.locator('.risk-status')).toHaveClass('risk-status clear');
   await expect(page.locator('.risk-scope-status')).toHaveText('已授权，规划证据待核实');
   await expect(page.locator('.risk-sidebar')).toContainText('借币');
-  await page.locator('.risk-settings summary').click();
-  await expect(page.locator('.risk-settings .risk-group').filter({ hasText: 'TEST' })).toContainText('暂不可规划');
-  await expect(page.locator('.risk-settings .risk-group').filter({ hasText: 'TEST' }).locator('input')).toBeChecked();
+  await page.locator('.risk-protected-groups > summary').click();
+  await expect(page.locator('.risk-protected-groups .risk-group').filter({ hasText: 'TEST' })).toContainText('暂不可规划');
+  await expect(page.locator('.risk-protected-groups .risk-group').filter({ hasText: 'TEST' }).locator('input')).toBeChecked();
 });
 
 test('fresh stream observations stay valid between clock ticks and expire without another message', async ({ page }) => {
@@ -132,7 +135,9 @@ test('portfolio margin ratios expire at the same 5001 ms boundary', async ({page
   const at=await pauseRiskClock(page);
   latest=current({sampledAt:at});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
   await expect(rate).toContainText('248');await page.clock.runFor(100);
-  latest=current({sampledAt:at-4900});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
+  // Keep source timestamps monotonic under the HTTP/WS ordering guard while retaining the exact 5000/5001 ms boundary.
+  await page.clock.runFor(5000);
+  latest=current({sampledAt:at+100});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
   await expect(rate).toContainText('248');await page.clock.runFor(1);
   await expect(rate).toHaveText('—');expect(await page.locator('.risk-topbar').getAttribute('class')).toContain('unavailable');
 });
@@ -172,7 +177,7 @@ test('failed history is not empty safety and stale observations block settings a
   await expect(page.locator('.risk-status')).toContainText('数据待核实');
   await expect(page.locator('.risk-records')).toContainText('记录加载失败');
   await expect(page.locator('.risk-records')).not.toContainText('暂无此类事项');
-  await page.locator('.risk-settings summary').click();
+  await page.getByRole('button', { name: '修改参数', exact: true }).click();
   await expect(page.getByRole('button', { name: '预览修改效果' })).toBeDisabled();
   await expect(page.getByRole('button', { name: '查看并复核' })).toHaveCount(0);
 });

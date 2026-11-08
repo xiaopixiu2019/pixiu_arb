@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { strategyErrorMessage, managedReasonMessage } from './strategy-error-message.js';
 
 describe('actionable strategy rejection messages', () => {
+  it('distinguishes a verified leverage ceiling from unavailable tiers', () => {
+    const text = strategyErrorMessage({ code: 'strategy_leverage_exceeds_limit', label: JSON.stringify({
+      symbol: 'OKX_FUTURE_DOOD_USDT', requested: '8', maximum: '6',
+    }) }, 'zh');
+    expect(text).toContain('OKX DOOD'); expect(text).toContain('8×'); expect(text).toContain('6×');
+    expect(strategyErrorMessage({ code: 'strategy_position_limit_unavailable', label: 'OKX_FUTURE_DOOD_USDT' }, 'en')).toContain('unverified');
+  });
   it('explains Hyperliquid validation and preserves the meaning of an existing maker hard pause', () => {
     expect(strategyErrorMessage({ code: 'hyperliquid_limit_price_invalid' }, 'zh')).toContain('未自动修改价格');
     expect(strategyErrorMessage({ code: 'hyperliquid_price_rules_unavailable' }, 'en')).toContain('order was blocked');

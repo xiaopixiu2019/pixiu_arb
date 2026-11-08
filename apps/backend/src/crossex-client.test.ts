@@ -417,6 +417,25 @@ describe('Gate APIv4 signing', () => {
     ]);
   });
 
+  it('keeps the documented comma separator literal when signing multiple leverage symbols', async () => {
+    const symbols = ['KRAKEN_FUTURE_TRX_USD', 'HYPERLIQUID_FUTURE_TRX_USDC'];
+    const queryString = `symbols=${symbols.join(',')}`;
+    const timestamp = '1700000000';
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(String(url)).toBe(`https://api.gateio.ws/api/v4/crossex/positions/leverage?${queryString}`);
+      expect(headers.get('SIGN')).toBe(signGateRequest({
+        method: 'GET', requestPath: '/api/v4/crossex/positions/leverage', queryString, body: '',
+        timestamp, secret: 'test-secret',
+      }));
+      return new Response(JSON.stringify(Object.fromEntries(symbols.map(symbol => [symbol, '10']))));
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, () => 1_700_000_000_000);
+
+    await expect(client.queryLeverages({ apiKey: 'test-api-key', apiSecret: 'test-secret' }, symbols))
+      .resolves.toEqual(Object.fromEntries(symbols.map(symbol => [symbol, '10'])));
+  });
+
   it('serializes authenticated workflows so independent callers cannot burst Gate', async () => {
     let releaseFirst: (() => void) | undefined;
     const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });

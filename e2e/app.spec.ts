@@ -781,8 +781,10 @@ test.describe.serial('local trading terminal', () => {
     await expect(page.locator('.strategy-leg').first()).toContainText('+0.0200%');
     await expect(page.locator('.strategy-leg').last()).toContainText('36.5');
     await expect(page.locator('.strategy-leg').last()).toContainText('-0.0100%');
-    await expect(page.getByRole('button', { name: 'Exchange A leverage: 1×' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Exchange B leverage: 1×' })).toBeVisible();
+    // This fixture has no exchange credentials: unavailable leverage must not masquerade as 1×.
+    await expect(page.getByRole('button', { name: 'Exchange A leverage: —' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Exchange B leverage: —' })).toBeVisible();
+    await expect(page.getByRole('alert').filter({ hasText: 'Leverage is unverified' })).toHaveCount(2);
     await expect(page.locator('.strategy-history-tabs')).toHaveCount(1);
     const launchBox = await page.locator('.strategy-launch').boundingBox();
     const automationBox = await page.locator('.running-strategies').boundingBox();

@@ -530,7 +530,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
   async queryLeverages(credentials: GateCredentials, symbols: string[]): Promise<Record<string, string>> {
-    const queryString = symbols.length ? new URLSearchParams({ symbols: symbols.join(',') }).toString() : '';
+    const queryString = symbols.length ? `symbols=${symbols.map(encodeURIComponent).join(',')}` : '';
     return this.signedRequest('GET', LEVERAGE_ENDPOINT, queryString, '', credentials, GateLeverageMapSchema, 'INVALID_LEVERAGE_RESPONSE');
   }
 

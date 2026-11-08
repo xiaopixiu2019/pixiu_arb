@@ -137,6 +137,49 @@ describe('generic adopted position groups and explicit stop intent', () => {
   async function protectTicks(h: Awaited<ReturnType<typeof harness>>, count = 4) {
     for (let i = 0; i < count; i++) { await vi.advanceTimersByTimeAsync(1100); await h.manager.tick(); }
   }
+  it.each([1, 3])('resumes monitoring after %i unchanged protection polls during the explicit account read', async polls => {
+    const h = await harness('SKHYNIX', 'BYBIT'), id = await h.task();
+    await h.manager.tick(); await continuous(h, id);
+    h.manager.failAll('synthetic reviewed incident'); h.session.set('live');
+    // Another explicitly reviewed group has already cleared the shared incident lock.
+    h.db.prepare('DELETE FROM managed_risk_lock').run(); await h.manager.waitForIdle();
+    let finish!: (facts: ManagedAccountFacts) => void, reads = 0;
+    h.setRead(async () => ++reads === 1 ? new Promise(resolve => { finish = resolve; }) : h.facts());
+    const pending = h.manager.resume(id, 'account-1', 'MONITORING');
+    expect(h.manager.protection.needsTick()).toBe(true);
+    for (let i = 0; i < polls; i++) {
+      if (i) await vi.advanceTimersByTimeAsync(1100);
+      await h.manager.tick();
+    }
+    expect(reads).toBeGreaterThanOrEqual(polls + 1);
+    finish(h.facts());
+    await expect(pending).resolves.toMatchObject({ status: 'RUNNING', management: { phase: 'MONITORING', reason: null } });
+    expect(h.created).toHaveLength(0); expect(h.cancelled).toHaveLength(0);
+  });
+  it.each(['position', 'order', 'account', 'mode', 'claims', 'config', 'intent', 'risk'] as const)(
+    'still refuses resume when %s changes during protection polling', async change => {
+      const h = await harness(), id = await h.task(); await h.manager.tick(); await continuous(h, id);
+      h.manager.failAll('synthetic reviewed incident'); h.session.set('live');
+      h.db.prepare('DELETE FROM managed_risk_lock').run(); await h.manager.waitForIdle();
+      let finish!: (facts: ManagedAccountFacts) => void, reads = 0;
+      h.setRead(async () => ++reads === 1 ? new Promise(resolve => { finish = resolve; }) : h.facts());
+      const pending = h.manager.resume(id, 'account-1', 'MONITORING');
+      const rejected = expect(pending).rejects.toBeInstanceOf(Error);
+      await h.manager.tick();
+      if (change === 'position') h.manager.notifyPosition({ symbol: h.legs[0].symbol, position_qty: '90', update_time: String(Date.now()) });
+      if (change === 'order') h.remote.set('new-remote-order', { symbol: h.legs[0].symbol,
+        order_id: 'new-remote-order', state: 'OPEN', qty: '1', side: h.legs[0].side } as GateCrossExOrder);
+      if (change === 'account') h.changeAccount();
+      if (change === 'mode') h.session.set('readonly');
+      if (change === 'claims') h.db.prepare('DELETE FROM managed_position_claims WHERE strategy_id=?').run(id);
+      if (change === 'config') h.db.prepare("UPDATE execution_strategies SET config_json=json_set(config_json,'$.entryBps','17') WHERE id=?").run(id);
+      if (change === 'intent') h.db.prepare("UPDATE managed_positions SET state_json=json_set(state_json,'$.exitRequested',json('true')) WHERE strategy_id=?").run(id);
+      if (change === 'risk') h.manager.failAll('new synthetic risk');
+      const ordersBeforeResume = h.created.length;
+      finish(h.facts()); await rejected;
+      expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+      expect(h.created).toHaveLength(ordersBeforeResume);
+    });
   it('keeps paused protection readable when the profit worker publishes after the planning read snapshot', async () => {
     const h = await harness(), id = await h.task(); await h.manager.tick();
     const { monitor } = await continuous(h, id);
@@ -886,6 +929,51 @@ describe('generic adopted position groups and explicit stop intent', () => {
     h.failSubmit(); await h.manager.tick(); await h.manager.tick();
     expect(h.created).toHaveLength(1); expect(h.session.current).toBe('readonly');
     expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED'); expect(blockIncident).toHaveBeenCalled();
+  });
+  it('keeps balanced monitoring live when no margin incident needs instrument constraints', async () => {
+    const h = await harness('AERO', 'HYPERLIQUID'); const id = await h.task(); h.missingFunding(true);
+    h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map((p) => ({ ...p, margin_mode: 'CROSS' })) }));
+    await h.manager.tick();
+    h.db.prepare('DELETE FROM crossex_instruments WHERE symbol=?').run(h.legs[1].symbol);
+    const planBatch = vi.fn(() => null);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), planBatch,
+      snapshot: () => ({ incidentId: null }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
+
+    await h.manager.tick();
+
+    expect(planBatch).not.toHaveBeenCalled(); expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'RUNNING', management: { phase: 'MONITORING' } });
+    expect(h.created).toHaveLength(0); expect(h.session.current).toBe('live');
+  });
+  it('still hard-pauses when a real margin incident cannot obtain instrument constraints', async () => {
+    const h = await harness('AERO', 'HYPERLIQUID'); const id = await h.task(); h.missingFunding(true);
+    h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map((p) => ({ ...p, margin_mode: 'CROSS' })) }));
+    await h.manager.tick();
+    h.db.prepare('DELETE FROM crossex_instruments WHERE symbol=?').run(h.legs[1].symbol);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), planBatch: vi.fn(),
+      snapshot: () => ({ incidentId: 'incident' }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
+
+    await h.manager.tick();
+
+    expect(managedRiskReason(h.db)).toBe(`managed_constraints_unavailable:{"symbol":"${h.legs[1].symbol}"}`);
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'PAUSED', management: { phase: 'RISK_PAUSED' } });
+    expect(h.created).toHaveLength(0); expect(h.session.current).toBe('readonly');
+  });
+  it.each(['imbalance', 'exit'] as const)('does not bypass unavailable constraints for an action-required %s', async action => {
+    const h = await harness('AERO', 'HYPERLIQUID'); const id = await h.task(); h.missingFunding(true);
+    await h.manager.tick();
+    const missingSymbol = action === 'imbalance' ? h.legs[1].symbol : h.legs[0].symbol;
+    h.db.prepare('DELETE FROM crossex_instruments WHERE symbol=?').run(missingSymbol);
+    h.manager.setMarginMonitor({ invalidateNormalRecovery: vi.fn(), planBatch: vi.fn(),
+      snapshot: () => ({ incidentId: null }), blockIncident: vi.fn() } as unknown as MarginRiskMonitor);
+    if (action === 'imbalance') h.quantities('90', '100');
+    else h.manager.requestExit(id);
+
+    await h.manager.tick();
+
+    expect(managedRiskReason(h.db)).toBe(`managed_constraints_unavailable:{"symbol":"${missingSymbol}"}`);
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'PAUSED', management: { phase: 'RISK_PAUSED' } });
+    expect(h.created).toHaveLength(0); expect(h.session.current).toBe('readonly');
   });
   it('never lets margin protection override KEEP or missing cross-margin evidence', async () => {
     const h = await harness(); const id = await h.task(); h.missingFunding(true); await h.manager.tick();

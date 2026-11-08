@@ -1,3 +1,5 @@
+import { useMarginSnapshotState } from './use-margin-snapshot-state.js';
+import { allowRiskDraftLeave } from './risk-draft-guard.js';
 import { ManagedCloseReceiptsContext, useManagedCloseReceipts } from './use-managed-close-receipts.js';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { PUBLIC_PROMOTION, contiguousCandleTail } from '@gate-crossex/shared-types';
@@ -521,7 +523,7 @@ function App() {
   const [marketSnapshot, setMarketSnapshot] = useState<MarketSnapshot | null>(null);
   const [tradingSnapshot, setTradingSnapshot] = useState<TradingSnapshot | null>(null);
   const [authenticatedPortfolio, setAuthenticatedPortfolio] = useState<AuthenticatedPortfolioSnapshot | null>(null);
-  const [marginSnapshot, setMarginSnapshot] = useState<import('@gate-crossex/shared-types').MarginSnapshot | null>(null);
+  const { snapshot: marginSnapshot, accept: acceptMarginSnapshot, stream: streamMarginSnapshot, clear: clearMarginSnapshot, read: readMarginSnapshot } = useMarginSnapshotState();
   const [accountStream, setAccountStream] = useState<PrivateStreamStatus | null>(null);
   const [strategies, setStrategies] = useState<StrategyRecord[]>([]);
   const [balances, setBalances] = useState<Record<string, LiveBalance>>({});
@@ -535,22 +537,16 @@ function App() {
   const [connection, setConnection] = useState<CredentialConnectionStatus | null>(null);
   useEffect(() => {
     let current = true;
-    if (connection?.configured) void import('./risk-api.js').then(({ riskApi }) => riskApi.snapshot())
-      .then((snapshot) => { if (current) setMarginSnapshot(snapshot); }).catch(() => { if (current) setMarginSnapshot(null); });
+    if (connection?.configured) void readMarginSnapshot(() => current);
     return () => { current = false; };
-  }, [connection?.activeProfileId, connection?.configured]);
+  }, [connection?.activeProfileId, connection?.configured, connection?.financialContext, readMarginSnapshot]);
   useEffect(() => {
     if (!connection?.configured || workspace !== 'Funding Rates') return;
     let active = true;
-    const refreshRisk = async () => {
-      try {
-        const { riskApi } = await import('./risk-api.js'); const snapshot = await riskApi.snapshot();
-        if (active) setMarginSnapshot(snapshot);
-      } catch { if (active) setMarginSnapshot((old) => old ? { ...old, fresh: false } : null); }
-    };
+    const refreshRisk = () => readMarginSnapshot(() => active);
     void refreshRisk(); const timer = setInterval(() => void refreshRisk(), 2000);
     return () => { active = false; clearInterval(timer); };
-  }, [connection?.activeProfileId, connection?.configured, workspace]);
+  }, [connection?.activeProfileId, connection?.configured, connection?.financialContext, readMarginSnapshot, workspace]);
   const [editingAccountName, setEditingAccountName] = useState(false);
   const [accountNameDraft, setAccountNameDraft] = useState('');
   const [accountRenameSaving, setAccountRenameSaving] = useState(false);
@@ -599,6 +595,8 @@ function App() {
   const accountEpochRef = useRef(0);
   const financialContextRef = useRef<string | undefined>(undefined);
   const acceptConnection = useCallback((next: CredentialConnectionStatus) => {
+    if (accountContextRef.current !== undefined && next.activeProfileId !== accountContextRef.current
+      || financialContextRef.current !== undefined && next.financialContext !== financialContextRef.current) clearMarginSnapshot();
     if (next.financialContext !== financialContextRef.current) {
       financialContextRef.current = next.financialContext;
       window.dispatchEvent(new Event('financial-context-changed'));
@@ -614,7 +612,7 @@ function App() {
       }).catch(() => undefined);
     }
     setConnection(next);
-  }, []);
+  }, [clearMarginSnapshot]);
   const refreshConnection = useCallback(async () => {
     const next = await api.connection(); acceptConnection(next); return next;
   }, [acceptConnection]);
@@ -632,6 +630,7 @@ function App() {
 
   const navigate = useCallback((nextRoute: FrontendRoute) => {
     const path = frontendPath(nextRoute);
+    if (window.location.pathname !== path && !allowRiskDraftLeave()) return;
     if (window.location.pathname !== path) window.history.pushState(null, '', path);
     setRoute(nextRoute);
   }, []);
@@ -641,7 +640,10 @@ function App() {
     const initialRoute = frontendRoute(window.location.pathname) ?? DEFAULT_FRONTEND_ROUTE;
     const initialPath = frontendPath(initialRoute);
     if (window.location.pathname !== initialPath) window.history.replaceState(null, '', initialPath);
-    const onPopState = () => setRoute(frontendRoute(window.location.pathname) ?? DEFAULT_FRONTEND_ROUTE);
+    const onPopState = () => {
+      if (!allowRiskDraftLeave()) { window.history.pushState(null, '', '/risk-management'); return; }
+      setRoute(frontendRoute(window.location.pathname) ?? DEFAULT_FRONTEND_ROUTE);
+    };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
@@ -877,10 +879,10 @@ function App() {
         setAuthenticatedPortfolio(message.payload);
         setAccountStream(message.payload.live?.stream ?? null);
       }
-      if (message.type === 'risk.margin') setMarginSnapshot(message.payload);
+      if (message.type === 'risk.margin') streamMarginSnapshot(message.payload);
       if (message.type === 'portfolio.cleared') {
         window.dispatchEvent(new Event('financial-context-changed'));
-        setMarginSnapshot(null);
+        clearMarginSnapshot();
         setAuthenticatedPortfolio(null);
         setBalances({});
       }
@@ -980,7 +982,7 @@ function App() {
       window.clearInterval(flushTimer);
     };
      
-  }, [terminalStreamEnabled, markBackendUnavailable, reportBackendConnectivityError]);
+  }, [terminalStreamEnabled, markBackendUnavailable, reportBackendConnectivityError, streamMarginSnapshot, clearMarginSnapshot]);
 
   const refreshMarketSnapshot = useCallback(async () => {
     const snapshot = await api.markets();
@@ -1151,7 +1153,7 @@ function App() {
       ? <FundingDetailView asset={fundingDetailAsset} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} onBack={() => navigate({ workspace: 'Funding Rates', asset: null })} />
       : <FundingRatesView metric={fundingMetric} onMetricChange={setFundingMetric} marketSnapshot={marketSnapshot} onMarketFallback={refreshMarketSnapshot} onOpenAsset={openFundingDetail} onOpenStrategy={openFundingStrategy} fundingOverview={fundingOverview} onFundingOverview={setFundingOverview} fundingHistoryCache={fundingHistoryCache} onFundingHistoryEntries={mergeFundingHistory} />;
     if (workspace === 'Portfolio') return <div ref={assetPageHost} />;
-    if (workspace === 'Risk Management') return <RiskManagementView key={marginSnapshot?.accountId ?? 'unverified-risk-account'} snapshot={marginSnapshot} onSnapshot={setMarginSnapshot} tasks={activeAccountStrategies} />;
+    if (workspace === 'Risk Management') return <RiskManagementView key={marginSnapshot?.accountId ?? 'unverified-risk-account'} snapshot={marginSnapshot} onSnapshot={acceptMarginSnapshot} tasks={activeAccountStrategies} />;
     if (workspace === 'Trading Fees') return <FeeComparisonView catalog={availableCatalog} marketSnapshot={marketSnapshot} favorites={favorites} fees={fees} feesReady={feesReady} error={feesError} onRefresh={refreshFees} />;
     return null;
 
@@ -1261,6 +1263,7 @@ function App() {
   }, [accountAction, accountRenameSaving]);
 
   const switchAccount = useCallback(async (profileId: string, confirmPauseRunningStrategies: boolean) => {
+    if (!allowRiskDraftLeave()) return;
     setAccountAction({ profileId, kind: 'switch' });
     setAccountManagerError(null);
     try {

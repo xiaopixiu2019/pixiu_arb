@@ -1,5 +1,5 @@
 interface StrategyFailure { code: string; label?: string; message?: string }
-interface SizeDetail { symbol?: string; quantity?: string; minimum?: string; step?: string; notional?: string }
+interface SizeDetail { symbol?: string; quantity?: string; minimum?: string; step?: string; notional?: string; requested?: string; maximum?: string }
 
 function detailFrom(label?: string): SizeDetail {
   if (!label) return {};
@@ -7,7 +7,7 @@ function detailFrom(label?: string): SizeDetail {
     const parsed: unknown = JSON.parse(label);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     return Object.fromEntries(Object.entries(parsed).filter(([key, value]) =>
-      ['symbol', 'quantity', 'minimum', 'step', 'notional'].includes(key) && typeof value === 'string'));
+      ['symbol', 'quantity', 'minimum', 'step', 'notional', 'requested', 'maximum'].includes(key) && typeof value === 'string'));
   } catch { return { symbol: label }; }
 }
 
@@ -21,6 +21,10 @@ export function strategyErrorMessage(error: StrategyFailure, language: string): 
   const quantity = detail.quantity ?? '—', minimum = detail.minimum ?? '—', step = detail.step ?? '—';
   const currency = parts?.[3] ?? '';
   const messages: Record<string, string> = {
+    strategy_leverage_exceeds_limit: zh ? `提交杠杆 ${detail.requested ?? '—'}× 超过当前最高 ${detail.maximum ?? '—'}×，请重新选择并应用允许的杠杆。`
+      : `Requested leverage ${detail.requested ?? '—'}× exceeds the current maximum ${detail.maximum ?? '—'}×. Select and apply an allowed leverage.`,
+    strategy_position_limit_unavailable: zh ? '风险档位尚未核实，无法确认持仓上限；本次未启动。' : 'Risk tiers are unverified; the position limit cannot be confirmed. The strategy was not started.',
+
     managed_close_target_changed: zh ? '账户或托管归属已变化，本次未发起平仓；请关闭窗口并重新核对。' : 'Account or ownership changed. No close was started; dismiss and review the current task.',
     managed_entry_resume_unverified: zh ? '当前持仓、成交或订单记录未能完整核对，任务继续暂停；没有补仓或平仓。' : 'Holdings, fills or orders could not be fully reconciled. The task stays paused without opening or closing positions.',
     managed_resume_action_changed: zh ? '恢复后的执行方向已变化，请刷新任务后确认；本次未执行恢复。' : 'The resume action changed. Refresh and review the task; it was not resumed.',

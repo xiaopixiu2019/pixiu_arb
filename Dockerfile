@@ -1,14 +1,11 @@
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package*.json ./
-COPY LICENSE SOURCE_NOTICES.md THIRD_PARTY_NOTICES.md CHANGELOG.md README.md SECURITY.md ./
-COPY LICENSES ./LICENSES
-COPY docs ./docs
 COPY tsconfig.base.json ./
 COPY apps ./apps
 COPY packages ./packages
 COPY migrations ./migrations
-COPY scripts/compress-frontend-assets.mjs scripts/backup-database.mjs scripts/restore-database.mjs scripts/maintain-database.mjs ./scripts/
+COPY scripts/compress-frontend-assets.mjs ./scripts/compress-frontend-assets.mjs
 RUN npm ci --no-audit --no-fund \
   && npm run build \
   && npm prune --omit=dev

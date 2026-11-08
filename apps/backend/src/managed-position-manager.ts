@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
 import { hyperliquidLimitPrice, isHyperliquidFuture } from './hyperliquid-limit-price.js';
 import type { GateCrossExOrder, GateCrossExPosition } from './crossex-client.js';
-import type { MarketSource } from './strategy-engine.js';
+import { isHyperliquidOpenInterestCapFailure, type MarketSource } from './strategy-engine.js';
 import type { TradingSession } from './trading-session.js';
 import { TradingRuntimeError, isTerminalOrderState, type TradingRuntime, type CreateStrategyInput, type StrategyRecord } from './trading-runtime.js';
 import { managedHardRiskReason, managedRiskBlock, managedRiskReason,
@@ -39,6 +39,10 @@ export function managedLegs(config: CreateStrategyInput): [ManagedLeg, ManagedLe
 }
 const opposite = (side: 'BUY' | 'SELL'): 'BUY' | 'SELL' => side === 'BUY' ? 'SELL' : 'BUY';
 const ACCOUNT_READ_TIMEOUT_MS = 8_000;
+interface CapacityProtection {
+  startedAt: number; context: string; identity: string; before: [string, string];
+}
+type CapacityState = ManagedState & { capacityProtection?: CapacityProtection };
 
 /** Owns post-entry decisions; never adds exposure and never awaits a fill in the scheduling loop. */
 export class ManagedPositionManager {
@@ -67,6 +71,7 @@ export class ManagedPositionManager {
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight: Promise<void> | null = null;
   private readonly fastPairing = new Map<string, Promise<void>>();
+  private readonly capacityTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopped = false;
   private revision = 0;
   private pendingWake = false;
@@ -145,8 +150,8 @@ export class ManagedPositionManager {
     this.protection = new ContinuousProtection(db, session, runtime, {
       profile: sources.activeAccount, version: () => `${this.readContext()}:${this.revision}`,
       stopped: () => this.stopped, read: () => this.facts(true), margin: () => this.marginMonitor,
-      publish: facts => this.marginFacts?.(facts), freeze: reason => this.failAll(reason),
-      evaluate: (record, facts, at) => this.evaluate(record, facts, at),
+      publish: facts => { this.checkCapacityFacts(facts); this.marginFacts?.(facts); }, freeze: reason => this.failAll(reason),
+      evaluate: (record, facts, at) => this.evaluateProtection(record, facts, at),
       quotes: record => { for (const leg of managedLegs(record.config)) this.markets.ensureMarket?.(leg.symbol); },
     }, this.now);
     this.unsubscribers.push(session.subscribe(() => {
@@ -166,19 +171,21 @@ export class ManagedPositionManager {
       if (!this.claimed(order.symbol) || this.orderEvents.get(order.id) === signature) return;
       this.orderEvents.set(order.id, signature);
       const state = order.strategyId ? readManagedState(this.db, order.strategyId) : null;
+      if ((state as CapacityState)?.capacityProtection && order.reduceOnly && isTerminalOrderState(order.state)
+        && new Decimal(order.executedQuantity).isZero()) { this.failAll('capacity_protection_reduction_failed'); return; }
       if (state?.phase === 'RISK_PAUSED' && isTerminalOrderState(order.state)) {
         this.save(order.strategyId!, { ...state,
           makerOrderId: state.makerOrderId === order.id ? null : state.makerOrderId,
           pendingOrderId: state.pendingOrderId === order.id ? null : state.pendingOrderId });
       }
-      const normal = this.isNormalEntryQuote(order) || this.isOrdinaryExecution(order) || this.isKnownMarginExecution(order);
+      const normal = this.isCapacityOrderUpdate(order) || this.isNormalEntryQuote(order) || this.isOrdinaryExecution(order) || this.isKnownMarginExecution(order);
       this.wake(!normal);
       if (normal && order.reduceOnly && new Decimal(order.executedQuantity).gt(0) && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
     this.unsubscribers.push(runtime.onFill((fill) => {
       if (!this.claimed(fill.symbol)) return;
       const order = this.runtime.getOrder(fill.orderId);
-      const normal = this.isOrdinaryExecution(order) || this.isCoveredMonitoringFill(order) || this.isKnownMarginExecution(order);
+      const normal = this.isCapacityOrderUpdate(order) || this.isOrdinaryExecution(order) || this.isCoveredMonitoringFill(order) || this.isKnownMarginExecution(order);
       this.wake(!normal);
       if (normal && order.reduceOnly && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
@@ -195,6 +202,8 @@ export class ManagedPositionManager {
   start(): void { this.stopped = false; this.timer ??= setInterval(() => { void this.tick(); }, 2000); this.timer.unref?.(); }
   async stop(): Promise<void> {
     this.stopped = true; this.controlEpoch += 1; this.abortReads(); this.clearRecoveryTimer();
+    for (const timer of this.capacityTimers.values()) clearTimeout(timer);
+    this.capacityTimers.clear();
     if (this.timer) clearInterval(this.timer);
     if (this.wakeTimer) clearTimeout(this.wakeTimer);
     this.timer = null; this.wakeTimer = null;
@@ -278,6 +287,22 @@ export class ManagedPositionManager {
         this.sources.activeAccount(), managedLegs(record.config), this.runtime.pairedEntryReady(record.id));
     } catch { return false; }
   }
+  private isCapacityOrderUpdate(order: ReturnType<TradingRuntime['getOrder']>): boolean {
+    if (!order.strategyId) return false;
+    const record = this.runtime.getStrategy(order.strategyId), state = readManagedState(this.db, record.id) as CapacityState;
+    const legs = managedLegs(record.config), index = legs.findIndex(l => l.symbol === order.symbol);
+    if (index < 0 || order.strategyLeg !== (index === 0 ? 'left' : 'right') || order.type !== 'MARKET') return false;
+    if (state?.capacityProtection && order.reduceOnly && this.protection.owns(record.id)
+      && ['NEW', 'OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED'].includes(order.state))
+      return order.side === opposite(legs[index].side) && new Decimal(order.quantity).gt(0)
+        && new Decimal(order.quantity).lte(new Decimal(state.capacityProtection.before[index]).minus(state.capacityProtection.before[1 - index]));
+    return ownsManagedExecution(this.db, record, state, this.sources.activeAccount(), legs)
+      && state.phase === 'OPENING' && record.config.kind === 'position' && record.config.executionMethod === 'MAKER_TAKER'
+      && !record.config.reduceOnly && order.symbol.startsWith('HYPERLIQUID_') && order.side === legs[index].side
+      && (index === 0 ? 'left' : 'right') !== (record.config.makerLeg ?? 'left')
+      && order.state === 'FAIL' && !order.reduceOnly && new Decimal(order.executedQuantity).isZero()
+      && isHyperliquidOpenInterestCapFailure(order.failureReason ?? '');
+  }
   private isKnownMarginExecution(order: ReturnType<TradingRuntime['getOrder']>): boolean {
     if (!order.strategyId) return false;
     const record = this.runtime.getStrategy(order.strategyId);
@@ -319,16 +344,21 @@ export class ManagedPositionManager {
       if (risk) this.recheck('managed_account_snapshot_invalidated');
       this.armRecoveryTimer();
     }
+    this.scheduleTick();
+  }
+  private scheduleTick(): void {
     if (this.stopped || this.wakeTimer) return;
     this.wakeTimer = setTimeout(() => { this.wakeTimer = null; this.lastWake = this.now(); void this.tick(); }, Math.max(0, 100 - (this.now() - this.lastWake), this.nextReadAt - this.now()));
     this.wakeTimer.unref?.();
   }
   async tick(): Promise<void> {
+    if (!this.stopped) this.checkCapacityDeadline();
     if (!this.stopped && this.protection.needsTick()) {
       if (this.inFlight) return this.inFlight;
       this.inFlight = this.protection.run().finally(() => {
         this.inFlight = null;
-        if (!this.stopped && this.session.liveTradingEnabled && !managedRiskReason(this.db)) this.wake(false);
+        // Completing a read schedules work; only actual events invalidate account facts.
+        if (!this.stopped && this.session.liveTradingEnabled && !managedRiskReason(this.db)) this.scheduleTick();
       });
       return this.inFlight;
     }
@@ -840,6 +870,91 @@ export class ManagedPositionManager {
     this.session.pause();
     this.sources.riskPause();
   }
+  private capacityRecords(): StrategyRecord[] {
+    return this.runtime.listStrategies().filter(r => (readManagedState(this.db, r.id) as CapacityState)?.capacityProtection
+      && !['COMPLETED', 'TRANSFERRED', 'STOPPED'].includes(r.management?.phase ?? ''));
+  }
+  private capacityIdentity(record: StrategyRecord): string {
+    return JSON.stringify([record.accountProfileId, record.config, this.protection.authority.grant(),
+      this.db.prepare('SELECT symbol,account_id FROM managed_position_claims WHERE strategy_id=? ORDER BY symbol').all(record.id)]);
+  }
+  /** Only the engine's confirmed, zero-fill Hyperliquid rejection may enter this path. */
+  pauseTaskForProtection(id: string, reason: string): void {
+    const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id)!;
+    const before = entryHoldings(this.db, id);
+    if (!this.session.liveTradingEnabled || managedRiskReason(this.db) || record.status !== 'RUNNING'
+      || record.accountProfileId !== this.sources.activeAccount() || state?.phase !== 'OPENING'
+      || state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident
+      || !this.protection.owns(id) || this.capacityRecords().length || this.runtime.listOpenOrders(id).length
+      || before.some(q => new Decimal(q).lt(0)) || new Decimal(before[0]).eq(before[1]))
+      throw new Error('capacity_protection_scope_unverified');
+    const capacityProtection = { startedAt: this.now(), context: this.readContext(), identity: this.capacityIdentity(record), before };
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id=?").run(id);
+      this.save(id, { ...state, capacityProtection, phase: 'RISK_PAUSED', reason, conditionSince: null,
+        verified: true, maxLeft: before[0], maxRight: before[1], leftQuantity: before[0], rightQuantity: before[1],
+        observedReductions: managedReductionTotals(this.db, id), after: this.now() } as CapacityState);
+    })();
+    this.revision += 1; this.pendingWake = true;
+    this.log(id, 'Hyperliquid capacity protection', reason);
+    const timer = setTimeout(() => { this.capacityTimers.delete(id); this.checkCapacityDeadline(); }, MANAGED_RECOVERY_WINDOW_MS);
+    timer.unref?.(); this.capacityTimers.set(id, timer); this.scheduleTick();
+  }
+  private checkCapacityDeadline(): void {
+    for (const record of this.capacityRecords()) {
+      const marker = (readManagedState(this.db, record.id) as CapacityState).capacityProtection!;
+      const blocked = this.protection.authority.statuses().find(s => s.strategyId === record.id && s.state === 'BLOCKED');
+      if (this.now() - marker.startedAt >= MANAGED_RECOVERY_WINDOW_MS) this.failAll('capacity_protection_expired');
+      else if (marker.context !== this.readContext() || marker.identity !== this.capacityIdentity(record)
+        || !this.protection.owns(record.id)) this.failAll('capacity_protection_scope_changed');
+      else if (blocked) this.failAll(blocked.reason ?? 'capacity_protection_failed');
+    }
+  }
+  private checkCapacityFacts(facts: ManagedAccountFacts): void {
+    if (!this.capacityRecords().length) return;
+    try {
+      this.checkCapacityDeadline();
+      if (managedRiskReason(this.db)) return;
+      const owned = this.db.prepare('SELECT symbol FROM managed_position_claims WHERE account_id=?')
+        .all(this.sources.activeAccount()) as Array<{ symbol: string }>;
+      if (facts.positions.some(p => !new Decimal(p.position_qty).isZero() && !owned.some(c => c.symbol === p.symbol)))
+        throw new Error('capacity_protection_external_position');
+      for (const other of this.active()) {
+        const state = readManagedState(this.db, other.id)!;
+        if (!['MONITORING', 'EXITING', 'BALANCING'].includes(state.phase)) continue;
+        const actual = pairedQuantities(facts.positions, managedLegs(other.config)), expected = entryHoldings(this.db, other.id);
+        if (actual.some((q, i) => !new Decimal(q).eq(expected[i]))
+          && observedHoldings(state, managedReductionTotals(this.db, other.id), actual) !== 'pending')
+          throw new Error('capacity_protection_other_task_changed');
+      }
+      for (const record of this.capacityRecords()) {
+        const state = readManagedState(this.db, record.id) as CapacityState;
+        const actual = pairedQuantities(facts.positions, managedLegs(record.config));
+        const expected = entryHoldings(this.db, record.id);
+        if (actual.some((q, i) => new Decimal(q).gt(state.capacityProtection!.before[i]) || new Decimal(q).lt(expected[i])))
+          throw new Error('capacity_protection_holdings_changed');
+      }
+    } catch (error) { this.failAll(error instanceof Error ? error.message : 'capacity_protection_failed'); throw error; }
+  }
+  private async evaluateProtection(record: StrategyRecord, facts: ManagedAccountFacts, at: number): Promise<void> {
+    const marker = (readManagedState(this.db, record.id) as CapacityState)?.capacityProtection;
+    if (!marker) { await this.evaluate(record, facts, at); return; }
+    try {
+      if (managedRiskReason(this.db)) return;
+      // A known reduction can reach the fill ledger before the position endpoint. Wait
+      // locally for that settlement; do not install the account-wide settlement hold.
+      const actual = pairedQuantities(facts.positions, managedLegs(record.config)), expected = entryHoldings(this.db, record.id);
+      if (actual.some((q, i) => !new Decimal(q).eq(expected[i]))) return;
+      await this.evaluate(record, facts, at);
+      const current = this.runtime.getStrategy(record.id), state = readManagedState(this.db, record.id) as CapacityState;
+      const q = pairedQuantities(facts.positions, managedLegs(record.config));
+      if (current.status === 'COMPLETED' || !state.pendingOrderId && q.every(v => new Decimal(v).eq(Decimal.min(...marker.before)))) {
+        const timer = this.capacityTimers.get(record.id); if (timer) clearTimeout(timer);
+        this.capacityTimers.delete(record.id);
+        writeManagedState(this.db, record.id, { ...state, capacityProtection: undefined } as CapacityState);
+      }
+    } catch (error) { this.failAll(error instanceof Error ? error.message : 'capacity_protection_failed'); throw error; }
+  }
   private save(id: string, state: ManagedState): void {
     const current = readManagedState(this.db, id);
     if (current?.stopIntent === 'KEEP' && state.stopIntent !== 'KEEP') return;
@@ -862,6 +977,7 @@ export class ManagedPositionManager {
   private async evaluate(record: StrategyRecord, facts: ManagedAccountFacts, started: number): Promise<void> {
     if (this.fastPairing.has(record.id)) return;
     let state = readManagedState(this.db, record.id)!;
+    if ((state as CapacityState).capacityProtection && !this.protection.isEvaluating(record.id)) return;
     if (started < state.after || ['COMPLETED', 'STOPPING', 'STOPPED', 'TRANSFERRED'].includes(state.phase)) return;
     const legs = managedLegs(record.config);
     const ownOrders = this.db.prepare('SELECT remote_order_id, client_order_id, state FROM execution_orders WHERE strategy_id = ?')
@@ -929,11 +1045,12 @@ export class ManagedPositionManager {
       this.completeMarginBatch(record, state, quantities); return;
     }
     if (state.pauseAfterProtection && !this.protection.isEvaluating(record.id)) { this.failAll(state.protectionIncident?.reason ?? 'managed_entry_exposure_changed'); return; }
-    if (this.marginMonitor?.snapshot().incidentId) {
-      const snapshot = this.marginMonitor.snapshot();
+    const marginSnapshot = this.marginMonitor?.snapshot();
+    if (marginSnapshot?.incidentId) {
+      const snapshot = marginSnapshot;
       const covered = snapshot.groups?.some(g => g.strategyId === record.id && g.eligible && g.authorized);
       if (covered && state.makerOrderId) { await this.cancelMaker(record, state); return; }
-      if (await this.reduceForMargin(record, state, facts)) return;
+      if (await this.reduceForMargin(record, state, facts, true)) return;
       if (snapshot.groups?.some(g => g.eligible && g.authorized) || snapshot.protection?.stage === 'settlement_pending'
         || snapshot.protection?.stage === 'confirming_recovery' || !state.exitRequested) return;
     }
@@ -944,8 +1061,10 @@ export class ManagedPositionManager {
     if (readManagedState(this.db, record.id)?.exitRequested) this.adoption.abortOwner(record.id);
   }
 
-  private async reduceForMargin(record: StrategyRecord, state: ManagedState, facts: ManagedAccountFacts): Promise<boolean> {
-    if (!this.marginMonitor || !this.protection.isEvaluating(record.id) && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) return false;
+  private async reduceForMargin(record: StrategyRecord, state: ManagedState, facts: ManagedAccountFacts, incident = false): Promise<boolean> {
+    const protecting = this.protection.isEvaluating(record.id);
+    if (!this.marginMonitor || !protecting && (!incident
+      || !this.session.liveTradingEnabled || managedRiskReason(this.db))) return false;
     const legs = managedLegs(record.config), constraints = legs.map((l) => this.constraints(l.symbol));
     if (legs.some((leg) => facts.positions.find((p) => p.symbol === leg.symbol)?.margin_mode !== 'CROSS')) return false;
     // LCM of decimal lot sizes gives a quantity both venues can represent exactly.
@@ -1014,12 +1133,13 @@ export class ManagedPositionManager {
       }
       throw new Error('managed_partial_untradeable');
     }
-    if ((state.marginBatch || state.protectionIncident) && !new Decimal(plan.quantity).eq(exact)) throw new Error('margin_partial_untradeable');
+    const capacity = (state as CapacityState).capacityProtection;
+    if ((state.marginBatch || state.protectionIncident || capacity) && !new Decimal(plan.quantity).eq(exact)) throw new Error('margin_partial_untradeable');
     // Enlarge only the reduction (never the position) if an exact trim is below venue minimums.
     if (state.marginBatch && new Decimal(plan.quantity).gt(state.marginBatch.quantity)) throw new Error('margin_batch_quantity_exceeded');
     if (state.marginBatch && this.sizeIssue(legs[index], new Decimal(plan.quantity))) throw new Error('margin_partial_untradeable');
-    if (state.protectionIncident) this.requireSize(legs[index], exact);
-    const quantity = state.marginBatch || state.protectionIncident || state.exitRequested ? new Decimal(plan.quantity)
+    if (state.protectionIncident || capacity) this.requireSize(legs[index], exact);
+    const quantity = state.marginBatch || state.protectionIncident || capacity || state.exitRequested ? new Decimal(plan.quantity)
       : this.reductionQuantity(legs[index], new Decimal(plan.quantity), new Decimal(quantities[index]));
     this.save(record.id, { ...readManagedState(this.db, record.id)!, phase: 'BALANCING', conditionSince: null });
     await this.submit(record, index, quantity, false, 'existing-imbalance', (state.exitRequested || state.phase === 'EXITING') && !state.marginBatch ? 'exit' : 'adjustment');
@@ -1137,6 +1257,10 @@ export class ManagedPositionManager {
     const wasPairing = pairing();
     const authorize = (excludeOrderId?: string): void => {
         const latestRecord = this.runtime.getStrategy(record.id), latestState = readManagedState(this.db, record.id);
+        if ((latestState as CapacityState)?.capacityProtection) {
+          this.checkCapacityDeadline();
+          if (managedRiskReason(this.db)) throw new TradingRuntimeError('capacity_protection_scope_changed', 409);
+        }
         if (control !== this.controlEpoch || context !== this.readContext() || (!protecting && !this.session.liveTradingEnabled)
           || (!protecting && latestRecord.status !== 'RUNNING') || latestRecord.accountProfileId !== this.sources.activeAccount()
           || latestState?.stopIntent === 'KEEP')

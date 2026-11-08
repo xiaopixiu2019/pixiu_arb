@@ -1,6 +1,6 @@
 {
   "name": "@gate-crossex/frontend",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
@@ -10,8 +10,8 @@
     "test": "vitest run --config ../../vitest.config.ts --passWithNoTests"
   },
   "dependencies": {
-    "@gate-crossex/domain": "1.0.3",
-    "@gate-crossex/shared-types": "1.0.3",
+    "@gate-crossex/domain": "1.0.4",
+    "@gate-crossex/shared-types": "1.0.4",
     "lightweight-charts": "^5.2.0",
     "react": "19.1.1",
     "react-dom": "19.1.1"

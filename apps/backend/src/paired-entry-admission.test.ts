@@ -91,6 +91,106 @@ async function reflectedMaker(h: Awaited<ReturnType<typeof harness>>, balance = 
   await h.monitor.refresh();
 }
 
+describe('paired preparation request ownership', () => {
+  it('shares concurrent matching preparation and reads both leverages once', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    Object.values(h.reads).forEach(read => read.mockClear());
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    h.reads.positions.mockImplementationOnce(async () => { await held; return []; });
+    const first = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    const second = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    await vi.waitFor(() => expect(h.reads.positions).toHaveBeenCalledTimes(1));
+    release(); await Promise.all([first, second]);
+    expect(h.reads.symbols).toHaveBeenCalledTimes(1);
+    expect(h.reads.positions).toHaveBeenCalledTimes(1);
+    expect(h.reads.modes).toHaveBeenCalledTimes(2);
+    expect(h.reads.leverage).toHaveBeenCalledExactlyOnceWith(expect.anything(), h.symbols);
+    expect(h.writes).toHaveLength(0);
+  });
+  it('does not reuse a fresh preparation for another account', async () => {
+    const h = await harness();
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'other-account'))
+      .rejects.toMatchObject({ code: 'paired_entry_account_changed' });
+    expect(h.writes).toHaveLength(0);
+  });
+  it('rejects an invalidated in-flight read and prepares again from new evidence', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    h.reads.positions.mockImplementationOnce(async () => { await held; return []; });
+    const first = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    const rejected = expect(first).rejects.toMatchObject({ code: 'paired_entry_account_changed' });
+    await vi.waitFor(() => expect(h.reads.positions).toHaveBeenCalledTimes(2));
+    h.runtime.invalidatePairedEntries();
+    const next = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    release(); await rejected; await next;
+    expect(h.reads.positions).toHaveBeenCalledTimes(3);
+    expect(h.runtime.pairedEntryReady('PAIR-TEST')).toBe(true);
+    expect(h.writes).toHaveLength(0);
+  });
+  it('distinguishes a missing leverage from an actual leverage mismatch', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    h.reads.leverage.mockResolvedValue({});
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account'))
+      .rejects.toMatchObject({ code: 'paired_entry_leverage_unavailable', label: expect.stringContaining(h.symbols[0]) });
+    await new Promise(resolve => setImmediate(resolve));
+    h.reads.leverage.mockImplementation(async (_c, names) => Object.fromEntries(names.map(symbol => [symbol, '8'])));
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account'))
+      .rejects.toMatchObject({ code: 'paired_entry_leverage_mismatch', label: expect.stringContaining('"actual":"8"') });
+    expect(h.writes).toHaveLength(0);
+  });
+  it('keeps failed reads owned until their siblings settle, then permits a new preparation', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    Object.values(h.reads).forEach(read => read.mockClear());
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    h.reads.leverage.mockImplementationOnce(async (_c, names) => {
+      await held; return Object.fromEntries(names.map(symbol => [symbol, '25']));
+    });
+    h.reads.symbols.mockRejectedValueOnce(new GateApiError(0, 'NETWORK_ERROR'));
+    const first = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    await expect(first).rejects.toMatchObject({ code: 'paired_entry_read_failed',
+      label: expect.stringContaining('"stage":"catalog"') });
+    let nextFinished = false;
+    const next = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account').then(() => { nextFinished = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(nextFinished).toBe(false);
+    expect(h.reads.symbols).toHaveBeenCalledTimes(1);
+    expect(h.reads.leverage).toHaveBeenCalledTimes(1);
+    release(); await next;
+    expect(h.reads.symbols).toHaveBeenCalledTimes(2);
+    expect(h.reads.leverage).toHaveBeenCalledTimes(2);
+    expect(h.writes).toHaveLength(0);
+  });
+  it('does not share a result for changed configuration or accept revoked live authority', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    h.reads.positions.mockImplementationOnce(async () => { await held; return []; });
+    const first = h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+    const changed = h.runtime.preparePairedEntry('PAIR-TEST', { ...h.config, entryBps: '20' }, 'account');
+    const rejected = expect(changed).rejects.toMatchObject({ code: 'paired_entry_approval_changed' });
+    release(); await first; await rejected;
+    h.session.set('readonly');
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account')).rejects.toMatchObject({ code: 'paired_entry_account_changed' });
+    expect(h.writes).toHaveLength(0);
+  });
+  it('retains mode-read categories and numeric tier changes through admission', async () => {
+    const h = await harness(); h.runtime.invalidatePairedEntries();
+    h.reads.modes.mockRejectedValueOnce(new GateApiError(403, 'FORBIDDEN'));
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account')).rejects.toMatchObject({
+      code: 'paired_entry_margin_mode_unverified', label: expect.stringContaining('"kind":"authentication"'),
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    h.reads.limits.mockImplementation(async names => names.map(symbol => ({ symbol, tiers: [{ maintenance_rate: '0.02' }] })));
+    await expect(h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account')).rejects.toMatchObject({
+      code: 'paired_entry_risk_tier_changed', label: expect.stringContaining('"actual":"0.02"'),
+    });
+    expect(h.writes).toHaveLength(0);
+  });
+});
+
 it('does not revisit released entry responsibility or build full risk plans on ordinary position observations', async () => {
   const h=await harness(), budget=readEntryBudget(h.db,'PAIR-TEST')!, key=h.monitor.snapshot().accountId!;
   h.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id='PAIR-TEST'").run();
