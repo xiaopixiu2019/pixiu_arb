@@ -847,6 +847,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   // Strategies may trade catalog-only tickers (e.g. stock perps) that nothing has watched yet, so
   // the engine's market source can register them on demand at launch.
   const strategyEngine = new StrategyEngine(database, tradingSession, tradingRuntime, {
+    hyperliquidOpenInterestCapped: async symbol => {
+      if (!publicMarketGateway.queryHyperliquidOpenInterestCap) throw new Error('hyperliquid_capacity_unavailable');
+      return publicMarketGateway.queryHyperliquidOpenInterestCap(symbol);
+    },
     market: (symbol) => marketHub.market(symbol),
     ensureMarket: ensureMarketKnown,
     ...(options.startMarketStream ? { prepareQuotes: (symbols: string[]) =>

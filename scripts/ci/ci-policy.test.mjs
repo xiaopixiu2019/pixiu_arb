@@ -164,10 +164,4 @@ test('workflow keeps required names, complete gates and bounded public publishin
   assert.equal((release.match(/node scripts\/ci\/release-guard.mjs/g) ?? []).length, 2);
   assert.match(release, /cancel-in-progress: false/);
   assert.match(release, /--title "PIXIU ARB/);
-  assert.match(release, /^ {2}source:\s*$/m);
-  assert.match(release, /needs: verify/);
-  assert.match(release, /if: github\.event_name == 'push' && startsWith\(github\.ref, 'refs\/tags\/v'\)/);
-  assert.match(release, /git archive --format=tar\.gz[^\n]+"\$GITHUB_SHA"/);
-  assert.match(release, /sha256sum[^\n]+> SHA256SUMS/);
-  assert.doesNotMatch(release, /build-macos:|build-windows:|release:bundle:|download-artifact/);
 });

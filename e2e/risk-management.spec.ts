@@ -11,6 +11,7 @@ function snapshot(): MarginSnapshot {
       assets: [{ venue: 'HYPERLIQUID', coin: 'USDC', equity: '-25', liability: '25', borrowingInitialMargin: '5', borrowingMaintenanceMargin: '2.5' }] } };
 }
 for (const mobile of [false, true]) test(`risk workspace ${mobile ? 'mobile' : 'desktop'} shows evidence and explicit configuration preview`, async ({ page }) => {
+  await page.routeWebSocket('**/ws/stream', () => {});
   await page.setViewportSize({ width: mobile ? 430 : 1440, height: 1000 });
   await page.addInitScript(() => localStorage.setItem('crossex-language', 'zh'));
   let configured = DEFAULT_MARGIN_POLICY;
@@ -22,8 +23,12 @@ for (const mobile of [false, true]) test(`risk workspace ${mobile ? 'mobile' : '
   await page.route('**/api/risk/margin/events*', (r) => r.fulfill({ json: { accountId: 'synthetic-risk-account', hasMore: false, events: [{ id: 1, at: Date.now(), kind: 'warning', detail: 'IMR below 110%', revision: 0 }] } }));
   await page.route('**/api/notifications/telegram', (r) => r.fulfill({ json: { configured: false, botName: null, chatId: null, testedAt: null,
     lastSentAt: null, lastError: null, retryAt: null, storage: 'env_file', csrfToken: 'synthetic-csrf-token-for-tests' } }));
-  await page.route('**/api/risk/margin/policy', (r) => {
-    if (r.request().method() === 'PUT') { configured = { ...r.request().postDataJSON().policy, revision: configured.revision + 1 }; return r.fulfill({ json: current() }); }
+  await page.route('**/api/risk/margin/policy', async (r) => {
+    if (r.request().method() === 'PUT') {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      configured = { ...r.request().postDataJSON().policy, revision: configured.revision + 1 };
+      return r.fulfill({ json: current() });
+    }
     return r.fulfill({ json: { policy: configured, accountId: 'synthetic-risk-account', csrfToken: 'synthetic-csrf-token-for-tests' } });
   });
   await page.goto('/risk-management');
@@ -36,20 +41,27 @@ for (const mobile of [false, true]) test(`risk workspace ${mobile ? 'mobile' : '
   await expect(page.getByRole('heading', { name: '保证金变化', exact: true })).toHaveCount(0);
   expect(historyRequests).toEqual([]);
   await expect(page.locator('.risk-sidebar')).toContainText('无实盘权限');
-  await page.locator('.risk-settings summary').click();
+  await page.getByRole('button', { name: '修改参数', exact: true }).click();
+  await page.locator('.risk-protected-groups > summary').click();
   await expect(page.locator('.risk-threshold-grid input')).toHaveCount(6);
   const groups = await page.locator('.risk-protected-groups').boundingBox();
   const thresholds = await page.locator('.risk-threshold-grid').boundingBox();
-  expect(groups!.y + groups!.height).toBeLessThanOrEqual(thresholds!.y);
+  // The approved design promotes thresholds before the separately managed long scope list.
+  expect(thresholds!.y).toBeLessThan(groups!.y + groups!.height);
   await page.locator('.risk-protected-groups input[type=checkbox]').check();
   await expect(page.getByLabel('分批市价减仓 (%)').first()).toHaveValue('105');
   await page.getByLabel('预警并禁止增仓 (%)').first().fill('111');
   await page.getByRole('button', { name: '刷新数据', exact: true }).click();
   await page.getByRole('button', { name: '预览修改效果' }).click();
-  await expect(page.locator('.risk-settings')).toContainText('按当前数据将预警并阻止增仓');
+  await expect(page.locator('.risk-settings')).toContainText('假设采用草稿规则，将满足预警并阻止增仓');
   expect(configured.initial.warn).toBe(110);
   expect(configured.protectedGroupIds).toEqual([]);
-  await page.getByRole('button', { name: '确认保存并应用' }).click();
+  const [saved] = await Promise.all([
+    page.waitForResponse(response => response.url().endsWith('/api/risk/margin/policy') && response.request().method() === 'PUT'),
+    page.getByRole('button', { name: '确认保存并应用' }).click(),
+  ]);
+  expect(saved.ok()).toBe(true);
+  expect(saved.request().postDataJSON().policy.initial.warn).toBe(111);
   await expect(page.locator('.risk-settings')).toContainText('已保存');
   expect(configured.initial.warn).toBe(111);
   expect(configured.protectedGroupIds).toEqual(['PAIR-TEST']);

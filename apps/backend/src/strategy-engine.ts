@@ -26,8 +26,13 @@ import {
 const isAccountRecheckDeferral = (error: unknown): boolean => error instanceof TradingRuntimeError
   && ['managed_account_rechecking', 'strategy_market_data_unavailable', 'strategy_quote_changed'].includes(error.code);
 
+export function isHyperliquidOpenInterestCapFailure(reason: string): boolean {
+  return /(?:^|[^A-Za-z])(?:PositionIncreaseAtOpenInterestCap|PositionFlipAtOpenInterestCap|OpenInterestIncreaseRejected|Cannot increase position when open interest is at cap)(?:$|[^A-Za-z])/.test(reason);
+}
+
 /** Read access to the live market cache; the production implementation is CrossExMarketHub. */
 export interface MarketSource {
+  hyperliquidOpenInterestCapped?(symbol: string): Promise<boolean>;
   market(symbol: string): LiveMarket | null;
   /** Register a catalog-known symbol on demand so its ticker streams; false when unknown. */
   ensureMarket?(symbol: string): boolean;
@@ -1459,6 +1464,27 @@ export class StrategyEngine {
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(actor.id));
   }
 
+  private async pauseHyperliquidCapacityTask(actor: StrategyActor, leg: LegDefinition, reason: string): Promise<boolean> {
+    if (!actor.config.management || actor.config.executionMethod !== 'MAKER_TAKER' || actor.config.kind !== 'position'
+      || actor.config.reduceOnly || leg.venue !== 'HYPERLIQUID' || leg.leg === (actor.config.makerLeg ?? 'left')
+      || !isHyperliquidOpenInterestCapFailure(reason)) return false;
+    const rejected = this.database.prepare(`SELECT state,executed_quantity,failure_reason FROM execution_orders
+      WHERE strategy_id=? AND symbol=? AND side=? AND reduce_only=0 ORDER BY rowid DESC LIMIT 1`)
+      .get(actor.id, leg.symbol, leg.side) as { state: string; executed_quantity: string; failure_reason: string | null } | undefined;
+    if (rejected?.state !== 'FAIL' || !new Decimal(rejected.executed_quantity).isZero()
+      || !isHyperliquidOpenInterestCapFailure(rejected.failure_reason ?? '')) return false;
+    actor.suspended = true;
+    try {
+      const settled = await this.runtime.quiesceOpenOrders({ strategyId: actor.id, timeoutMs: this.options.orderTimeoutMs });
+      if (settled.unresolved.length || !this.positionManager) throw new Error('capacity_protection_orders_unresolved');
+      this.positionManager.pauseTaskForProtection(actor.id, reason);
+      actor.status = 'PAUSED'; this.actors.delete(actor.id);
+    } catch (error) {
+      this.positionManager?.failAll(error instanceof Error ? error.message : 'capacity_protection_unverified');
+    }
+    return true;
+  }
+
   private async pause(actor: StrategyActor, reason: string): Promise<void> {
     if (actor.config.management) {
       actor.suspended = true;
@@ -1965,9 +1991,27 @@ export class StrategyEngine {
       return;
     }
     actor.busy = true;
+    let preparing = false;
     try {
       const reduceOnly = intent === 'exit' || actor.config.reduceOnly;
-      if (!reduceOnly) await this.runtime.preparePairedEntry(actor.id, actor.config, this.runtime.getStrategy(actor.id).accountProfileId);
+      if (!reduceOnly && desired.takerLeg.venue === 'HYPERLIQUID' && this.markets.hyperliquidOpenInterestCapped) {
+        try {
+          if (await this.markets.hyperliquidOpenInterestCapped(desired.takerLeg.symbol)) {
+            actor.cooldownUntil = this.options.now() + 5000;
+            this.runtime.addStrategyLog(actor.id, 'warning', 'Entry waiting for capacity', desired.takerLeg.symbol, '—', 'Hyperliquid open interest is capped; recheck in five seconds');
+            return;
+          }
+        } catch {
+          actor.cooldownUntil = this.options.now() + 5000;
+          this.runtime.addStrategyLog(actor.id, 'warning', 'Entry capacity unavailable', desired.takerLeg.symbol, '—', 'No maker submitted; recheck in five seconds');
+          return;
+        }
+      }
+      if (!reduceOnly) {
+        preparing = true;
+        await this.runtime.preparePairedEntry(actor.id, actor.config, this.runtime.getStrategy(actor.id).accountProfileId);
+        preparing = false;
+      }
       const order = await this.runtime.createOrder({
         symbol: desired.makerLeg.symbol, side: desired.makerLeg.side, type: 'LIMIT', timeInForce: 'POC',
         quantity: roundedQuantity.toString(), price: isHyperliquidFuture(desired.makerLeg.symbol) ? desired.price.toFixed() : desired.price.toString(), reduceOnly,
@@ -1984,10 +2028,14 @@ export class StrategyEngine {
       if (isAccountRecheckDeferral(error)) return;
       actor.failureCount += 1;
       actor.cooldownUntil = this.options.now() + Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount));
-      this.runtime.addStrategyLog(actor.id, 'warning', 'Maker quote rejected', `Post-only at ${desired.price.toString()}`,
-        roundedQuantity.toString(), error instanceof Error ? error.message.slice(0, 120) : 'submit error');
+      const detail = preparing ? error instanceof TradingRuntimeError
+        ? `${error.code} ${/^paired_entry_(read_failed|margin_mode_unverified|leverage_unavailable|leverage_mismatch|risk_tier_changed)$/.test(error.code) ? error.label ?? '' : ''}`.trim()
+        : 'paired_entry_preparation_failed'
+        : error instanceof Error ? error.message.slice(0, 120) : 'submit error';
+      this.runtime.addStrategyLog(actor.id, 'warning', preparing ? 'Maker entry preparation failed' : 'Maker quote rejected',
+        `Post-only at ${desired.price.toString()}`, roundedQuantity.toString(), detail.slice(0, 600));
       if (actor.failureCount >= 5) {
-        await this.pause(actor, 'Five consecutive maker quotes were rejected; check credentials, balances, and venue status');
+        await this.pause(actor, `Five consecutive maker attempts failed; last failure during ${preparing ? 'entry preparation' : 'order submission'}; review task logs`);
       }
     } finally {
       actor.busy = false;
@@ -2026,9 +2074,14 @@ export class StrategyEngine {
     const reconcile = async () => {
       const current = await this.runtime.refreshOrderFromRemote(quote.orderId);
       if (!current || isTerminalOrderState(current.state) || !stillOwned()) return;
-      if (current.state !== 'PENDING_CANCEL') await this.runtime.cancelOrder(quote.orderId, () => {
-        if (!stillOwned()) throw new StrategyEngineError('managed_review_changed', 409);
-      });
+      const authorize = () => { if (!stillOwned()) throw new StrategyEngineError('managed_review_changed', 409); };
+      if (current.state !== 'PENDING_CANCEL') await this.runtime.cancelOrder(quote.orderId, authorize);
+      else {
+        const attempts = this.runtime.cancelDispatchAttempts(quote.orderId);
+        const delay = attempts === 1 ? 2_000 : attempts === 2 ? 8_000 : null;
+        if (delay !== null && this.options.now() - pending.startedAt >= delay)
+          await this.runtime.retryConfirmedCancellation(quote.orderId, authorize);
+      }
       await this.runtime.refreshOrderFromRemote(quote.orderId);
     };
     // Do not occupy the actor queue while REST is slow: fills and other tasks must still run.
@@ -2036,7 +2089,13 @@ export class StrategyEngine {
       pending.failure = error instanceof Error ? error.message.slice(0, 160) : 'order_read_failed';
     }).finally(() => {
       pending.checking = false;
-      pending.nextCheckAt = this.options.now() + this.options.requoteIntervalMs;
+      const now = this.options.now(), attempts = this.runtime.cancelDispatchAttempts(quote.orderId);
+      const retryDelay = attempts === 1 ? 2_000 : attempts === 2 ? 8_000 : null;
+      const retryAt = retryDelay === null ? null : pending.startedAt + retryDelay;
+      const firstProbe = pending.nextCheckAt === 0;
+      pending.nextCheckAt = retryAt === null ? now + this.options.requoteIntervalMs
+        : retryAt > now ? Math.min(now + this.options.requoteIntervalMs, retryAt)
+          : firstProbe ? now : now + this.options.requoteIntervalMs;
     });
   }
 
@@ -2414,6 +2473,7 @@ export class StrategyEngine {
           ...(target.clip ? { strategyClip: target.clip } : {}) });
         submitted = true;
         const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
+        if (!trimExcess && await this.pauseHyperliquidCapacityTask(actor, repairLeg, settled.failureReason ?? '')) return;
         if (settled.state === 'FILLED') actor.repairAttempts = 0;
         const failure = failureSummary(settled.failureReason);
         this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning',
@@ -2422,6 +2482,8 @@ export class StrategyEngine {
           `${settled.state} · ${failure ?? `avg ${settled.executedAveragePrice ?? '—'}`}`);
       }
     } catch (error) {
+      if (!trimExcess && await this.pauseHyperliquidCapacityTask(actor, repairLeg,
+        error instanceof GateApiError ? error.label : error instanceof Error ? error.message : '')) return;
       if (!topUpRequired && !submitted && isAccountRecheckDeferral(error)) {
         actor.repairAttempts -= 1; actor.lastRepairAt = previousRepairAt; return;
       }

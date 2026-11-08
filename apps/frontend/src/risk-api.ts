@@ -30,9 +30,11 @@ export const riskApi = {
     if (data.accountId !== accountId) throw new Error('margin_account_changed'); return data;
   },
   policy: () => read('/api/risk/margin/policy', z.object({ policy: MarginPolicySchema, accountId: z.string().nullable(), csrfToken: z.string() })),
-  save: async (policy: MarginPolicy, accountId: string | null) => {
-    const { csrfToken, accountId: current } = await riskApi.policy();
+  save: async (policy: MarginPolicy, accountId: string | null, authorize?: () => void) => {
+    const { csrfToken, accountId: current, policy: latest } = await riskApi.policy();
     if (!accountId || current !== accountId) throw new Error('margin_account_changed');
+    if (latest.revision !== policy.revision) throw new Error('margin_policy_conflict');
+    authorize?.();
     return read('/api/risk/margin/policy', MarginSnapshotSchema, { method: 'PUT', headers: { 'x-gct-risk-intent': 'configure-margin' }, body: JSON.stringify({ policy, accountId, csrfToken }) });
   },
   resume: async (accountId: string | null) => {

@@ -10,7 +10,7 @@ import { PositionManagementConfigSchema, type ManagedPositionView, type LiveBala
 import { managedOrderBlock, managedRiskBlock, readManagedState } from './managed-position-store.js';
 import { managedResumeView } from './managed-position-resume.js';
 import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault } from './credential-vault.js';
-import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type GateCrossExRiskLimit, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
+import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExRiskLimit, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import type { PrivateCrossExEvent } from './private-stream.js';
 import type { TradingSession } from './trading-session.js';
 
@@ -189,6 +189,7 @@ function strategyFromRow(row: StrategyRow): StrategyRecord {
 function venueFromSymbol(symbol: string): string { return symbol.split('_', 1)[0] ?? 'UNKNOWN'; }
 
 const OPEN_ORDER_STATES = ['PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED'];
+const MAX_CANCEL_DISPATCHES = 3;
 
 export function isTerminalOrderState(state: string): boolean {
   return !OPEN_ORDER_STATES.includes(state);
@@ -201,6 +202,16 @@ export function isTerminalOrderState(state: string): boolean {
  */
 function isDefinitiveSubmitRejection(error: unknown): boolean {
   return error instanceof RequestNotDispatchedError || error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500;
+}
+
+/** A missing/malformed tier is not evidence that the requested leverage exceeds a known ceiling. */
+function verifiedMaximumLeverage(limit: GateCrossExRiskLimit | undefined): Decimal | null {
+  if (!limit?.tiers.length) return null;
+  try {
+    const values = limit.tiers.map(tier => ({ leverage: new Decimal(tier.leverage_max), value: new Decimal(tier.max_risk_limit_value) }));
+    if (values.some(tier => !tier.leverage.isFinite() || tier.leverage.lte(0) || !tier.value.isFinite() || tier.value.lte(0))) return null;
+    return Decimal.max(...values.map(tier => tier.leverage));
+  } catch { return null; }
 }
 
 function maxRiskPositionValueAtLeverage(
@@ -410,6 +421,11 @@ export class TradingRuntime {
         new Decimal(leg.leverage),
       );
       if (!maxPositionValue) {
+        const maximum = verifiedMaximumLeverage(riskLimitBySymbol.get(leg.symbol));
+        if (maximum && new Decimal(leg.leverage).gt(maximum)) {
+          throw new TradingRuntimeError('strategy_leverage_exceeds_limit', 409,
+            JSON.stringify({ symbol: leg.symbol, requested: leg.leverage, maximum: maximum.toString() }));
+        }
         throw new TradingRuntimeError('strategy_position_limit_unavailable', 503, leg.symbol);
       }
       const projectedPositionValue = existingQuantity.plus(plannedQuantity).abs().mul(leg.estimatedPrice);
@@ -1013,6 +1029,79 @@ export class TradingRuntime {
     return cancellation;
   }
 
+  cancelDispatchAttempts(id: string): number {
+    const row = this.database.prepare(`SELECT count(*) AS count FROM audit_events
+      WHERE type = 'execution_cancel_dispatched' AND correlation_id = ?`).get(id) as { count: number };
+    return row.count;
+  }
+
+  private recordCancelDispatch(order: ExecutionOrder, reason: 'initial' | 'confirmed-open-retry'): number {
+    const attempt = this.cancelDispatchAttempts(order.id) + 1;
+    if (attempt > MAX_CANCEL_DISPATCHES) throw new TradingRuntimeError('order_cancel_retry_limit', 409);
+    this.database.prepare(`INSERT INTO audit_events (id,created_at,type,correlation_id,payload_json)
+      VALUES (?,?,?,?,?)`).run(randomUUID(), new Date().toISOString(), 'execution_cancel_dispatched', order.id,
+      JSON.stringify({ attempt, reason, remoteOrderId: order.remoteOrderId, clientOrderId: order.clientOrderId,
+        symbol: order.symbol, side: order.side, quantity: order.quantity, executedQuantity: order.executedQuantity }));
+    return attempt;
+  }
+
+  private assertRetryIdentity(local: ExecutionOrder, remote: GateCrossExOrder): void {
+    const client = remote.text?.trim() || remote.client_order_id?.trim() || undefined;
+    let sameQuantity = false;
+    try {
+      sameQuantity = new Decimal(remote.qty).eq(local.quantity)
+        && new Decimal(remote.executed_qty).eq(local.executedQuantity)
+        && new Decimal(remote.qty).minus(remote.executed_qty).eq(new Decimal(local.quantity).minus(local.executedQuantity));
+    } catch { /* Invalid remote decimal is not identity evidence. */ }
+    const same = local.remoteOrderId !== null && remote.order_id === local.remoteOrderId
+      && (client === undefined || client === local.clientOrderId)
+      && remote.symbol === local.symbol && remote.side.toUpperCase() === local.side
+      && remote.type.toUpperCase() === local.type && remote.time_in_force.toUpperCase() === local.timeInForce
+      && remote.reduce_only.toLowerCase() === String(local.reduceOnly) && sameQuantity;
+    if (!same) throw new TradingRuntimeError('cancel_retry_identity_changed', 409);
+  }
+
+  async retryConfirmedCancellation(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    const inFlight = this.cancelRequests.get(id);
+    if (inFlight) return inFlight;
+    const retry = this.retryConfirmedCancellationOnce(id, beforeDispatch).finally(() => {
+      if (this.cancelRequests.get(id) === retry) this.cancelRequests.delete(id);
+    });
+    this.cancelRequests.set(id, retry);
+    return retry;
+  }
+
+  private async retryConfirmedCancellationOnce(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    const order = this.getOrder(id);
+    if (order.state !== 'PENDING_CANCEL' || order.failureReason === 'ORDER_CANCELLATION_UNKNOWN')
+      throw new TradingRuntimeError('cancel_retry_not_allowed', 409);
+    const attempts = this.cancelDispatchAttempts(id);
+    if (attempts < 1) throw new TradingRuntimeError('cancel_retry_history_missing', 409);
+    if (attempts >= MAX_CANCEL_DISPATCHES) throw new TradingRuntimeError('order_cancel_retry_limit', 409);
+    const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
+    const gateway = this.gateway as Partial<TradingCrossExGateway>;
+    if (!credentials || !gateway.queryOrder || !gateway.cancelOrder) throw new TradingRuntimeError('live_gateway_unavailable', 503);
+    const remote = await gateway.queryOrder(credentials, order.remoteOrderId ?? order.clientOrderId);
+    this.assertRetryIdentity(order, remote);
+    if (!['OPEN', 'PARTIALLY_FILLED'].includes(remote.state.toUpperCase()))
+      return await this.refreshOrderFromRemote(id) ?? this.getOrder(id);
+    const latest = this.getOrder(id);
+    if (latest.state !== 'PENDING_CANCEL' || latest.remoteOrderId !== order.remoteOrderId
+      || latest.executedQuantity !== order.executedQuantity) throw new TradingRuntimeError('cancel_retry_order_changed', 409);
+    beforeDispatch?.(); this.recordCancelDispatch(latest, 'confirmed-open-retry');
+    try {
+      await gateway.cancelOrder(credentials, remote.order_id, beforeDispatch);
+    } catch (error) {
+      if (!(error instanceof RequestNotDispatchedError) && !isDefinitiveSubmitRejection(error)) {
+        this.database.prepare("UPDATE execution_orders SET failure_reason='ORDER_CANCELLATION_UNKNOWN',updated_at=? WHERE id=? AND state='PENDING_CANCEL'")
+          .run(new Date().toISOString(), id);
+        const uncertain = this.getOrder(id); this.emit({ type: 'execution.update', payload: uncertain }); this.notifyOrderListeners(uncertain);
+      }
+      throw error;
+    }
+    return this.getOrder(id);
+  }
+
   private async cancelOrderOnce(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
     const order = this.getOrder(id);
     if (isTerminalOrderState(order.state)) throw new TradingRuntimeError('order_not_cancellable', 409);
@@ -1031,6 +1120,7 @@ export class TradingRuntime {
     const pending = this.getOrder(id);
     this.emit({ type: 'execution.update', payload: pending });
     this.notifyOrderListeners(pending);
+    this.recordCancelDispatch(pending, 'initial');
     try {
       await tradingGateway.cancelOrder(credentials, latest.remoteOrderId ?? latest.clientOrderId, beforeDispatch);
     } catch (error) {

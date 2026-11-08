@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { ContinuousProtectionSettings } from './risk-continuous-protection.js';
 import { type MarginSnapshot } from '@gate-crossex/shared-types';
 import { useLanguage } from './i18n.js';
 import { riskApi } from './risk-api.js';
 import { MarginProtectionStatus } from './margin-protection-status.js';
 import { RiskEvents } from './risk-events.js';
 import { RiskSettings } from './risk-settings.js';
-import { RiskNotifications } from './risk-notifications.js';
 import { riskExecutionStatus, type RiskExecutionTask } from './risk-execution-status.js';
-import { protectionCopy, riskAmount as amount, riskFresh, riskReason, riskTime } from './risk-presentation.js';
+import { riskAmount as amount, riskFresh, riskReason, riskTime } from './risk-presentation.js';
 import './risk.css';
+import { olderRiskSnapshot, supersededRiskReply } from './risk-policy-draft.js';
 import { useRiskClock } from './use-risk-clock.js';
 
 type Props = { snapshot: MarginSnapshot | null; onSnapshot: (s: MarginSnapshot) => void; tasks?: readonly RiskExecutionTask[] };
@@ -18,31 +17,31 @@ export function RiskManagementView(props: Props) {
 }
 function RiskWorkspace({ snapshot, onSnapshot, tasks }: Props) {
   const { language } = useLanguage(), zh = language === 'zh';
-  const [settings, setSettings] = useState(false);
   useRiskClock(snapshot);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
   const active = useRef(true);
+  const latest = useRef(snapshot); latest.current = snapshot;
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   const fresh = riskFresh(snapshot, Date.now()), accountId = snapshot?.accountId ?? null;
-  const accept = (next: MarginSnapshot) => { if (active.current && next.accountId === accountId) onSnapshot(next); };
+  const accept = (next: MarginSnapshot) => { if (active.current && next.accountId === accountId && (!latest.current || !olderRiskSnapshot(next, latest.current))) onSnapshot(next); };
   const refresh = async () => {
+    const before = latest.current;
     setBusy(true); setError('');
-    try { const next = await riskApi.snapshot(); if (active.current) { if (accountId && next.accountId !== accountId) setError('margin_account_changed'); else onSnapshot(next); } }
+    try { const next = await riskApi.snapshot(); if (active.current) { if (accountId && next.accountId !== accountId) setError('margin_account_changed'); else if (!latest.current || !supersededRiskReply(next, latest.current, before)) onSnapshot(next); } }
     catch (e) { if (active.current) setError(e instanceof Error ? e.message : 'risk_request_failed'); }
     finally { if (active.current) setBusy(false); }
   };
-  const openSettings = () => { setSettings(true); requestAnimationFrame(() => document.getElementById('risk-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' })); };
-  return <main className="risk-page">
+
+  return <main className="risk-page risk-configuration-page">
     <header className="risk-heading"><div><span className="risk-eyebrow">ACCOUNT / RISK</span><div className="risk-title-row"><h1>{zh ? '风险管理' : 'Risk management'}</h1><p>{snapshot?.accountLabel || (zh ? '等待账户连接' : 'Waiting for account')} / {snapshot?.metrics?.accountMode === 'CROSS_EXCHANGE' ? (zh ? '跨交易所全仓' : 'Cross-exchange margin') : snapshot?.metrics?.accountMode ?? '—'}</p></div></div>
       <div className="risk-heading-actions"><span className="risk-updated">{zh ? '更新于' : 'Observed'} {riskTime(snapshot?.sampledAt)}</span><button disabled={busy} onClick={() => void refresh()}>{zh ? '刷新数据' : 'Refresh'}</button></div></header>
     {error && <p className="risk-notice error" role="alert">{riskReason(error, zh)}</p>}
     <ExecutionNotice snapshot={snapshot} fresh={fresh} tasks={tasks} zh={zh} />
     <RiskStatus snapshot={snapshot} fresh={fresh} zh={zh} onSaved={accept} />
     <RiskMetrics snapshot={snapshot} fresh={fresh} zh={zh} />
-    {snapshot && <ContinuousProtectionSettings key={snapshot.accountId} snapshot={snapshot} zh={zh} />}
+    {snapshot && <RiskSettings snapshot={snapshot} onSaved={accept} fresh={fresh} />}
     {snapshot?.protection && <MarginProtectionStatus snapshot={snapshot} />}
-    <div className="risk-workspace-grid"><RiskEvents key={accountId} accountId={accountId} /><ProtectionSummary snapshot={snapshot} fresh={fresh} zh={zh} onSettings={openSettings} /></div>
-    {snapshot && <RiskSettings snapshot={snapshot} onSaved={accept} fresh={fresh} open={settings} onToggle={setSettings} />}
+    <RiskEvents key={accountId} accountId={accountId} />
     <AccountDetails snapshot={snapshot} fresh={fresh} zh={zh} />
     <p className="risk-caption risk-bottom-note">{zh ? '未触发预警不等于无风险。自动减仓受授权、持仓模式、行情及可执行数量约束。' : 'No alert is not a safety guarantee. Reduction depends on authority, margin mode, quotes and executable size.'}</p>
   </main>;
@@ -103,21 +102,6 @@ function RiskMetrics({ snapshot, fresh, zh }: { snapshot: MarginSnapshot | null;
     <article><div className="risk-metric-label"><span>{zh ? '维持保证金率' : 'Maintenance margin ratio'}</span><small>MMR</small></div><div className="risk-metric-value"><strong>{amount(m?.maintenancePct)}<em>{m?.maintenancePct == null ? '' : '%'}</em></strong><span>{zh ? '预警' : 'Warn'} &lt; {p?.maintenance.warn ?? '—'}%</span></div><footer>{zh ? '不高于 100%：存在强平风险' : 'At or below 100%: liquidation risk'}</footer></article>
     <article><div className="risk-metric-label"><span>{zh ? '保证金余额' : 'Margin balance'}</span><small>USDT</small></div><div className="risk-metric-value"><strong>{amount(m?.marginBalance)}</strong></div><footer className="risk-available"><span>{zh ? '可用保证金' : 'Available margin'}</span><b>{amount(m?.availableMargin)}</b></footer></article>
   </section>;
-}
-function ProtectionSummary({ snapshot, fresh, zh, onSettings }: { snapshot: MarginSnapshot | null; fresh: boolean; zh: boolean; onSettings: () => void }) {
-  const copy = protectionCopy(snapshot, fresh, zh), policy = snapshot?.effectivePolicy;
-  const debts = snapshot?.metrics?.assets.filter(a => Number(a.liability) > 0) ?? [];
-  return <aside className="risk-panel risk-sidebar"><h2>{zh ? '保护与通知' : 'Protection and notifications'}</h2><p className="risk-caption">{zh ? '保护范围、规则和通知，一处查看。' : 'Scope, rules and delivery in one place.'}</p>
-    <div className="risk-side-item"><div className="risk-section-heading"><h3>{zh ? '自动减仓范围' : 'Automatic reduction scope'}</h3><button disabled={!snapshot} className="risk-text-button" onClick={onSettings}>{zh ? '管理 ›' : 'Manage ›'}</button></div>
-      <strong className={`risk-scope-status ${copy.tone}`}>{copy.title}</strong><p>{copy.detail}</p>
-      <p>{snapshot ? snapshot.liveEnabled ? (zh ? '实盘权限已启用' : 'Live permission enabled') : snapshot.continuousProtection?.enabled ? (zh ? '普通交易锁定；持续保护按独立授权执行' : 'Ordinary trading locked; continuous protection has separate authority') : (zh ? '无实盘权限，不执行自动减仓' : 'Trading locked · no automatic reduction') : (zh ? '实盘权限待核实' : 'Live permission unverified')}</p>
-      {!!snapshot?.uncoveredSymbols.length && <details><summary>{zh ? `${snapshot.uncoveredSymbols.length} 个合约未被运行中的托管组覆盖` : `${snapshot.uncoveredSymbols.length} contracts outside active managed coverage`}</summary><p>{snapshot.uncoveredSymbols.join(', ')}</p></details>}
-      {!!debts.length && <p className="risk-inline-warning">{zh ? '存在币种负债，相关组可能无法形成减仓计划。请查看账户明细。' : 'Currency liabilities may prevent reduction plans for affected groups. Inspect account details.'}</p>}</div>
-    <div className="risk-side-item"><div className="risk-section-heading"><h3>{zh ? '保护阈值' : 'Protection thresholds'}</h3><button disabled={!snapshot} className="risk-text-button" onClick={onSettings}>{zh ? '设置 ›' : 'Settings ›'}</button></div>
-      <dl className="risk-policy-summary">{(['initial', 'maintenance'] as const).map((key, index) => <div key={key}><dt>{index ? 'MMR' : 'IMR'}</dt><dd>{policy ? `${policy[key].warn} / ${policy[key].reduce} / ${policy[key].recover}%` : '—'}</dd></div>)}</dl><p>{zh ? '依次为：预警 / 减仓 / 停止减仓恢复值' : 'Warning / reduction / recovery target'}</p>
-      {snapshot && snapshot.policy.revision !== policy?.revision && <p className="risk-inline-warning">{zh ? '显示当前事件有效阈值；新设置将在事件结束后生效。' : 'Showing active incident thresholds; new settings apply after it ends.'}</p>}</div>
-    <RiskNotifications zh={zh} />
-  </aside>;
 }
 function AccountDetails({ snapshot, fresh, zh }: { snapshot: MarginSnapshot | null; fresh: boolean; zh: boolean }) {
   const m = snapshot?.metrics;

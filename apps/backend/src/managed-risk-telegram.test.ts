@@ -16,7 +16,7 @@ function harness() {
 }
 
 describe('managed risk Telegram alerts', () => {
-  it('notifies quote loss immediately, deduplicates across restart, then records recovery without claiming trading permission', async () => {
+  it('debounces a quote flap, then pairs a sustained alert with one recovery', async () => {
     const h = harness(); h.db.exec('DELETE FROM managed_risk_lock');
     let now = Date.now(); const startedAt = now;
     h.db.prepare("INSERT INTO execution_strategies (id,kind,environment,status,config_json,created_at,updated_at) VALUES ('PAIR-LOSS','position','live','RUNNING',?, 'test','test')").run('{"asset":"ETH"}');
@@ -24,12 +24,71 @@ describe('managed risk Telegram alerts', () => {
     h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run('PAIR-LOSS','synthetic',JSON.stringify(state),'test');
     const send = vi.fn<typeof fetch>(async () => Response.json({ ok: true }));
     const notifier = () => new ManagedRiskTelegramAlerts(h.db,h.settings,vi.fn(),send,()=>now);
-    await notifier().poll(); await notifier().poll(); expect(send).toHaveBeenCalledTimes(1);
+    await notifier().poll(); now += 9_999; await notifier().poll(); expect(send).not.toHaveBeenCalled();
+    now += 1; await notifier().poll(); await notifier().poll(); expect(send).toHaveBeenCalledTimes(1);
     now += 2000;
     h.db.prepare('UPDATE managed_positions SET state_json=? WHERE strategy_id=?').run(JSON.stringify({ ...state, signalReason: null, signalMissingSince: null }), 'PAIR-LOSS');
     h.db.prepare('INSERT INTO audit_events (id,type,created_at,correlation_id,payload_json) VALUES (?,?,?,?,?)').run('recovery','managed_signal_recovered',new Date(now).toISOString(),`signal:PAIR-LOSS:${startedAt}`,JSON.stringify({ strategyId:'PAIR-LOSS',asset:'ETH',startedAt,endedAt:now }));
     await notifier().poll(); await notifier().poll(); expect(send).toHaveBeenCalledTimes(2);
     expect(JSON.parse(String(send.mock.calls[1][1]?.body)).text).toContain('风险锁');
+    h.db.close();
+  });
+  it('does not send a recovery when the brief incident never produced an outage alert', async () => {
+    const h = harness(); h.db.exec('DELETE FROM managed_risk_lock');
+    const now = Date.now(), startedAt = now - 2_000;
+    h.db.prepare("INSERT INTO execution_strategies (id,kind,environment,status,config_json,created_at,updated_at) VALUES ('PAIR-BRIEF','position','live','RUNNING',?, 'test','test')").run('{"asset":"BRIEF"}');
+    h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run('PAIR-BRIEF','synthetic',JSON.stringify({
+      phase:'MONITORING',leftQuantity:'1',rightQuantity:'1',signalReason:null,signalMissingSince:null}),'test');
+    h.db.prepare('INSERT INTO audit_events (id,type,created_at,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+      .run('brief-recovery','managed_signal_recovered',new Date(now).toISOString(),`signal:PAIR-BRIEF:${startedAt}`,
+        JSON.stringify({strategyId:'PAIR-BRIEF',asset:'BRIEF',startedAt,endedAt:now}));
+    const send=vi.fn<typeof fetch>(async()=>Response.json({ok:true}));
+    await new ManagedRiskTelegramAlerts(h.db,h.settings,vi.fn(),send,()=>now).poll();
+    expect(send).not.toHaveBeenCalled();
+    h.db.close();
+  });
+  it('does not let a newer unalerted flap hide an older alerted recovery', async () => {
+    const h=harness();h.db.exec('DELETE FROM managed_risk_lock');const now=Date.now(),older=now-20_000,newer=now-2_000;
+    h.db.prepare("INSERT INTO execution_strategies (id,kind,environment,status,config_json,created_at,updated_at) VALUES ('PAIR-ORDERED','position','live','RUNNING',?, 'test','test')").run('{"asset":"ORDERED"}');
+    h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run('PAIR-ORDERED','synthetic',JSON.stringify({phase:'MONITORING',leftQuantity:'1',rightQuantity:'1',signalReason:null,signalMissingSince:null}),'test');
+    h.db.prepare('INSERT INTO audit_events (id,type,created_at,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+      .run('older-alert','managed_quote_unavailable_telegram_sent',new Date(older+10_000).toISOString(),`signal:PAIR-ORDERED:${older}`,JSON.stringify({reason:'managed_quote_unavailable:TEST',taskCount:1}));
+    for(const [id,startedAt] of [['older-recovery',older],['newer-recovery',newer]] as const)
+      h.db.prepare('INSERT INTO audit_events (id,type,created_at,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+        .run(id,'managed_signal_recovered',new Date(startedAt+2_000).toISOString(),`signal:PAIR-ORDERED:${startedAt}`,
+          JSON.stringify({strategyId:'PAIR-ORDERED',asset:'ORDERED',startedAt,endedAt:startedAt+2_000}));
+    const send=vi.fn<typeof fetch>(async()=>Response.json({ok:true}));
+    await new ManagedRiskTelegramAlerts(h.db,h.settings,vi.fn(),send,()=>now).poll();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(send.mock.calls[0][1]?.body)).text).toContain(new Date(older).toISOString());
+    expect(h.db.prepare("SELECT correlation_id FROM audit_events WHERE type='managed_signal_recovered_telegram_sent'").all())
+      .toEqual([{correlation_id:`signal:PAIR-ORDERED:${older}`}]);
+    h.db.close();
+  });
+  it('batches simultaneous task outages and their paired recoveries into one message each', async () => {
+    const h = harness(); h.db.exec('DELETE FROM managed_risk_lock');
+    let now=Date.now();const startedAt=now-10_000;
+    for(const [id,asset] of [['PAIR-A','A'],['PAIR-B','B'],['PAIR-C','C']]) {
+      h.db.prepare('INSERT INTO execution_strategies (id,kind,environment,status,config_json,created_at,updated_at) VALUES (?,\'position\',\'live\',\'RUNNING\',?,\'test\',\'test\')').run(id,JSON.stringify({asset}));
+      h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run(id,'synthetic',JSON.stringify({phase:'MONITORING',leftQuantity:'1',rightQuantity:'1',
+        signalReason:`managed_quote_unavailable:HYPERLIQUID_FUTURE_${asset}_USDC`,signalMissingSince:startedAt}),'test');
+    }
+    const send=vi.fn<typeof fetch>(async()=>Response.json({ok:true}));
+    const alerts=new ManagedRiskTelegramAlerts(h.db,h.settings,vi.fn(),send,()=>now);
+    await alerts.poll();expect(send).toHaveBeenCalledTimes(1);
+    expect(h.db.prepare("SELECT count(*) n FROM audit_events WHERE type='managed_quote_unavailable_telegram_sent'").get()).toEqual({n:3});
+    const firstText=JSON.parse(String(send.mock.calls[0][1]?.body)).text;
+    expect(firstText).toContain('3 个任务');expect(firstText.length).toBeLessThanOrEqual(4096);
+    now+=2_000;
+    for(const [id,asset] of [['PAIR-A','A'],['PAIR-B','B'],['PAIR-C','C']]) {
+      h.db.prepare('UPDATE managed_positions SET state_json=? WHERE strategy_id=?').run(JSON.stringify({phase:'MONITORING',leftQuantity:'1',rightQuantity:'1',signalReason:null,signalMissingSince:null}),id);
+      h.db.prepare('INSERT INTO audit_events (id,type,created_at,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+        .run(`recovery-${id}`,'managed_signal_recovered',new Date(now).toISOString(),`signal:${id}:${startedAt}`,
+          JSON.stringify({strategyId:id,asset,startedAt,endedAt:now}));
+    }
+    await alerts.poll();expect(send).toHaveBeenCalledTimes(2);
+    expect(h.db.prepare("SELECT count(*) n FROM audit_events WHERE type='managed_signal_recovered_telegram_sent'").get()).toEqual({n:3});
+    expect(JSON.parse(String(send.mock.calls[1][1]?.body)).text).toContain('3 个任务');
     h.db.close();
   });
   it('reports failure start separately from hard pause and retains the precise read cause without duplicate alerts', async () => {
@@ -113,8 +172,8 @@ describe('managed risk Telegram alerts', () => {
     const send = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
     const alerts = new ManagedRiskTelegramAlerts(h.db, h.settings, vi.fn(), send as typeof fetch, () => now);
     await alerts.poll(); await alerts.poll(); await alerts.poll();
-    expect(send).toHaveBeenCalledTimes(2);
-    expect(h.db.prepare("SELECT count(*) AS n FROM audit_events WHERE type = 'managed_signal_telegram_sent'").get()).toEqual({ n: 2 });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(h.db.prepare("SELECT count(*) AS n FROM audit_events WHERE type IN ('managed_signal_telegram_sent','managed_quote_unavailable_telegram_sent')").get()).toEqual({ n: 2 });
     h.db.close();
   });
 });

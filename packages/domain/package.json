@@ -1,6 +1,6 @@
 {
   "name": "@gate-crossex/domain",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "license": "AGPL-3.0-only",
   "type": "module",
   "main": "dist/index.js",
@@ -12,6 +12,6 @@
   },
   "dependencies": {
     "decimal.js": "10.6.0",
-    "@gate-crossex/shared-types": "1.0.3"
+    "@gate-crossex/shared-types": "1.0.4"
   }
 }

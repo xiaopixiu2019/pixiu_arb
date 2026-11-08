@@ -6,6 +6,22 @@ function response(payload: unknown): Promise<Response> {
 }
 
 describe('venue public market data client', () => {
+  it.each([['SOPH', ''], ['xyz:SKHX', 'xyz']])('checks official OI caps for the exact native market %s', async (coin, dex) => {
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toEqual({ type: 'perpsAtOpenInterestCap', dex });
+      return response([coin]);
+    });
+    const client = new VenuePublicMarketDataClient(fetchMock as typeof fetch, () => 100_000, {
+      hyperliquidMetadataStore: { read: () => ({ nativeNames: [coin], fetchedAt: new Date(100_000).toISOString() }), write: () => undefined },
+    });
+    await expect(client.queryHyperliquidOpenInterestCap(`HYPERLIQUID_FUTURE_${coin.split(':').at(-1)}_USDC`)).resolves.toBe(true);
+  });
+  it('rejects malformed cap responses instead of treating them as free capacity', async () => {
+    const client = new VenuePublicMarketDataClient(vi.fn(() => response({ error: 'unavailable' })) as typeof fetch, () => 100_000, {
+      hyperliquidMetadataStore: { read: () => ({ nativeNames: ['SOPH'], fetchedAt: new Date(100_000).toISOString() }), write: () => undefined },
+    });
+    await expect(client.queryHyperliquidOpenInterestCap('HYPERLIQUID_FUTURE_SOPH_USDC')).rejects.toBeInstanceOf(Error);
+  });
   it('reads a fresh Binance depth snapshot without marks, keys or unsigned redirects', async () => {
     const now = 1_790_000_000_000;
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
