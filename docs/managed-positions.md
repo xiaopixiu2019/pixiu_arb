@@ -1,6 +1,6 @@
 # 托管对冲持仓规格
 
-本文件定义 PIXIU ARB 终端的现行托管行为。开发入口为 `legacy-terminal/`。API 请求与错误码见[接入文档](integration.md)，实现结构见[架构](architecture.md)。
+本文件定义 PIXIU ARB 终端的现行托管行为。开发入口为本仓库根目录。API 请求与错误码见[接入文档](integration.md)，实现结构见[架构](architecture.md)。
 
 ## 独立持续保护
 

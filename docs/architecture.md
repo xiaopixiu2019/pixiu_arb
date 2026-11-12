@@ -1,6 +1,6 @@
 # Architecture
 
-PIXIU ARB is a single-user terminal backed by Gate CrossEx. The owner can run the backend locally or on a dedicated private server reached through an SSH tunnel. It has no central hosted account service, telemetry or maintainer-controlled trading service. `legacy-terminal/` is the sole maintained checkout.
+PIXIU ARB is a single-user terminal backed by Gate CrossEx. The owner can run the backend locally or on a dedicated private server reached through an SSH tunnel. It has no central hosted account service, telemetry or maintainer-controlled trading service. This repository root is the maintained source checkout.
 
 ## Components
 
@@ -132,4 +132,4 @@ Each paired reduction's first leg requires both quotes, whether LIMIT or MARKET.
 
 ## Distribution
 
-Source launchers build and run the same local backend and frontend. Prebuilt macOS and Windows archives add a private Node.js runtime and platform-specific per-user startup integration. Installers verify the archive checksum and manifest, back up the database before updates, health-check new versions, and roll back failed activation. These installer operations do not configure the Japan server's backup timer or authorize live database restoration.
+Source launchers build and run the same local backend and frontend. Prebuilt macOS and Windows archives add a private Node.js runtime and platform-specific per-user startup integration. Installers verify the archive checksum and manifest, back up the database before updates, health-check new versions, and roll back failed activation. These installer operations do not configure unrelated remote backup services or authorize live database restoration.

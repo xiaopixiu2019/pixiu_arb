@@ -1,4 +1,5 @@
 import { marginReadFault } from './margin-read-fault.js';
+import { mergeMarginVersions, MarginVersionRegression, type MarginVersionEvidence } from './margin-version.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
 import { DEFAULT_MARGIN_POLICY, MarginPolicySchema, type MarginMetrics, type MarginSnapshot } from '@gate-crossex/shared-types';
@@ -13,7 +14,7 @@ export interface MarginProposal { quantity: string; target: string | null; apr: 
   approximate?: boolean; costPerUnit?: string; feePerUnit?: string; firstImpact?: { cost: string; initial: string; maintenance: string }; executionLegs?: CostReservation['legs'] }
 
 export interface MarginAccountRead { profileId: string; label: string; userId: string; account: GateCrossExAccount;
-  units?: GateCrossExAccount[]; unavailableUnits?: string[]; fatalUnavailableUnits?: boolean }
+  units?: GateCrossExAccount[]; unavailableUnits?: string[]; fatalUnavailableUnits?: boolean; accept?(): void }
 export interface MarginLaunchAuthorization { accountId: string; context: string; revision: number }
 export interface MarginEntryCheck {
   readonly snapshot: MarginSnapshot;
@@ -36,6 +37,7 @@ export interface MarginMonitorSources {
   valuation?(): NonNullable<MarginSnapshot['valuation']> | null;
   modes?(symbols: string[]): Promise<unknown>;
   onReadFault?(fields: Record<string, unknown>): void;
+  versionFloor?(): MarginVersionEvidence | null;
   onStop?(): Promise<void>;
   onSnapshot?(snapshot: MarginSnapshot): void; now?: () => number;
 }
@@ -48,6 +50,14 @@ export class MarginRiskMonitor {
   private valid = false;
   private failure: string | null = null;
   private fatalReadFailure = false;
+  private versionContext = '';
+  private versions: MarginVersionEvidence | null = null;
+  acceptedVersionEvidence(): MarginVersionEvidence | null {
+    return this.versionContext === this.sources.context() && this.versions ? {accountId:this.versions.accountId,units:{...this.versions.units}} : null;
+  }
+  clockAccountId(): string | null {
+    return this.latest?.context === this.sources.context() ? this.latest.key : null;
+  }
   readFailureRequiresReview(): boolean { return this.fatalReadFailure; }
   private lastState = '';
   private lastPrunedAt = 0;
@@ -93,10 +103,17 @@ export class MarginRiskMonitor {
       const key = createHash('sha256').update(`${result.profileId}:${result.userId}:${result.account.account_mode}:${result.account.account_mode === 'CROSS_EXCHANGE' ? 'CROSSEX' : 'all'}`).digest('hex');
       const policy = this.store.incident(key)?.policy ?? this.store.policy(key);
       const units = (result.units ?? [result.account]).map((a) => ({ exchangeType: a.exchange_type, metrics: marginMetrics(a, policy) }));
+      const retained = this.acceptedVersionEvidence(), persisted = this.sources.versionFloor?.() ?? null;
+      const previousVersions = persisted ? mergeMarginVersions(retained,persisted) : retained;
+      const candidateVersions = mergeMarginVersions(null,{accountId:key, units:Object.fromEntries(units.map(u=>[u.exchangeType,u.metrics.remoteUpdatedAt]))});
+      if (previousVersions && previousVersions.accountId !== key) throw new Error('margin_account_identity_changed');
       for (const unit of units) {
-        const previous = this.latest?.context === context ? this.latest.units.find(u => u.exchangeType === unit.exchangeType)?.metrics : null;
-        if (previous && new Decimal(unit.metrics.remoteUpdatedAt).lt(previous.remoteUpdatedAt)) throw new Error('margin_account_version_regressed');
+        const previous = previousVersions?.units[unit.exchangeType];
+        if (previous !== undefined && new Decimal(unit.metrics.remoteUpdatedAt).lt(previous))
+          throw new MarginVersionRegression(unit.exchangeType, previous, unit.metrics.remoteUpdatedAt);
       }
+      if (!result.unavailableUnits?.length) result.accept?.();
+      this.versions = mergeMarginVersions(previousVersions,candidateVersions); this.versionContext = context;
       const values = units.map((u) => u.metrics);
       values.sort((a, b) => Number(a.initialPct ?? Infinity) - Number(b.initialPct ?? Infinity));
       const metrics = values[0];
@@ -109,6 +126,7 @@ export class MarginRiskMonitor {
       if (context !== this.sources.context() || epoch !== this.readEpoch) return;
       const fault = marginReadFault(error);
       try { this.sources.onReadFault?.({ reason: fault.reason, fatal: fault.fatal,
+        ...(error instanceof MarginVersionRegression ? { exchangeType:error.exchangeType, previousVersion:error.previousVersion, candidateVersion:error.candidateVersion } : {}),
         ...(error instanceof GateApiError ? { status: error.statusCode, label: error.label, ...error.context } : {}) }); } catch { /* diagnostics do not change risk decisions */ }
       this.valid = false; this.failure = fault.reason; this.fatalReadFailure = fault.fatal;
       if (this.latest?.context === context) {

@@ -88,6 +88,26 @@ describe('Gate APIv4 signing', () => {
     finally { release(); await foreground; }
     expect(calls).toBe(2);
   });
+  it('keeps the risk-control account read independent when both ordinary slots are occupied', async () => {
+    let release!: () => void, calls = 0;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const account = { available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
+      initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE', account_mode: 'CROSS_EXCHANGE',
+      exchange_type: 'CROSSEX', update_time: '1783689000000', assets: [] };
+    const fetched = vi.fn(async (url: string | URL | Request) => {
+      calls += 1; if (calls <= 2) await held;
+      return new Response(new URL(String(url)).pathname.endsWith('/accounts') ? JSON.stringify(account) : '[]');
+    });
+    const client = new GateCrossExClient(fetched as typeof fetch, Date.now, undefined, 0);
+    const credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
+    const ordinaryA = client.queryPositions(credentials);
+    const ordinaryB = client.createStatisticsReader().queryAccount(credentials);
+    await vi.waitFor(() => expect(calls).toBe(2));
+    try {
+      await expect(client.createRiskControlReader().queryAccount(credentials)).resolves.toMatchObject({ margin_balance: '100' });
+      expect(calls).toBe(3);
+    } finally { release(); await Promise.all([ordinaryA, ordinaryB]); }
+  });
   it('uses public observed prices without credentials or assumed stablecoin parity', async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toBe('https://api.gateio.ws/api/v4/spot/tickers');

@@ -34,10 +34,10 @@ export interface MarginServiceOptions {
   funding?(symbol: string): { rate8h: string; fetchedAt: number } | null;
 }
 export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMonitor {
-  const accountGateway = o.gateway.createStatisticsReader?.() ?? o.gateway;
+  const accountGateway = o.gateway.createRiskControlReader?.() ?? o.gateway.createStatisticsReader?.() ?? o.gateway;
   // Retain the physical work until it settles; an ignored abort must not multiply credential/HTTP calls.
   let accountRead: Promise<import('./margin-risk-monitor.js').MarginAccountRead> | null = null;
-  let readStage = 'idle', readStartedAt = 0, readSequence = 0;
+  let readStage = 'idle', readStartedAt = 0, readSequence = 0, readContext = '';
   let currentAccount: Awaited<ReturnType<ReadOnlyCrossExGateway['queryAccount']>> | null = null;
   const readParameters = o.parameters ?? (o.dataDir ? marginParameterReader(o.dataDir) : () => null);
   const evidence = new MarginReductionEvidence(o.gateway.createStatisticsReader?.() ?? o.gateway, o.markets, o.context, o.funding);
@@ -68,13 +68,14 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
         eligible, authorized: false, reason: eligible ? null : !modeKnown ? 'position_margin_mode_unverified' : 'group_not_monitoring', readiness };
     });
   const monitor = new MarginRiskMonitor(store, {
+    versionFloor: () => o.manager.pendingMarginVersionFloor?.() ?? null,
     onStop: () => o.runtime.stopPairedEntries(),
     context: o.context, live: o.live, groups,
     normalRecoveryAuthority: () => o.manager.normalMarginRecoveryAuthority?.() ?? null,
     protectionEnabled: id => o.manager.protection?.owns(id) === true,
     protectionReady: id => o.manager.protection?.ready(id) === true && remoteOpenOrders === 0 && !o.runtime.listOpenOrders().length,
     continuousProtection: () => o.manager.protection?.view(),
-    onReadFault: (fields) => o.readFailure?.({ ...fields, stage: readStage, startedAt: readStartedAt, endedAt: Date.now(), context: accountContext, elapsedMs: Date.now() - readStartedAt, requestId: readSequence }),
+    onReadFault: (fields) => o.readFailure?.({ ...fields, stage: readStage, startedAt: readStartedAt, endedAt: Date.now(), context: readContext, elapsedMs: Date.now() - readStartedAt, requestId: readSequence }),
     valuation: () => { const value = evidence.valuation(); return value ? { ...value, profileId: o.profile()?.id ?? null } : null; },
     proposal: (record, facts, metrics, policy) => {
       if (!currentAccount) { failures.set(record.id, 'margin_account_unavailable'); return null; }
@@ -142,19 +143,20 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
     account: (signal) => {
       if (accountRead) return Promise.reject(new Error('margin_read_pending'));
       const context = o.context(), profile = o.profile();
-      readStartedAt = Date.now(); readSequence++; readStage = 'credentials';
+      readStartedAt = Date.now(); readSequence++; readStage = 'credentials'; readContext = context;
       const valid = () => { signal.throwIfAborted(); if (context !== o.context()) throw new Error('margin_account_changed'); };
       accountRead = (async () => {
         const credentials = await o.credentials(signal); valid();
         if (!credentials || !profile) throw new Error('margin_account_not_configured');
         readStage = 'account';
-        const result = await readAccountUnits(accountGateway, credentials, signal); valid();
+        const result = await readAccountUnits(accountGateway, o.gateway, credentials, signal); valid();
         const account = result.account;
         if (accountContext === context && currentAccount && (currentAccount.user_id !== account.user_id || currentAccount.account_mode !== account.account_mode)) throw new Error('margin_account_identity_changed');
-        accountMode = account.account_mode; currentAccount = account; accountContext = context;
-        refreshPositions(credentials, context);
-        if (positionContext === context) evidence.refresh(credentials, account, positions);
-        return { profileId: profile.id, label: profile.label, userId: account.user_id ?? '', ...result };
+        return { profileId: profile.id, label: profile.label, userId: account.user_id ?? '', ...result, accept: () => {
+          valid(); accountMode = account.account_mode; currentAccount = account; accountContext = context;
+          refreshPositions(credentials, context);
+          if (positionContext === context) evidence.refresh(credentials, account, positions);
+        } };
       })().finally(() => { accountRead = null; });
       return accountRead;
     },
@@ -178,7 +180,7 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
     if (!s.fresh) {
       if (!o.runtime.listStrategies().some(r => r.config.management && r.status === 'RUNNING')) return;
       if (monitor.readFailureRequiresReview()) o.manager.failAll(s.reason ?? 'margin_account_verification_failed');
-      else o.manager.holdForMarginRead();
+      else o.manager.holdForMarginRead(s.reason ?? undefined);
       return;
     }
     if (!o.runtime.listOpenOrders().some((order) => !order.reduceOnly) && !o.runtime.listStrategies().some((r) => r.management?.phase === 'OPENING' && r.status === 'RUNNING')) return;
@@ -188,13 +190,15 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
   return monitor;
 }
 
-async function readAccountUnits(gateway: ReadOnlyCrossExGateway, credentials: GateCredentials, signal: AbortSignal) {
+async function readAccountUnits(control: ReadOnlyCrossExGateway, ordinary: ReadOnlyCrossExGateway,
+  credentials: GateCredentials, signal: AbortSignal) {
   try {
-    const account = await gateway.queryAccount(credentials, undefined, signal);
+    const account = await control.queryAccount(credentials, undefined, signal);
     if (account.account_mode === 'CROSS_EXCHANGE') return { account };
   } catch (error) { if (!(error instanceof GateApiError) || ![400, 422].includes(error.statusCode)) throw error; }
   const venues = ['BINANCE', 'OKX', 'GATE', 'BYBIT', 'KRAKEN', 'HYPERLIQUID', 'DERIBIT'];
-  const reads = await Promise.allSettled(venues.map((venue) => gateway.queryAccount(credentials, venue, signal)));
+  // Split-mode fanout stays on the original two ordinary slots; one control sample cannot starve writes.
+  const reads = await Promise.allSettled(venues.map((venue) => ordinary.queryAccount(credentials, venue, signal)));
   signal.throwIfAborted();
   const units = reads.flatMap((r) => r.status === 'fulfilled' && r.value.account_mode === 'ISOLATED_EXCHANGE' ? [r.value] : []);
   if (!units.length && reads.every(r => r.status === 'rejected' && !marginReadFault(r.reason).fatal)) throw new Error('margin_read_pending');

@@ -24,10 +24,27 @@ export function admissionReadFailure(error: unknown, stage: string, symbol?: str
 }
 export interface CrossMarginEvidence { symbol: string; supportCross: boolean | null; mode: 'CROSS' | 'ISOLATED' | null;
   checkedAt: number; reason: string | null; failure?: AdmissionReadFailure }
+export interface CrossMarginReadBudget { deadline: number; track(reads: readonly Promise<unknown>[]): void }
+async function stageRead<T>(read: (signal?: AbortSignal) => Promise<T>, signal?: AbortSignal, budget?: CrossMarginReadBudget): Promise<T> {
+  if (!budget) return read(signal);
+  const remaining = Math.min(4000, budget.deadline - Date.now());
+  if (remaining <= 0) throw new DOMException('Preparation deadline exceeded', 'TimeoutError');
+  const controller = new AbortController(), combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(new DOMException('Preparation stage deadline exceeded', 'TimeoutError')), remaining);
+  const physical = Promise.resolve().then(() => { combined.throwIfAborted(); return read(combined); });
+  budget.track([physical]);
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([physical, new Promise<never>((_, reject) => {
+      abort = () => reject(combined.reason); combined.addEventListener('abort', abort, { once: true });
+      if (combined.aborted) abort();
+    })]);
+  } finally { clearTimeout(timer); if (abort) combined.removeEventListener('abort', abort); }
+}
 /** Account-bound reads also work before any position exists. No mode writes or probe orders. */
 export async function readCrossMarginEvidence(gateway: ReadOnlyCrossExGateway, credentials: GateCredentials,
-  symbols: string[], signal?: AbortSignal): Promise<CrossMarginEvidence[]> {
-  const catalog = await gateway.querySymbols();
+  symbols: string[], signal?: AbortSignal, budget?: CrossMarginReadBudget): Promise<CrossMarginEvidence[]> {
+  const catalog = await stageRead(s => gateway.querySymbols(s), signal, budget);
   signal?.throwIfAborted();
   return Promise.all(symbols.map(async (symbol) => {
     const capability = catalog.find(row => row.symbol === symbol)?.support_cross;
@@ -35,7 +52,7 @@ export async function readCrossMarginEvidence(gateway: ReadOnlyCrossExGateway, c
     if (supportCross !== true) return { symbol, supportCross, mode: null, checkedAt: Date.now(),
       reason: supportCross === false ? 'cross_margin_unsupported' : 'cross_margin_capability_unknown' };
     try {
-      const mode = await gateway.queryPositionMarginMode?.(credentials, symbol, signal);
+      const mode = await stageRead(async s => gateway.queryPositionMarginMode?.(credentials, symbol, s), signal, budget);
       signal?.throwIfAborted();
       return { symbol, supportCross, mode: mode ?? null, checkedAt: Date.now(),
         reason: mode === 'CROSS' ? null : mode === 'ISOLATED' ? 'cross_margin_mode_isolated' : 'cross_margin_mode_unknown' };

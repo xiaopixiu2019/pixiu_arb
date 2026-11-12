@@ -73,6 +73,7 @@ test('completion frames update protection without refresh, writes or renewing ex
       exchangeType: 'CROSSEX', remoteUpdatedAt: String(at), assets: [] } });
   let stream: WebSocketRoute | undefined;
   await page.routeWebSocket('**/ws/stream', ws => { stream = ws; ws.send(JSON.stringify({ type: 'risk.margin', payload: current })); });
+  await page.route('**/api/risk/margin/clock',r=>r.fulfill({json:{accountId:current.accountId,serverAt:current.sampledAt!+current.ageMs!}}));
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current }));
   await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId: current.accountId, events: [], hasMore: false } }));
   await page.route('**/api/risk/protection', r => r.fulfill({ json: { accountId: current.accountId, authorization: null,

@@ -266,7 +266,10 @@ test('a same-sample old HTTP reply cannot erase a newer blocked control state', 
   const f = await riskConfigFixture(page); f.override({ sampledAt: Date.now() }); await openRiskConfig(page);
   let release!: () => void; const wait = new Promise<void>(resolve => { release = resolve; });
   const old = f.snapshot(); let reads = 0;
-  await page.route('**/api/risk/margin', async route => { reads++; await wait; return route.fulfill({ json: old }); });
+  await page.route('**/api/risk/margin', async route => {
+    reads++; const reply={...old,ageMs:Date.now()-old.sampledAt!};
+    await wait; return route.fulfill({ json: reply });
+  });
   try {
     await page.getByRole('button', { name: '刷新数据', exact: true }).click(); await expect.poll(() => reads).toBe(1);
     f.override({ sampledAt: old.sampledAt, status: 'blocked', entryBlocked: true });

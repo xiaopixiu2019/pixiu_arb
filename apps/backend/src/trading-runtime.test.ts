@@ -311,6 +311,121 @@ describe('trading runtime order submission', () => {
 });
 
 describe('private event ingestion guards', () => {
+  it.each(['REJECT', 'REJECTED'])('preserves a known %s push as a terminal zero-fill order', async state => {
+    const h = await createHarness(), order = await h.runtime.createOrder(marketOrderInput);
+    h.runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: 'remote-1', state, executed_qty: '0', reason: 'post_only_reject' } });
+    expect(h.runtime.getOrder(order.id)).toMatchObject({ state, executedQuantity: '0', failureReason: 'post_only_reject' });
+    expect(h.runtime.listOpenOrders()).toEqual([]);
+  });
+  it('keeps persisted remote-missing responsibility visible after restart', async () => {
+    const h = await createHarness(), order = await h.runtime.createOrder(marketOrderInput);
+    h.database.prepare("UPDATE execution_orders SET state='REMOTE_NOT_FOUND' WHERE id=?").run(order.id);
+    const vault = new MemoryCredentialVault(); await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'fake', apiSecret: 'fake' });
+    const restarted = new TradingRuntime(h.database, new TradingSession(), vault, h.gateway);
+    expect(restarted.listOpenOrders().map(o => o.id)).toEqual([order.id]);
+    expect(isTerminalOrderState('REMOTE_NOT_FOUND')).toBe(false);
+    await expect(restarted.cancelOrder(order.id)).rejects.toMatchObject({ code: 'order_state_unresolved' });
+    expect(restarted.cancelDispatchAttempts(order.id)).toBe(0);
+  });
+  it('reconciles a fill discovered before a cancellation retry without another write', async () => {
+    const h = await createHarness({ queryOrder: id => remoteOrder({ order_id: id, text: undefined, state: 'FILLED' }) });
+    const order = await h.runtime.createOrder(marketOrderInput);
+    await h.runtime.cancelOrder(order.id);
+    await expect(h.runtime.retryConfirmedCancellation(order.id)).resolves.toMatchObject({ state: 'FILLED', executedQuantity: '0.1' });
+    expect(h.runtime.cancelDispatchAttempts(order.id)).toBe(1);
+  });
+  it('ignores a conflicting remote identity even when the client ID matches', async () => {
+    const h = await createHarness(), order = await h.runtime.createOrder(marketOrderInput);
+    h.runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: 'foreign', text: order.clientOrderId,
+      state: 'FILLED', executed_qty: '0.1' } });
+    expect(h.runtime.getOrder(order.id)).toMatchObject({ state: 'NEW', executedQuantity: '0' });
+  });
+  it('audit: missing remote evidence during cancellation must not resolve as success', async () => {
+    const h = await createHarness({ queryOrder: () => { throw new GateApiError(404, 'ORDER_NOT_FOUND'); } });
+    const order = await h.runtime.createOrder(marketOrderInput);
+    h.gateway.cancelOrder = async () => {
+      const result = await h.runtime.quiesceOpenOrders({ orderIds: [order.id], timeoutMs: 10 });
+      expect(result.resolved).toEqual([]);
+      expect(result.unresolved.map(item => item.order.id)).toEqual([order.id]);
+      expect(h.runtime.getOrder(order.id).state).toBe('PENDING_CANCEL');
+      throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR');
+    };
+    await expect(h.runtime.cancelOrder(order.id)).rejects.toMatchObject({ label: 'TRADE_ORDER_NOT_FOUND_ERROR' });
+  });
+
+  it('audit: an unrecognized private state must not establish cancellation completion', async () => {
+    const h = await createHarness();
+    const order = await h.runtime.createOrder(marketOrderInput);
+    h.gateway.cancelOrder = async () => {
+      h.runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: 'remote-1', state: 'UNKNOWN', executed_qty: '0' } });
+      throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR');
+    };
+    await expect(h.runtime.cancelOrder(order.id)).rejects.toMatchObject({ label: 'TRADE_ORDER_NOT_FOUND_ERROR' });
+  });
+
+  it('audit: REST-confirmable fill without an earlier private push must reconcile cancellation', async () => {
+    const h = await createHarness({ queryOrder: id => remoteOrder({ order_id: id, text: undefined, state: 'FILLED' }) });
+    const order = await h.runtime.createOrder(marketOrderInput);
+    h.gateway.cancelOrder = async () => { throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR'); };
+    await expect(h.runtime.cancelOrder(order.id)).resolves.toMatchObject({ state: 'FILLED', executedQuantity: '0.1' });
+    expect(h.gateway.queriedOrderIds).toEqual(['remote-1']);
+  });
+
+  it('accepts a terminal private fill when cancellation loses the active-order race', async () => {
+    const h = await createHarness();
+    const order = await h.runtime.createOrder(marketOrderInput);
+    h.runtime.ingestPrivateEvent({ channel: 'order', payload: {
+      order_id: 'remote-1', state: 'PARTIALLY_FILLED', executed_qty: '0.05', executed_avg_price: '100000',
+      update_time: '1783600002000',
+    } });
+    h.gateway.cancelOrder = async () => {
+      expect(h.runtime.getOrder(order.id)).toMatchObject({ state: 'PENDING_CANCEL', executedQuantity: '0.05' });
+      h.runtime.ingestPrivateEvent({ channel: 'order', payload: {
+        order_id: 'remote-1', state: 'FILLED', executed_qty: '0.1', executed_avg_price: '100000',
+        update_time: '1783600002500',
+      } });
+      throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR');
+    };
+
+    await expect(h.runtime.cancelOrder(order.id)).resolves.toMatchObject({
+      state: 'FILLED', executedQuantity: '0.1', failureReason: null,
+    });
+    expect(h.runtime.cancelDispatchAttempts(order.id)).toBe(1);
+  });
+
+  it('accepts the same terminal fill race during a fact-confirmed cancellation retry', async () => {
+    const h = await createHarness({ queryOrder: id => remoteOrder({
+      order_id: id, text: undefined, state: 'OPEN', executed_qty: '0', executed_avg_price: '0',
+    }) });
+    const order = await h.runtime.createOrder(marketOrderInput);
+    let cancels = 0;
+    h.gateway.cancelOrder = async () => {
+      cancels += 1;
+      if (cancels === 1) return { order_id: 'remote-1', text: '' };
+      h.runtime.ingestPrivateEvent({ channel: 'order', payload: {
+        order_id: 'remote-1', state: 'FILLED', executed_qty: '0.1', executed_avg_price: '100000',
+        update_time: '1783600002500',
+      } });
+      throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR');
+    };
+
+    await expect(h.runtime.cancelOrder(order.id)).resolves.toMatchObject({ state: 'PENDING_CANCEL' });
+    await expect(h.runtime.retryConfirmedCancellation(order.id)).resolves.toMatchObject({
+      state: 'FILLED', executedQuantity: '0.1', failureReason: null,
+    });
+    expect(h.runtime.cancelDispatchAttempts(order.id)).toBe(2);
+  });
+
+  it('keeps cancellation failure visible when order-not-found has no terminal private proof', async () => {
+    const h = await createHarness();
+    const order = await h.runtime.createOrder(marketOrderInput);
+    h.gateway.cancelOrder = async () => { throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR'); };
+
+    await expect(h.runtime.cancelOrder(order.id)).rejects.toMatchObject({ label: 'TRADE_ORDER_NOT_FOUND_ERROR' });
+    expect(h.runtime.getOrder(order.id)).toMatchObject({ state: 'PENDING_CANCEL', executedQuantity: '0' });
+    expect(h.runtime.cancelDispatchAttempts(order.id)).toBe(1);
+  });
+
   it('persists one cancellation intent before the request and never replays an uncertain cancel after OPEN updates', async () => {
     const h = await createHarness({ queryOrder: id => remoteOrder({ order_id: id, state: 'OPEN', executed_qty: '0' }) });
     const order = await h.runtime.createOrder(marketOrderInput); let cancels = 0;

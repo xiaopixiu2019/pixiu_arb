@@ -6,7 +6,8 @@ export async function riskConfigFixture(page: Page) {
   let stream: WebSocketRoute | undefined;
   let overrides: Record<string, unknown> = {};
   const writes: { path: string; body: Record<string, unknown> }[] = [];
-  const snapshot = () => MarginSnapshotSchema.parse({ accountId, accountLabel: accountId, sampledAt: Date.now(), ageMs: 0,
+  const snapshot = () => MarginSnapshotSchema.parse({ accountId, accountLabel: accountId, sampledAt: Date.now(),
+    ageMs: typeof overrides.sampledAt === 'number' ? Math.max(0,Date.now()-overrides.sampledAt) : 0,
     fresh: true, status: 'clear', reason: null, entryBlocked: false, liveEnabled: true, incidentId: effective ? 'incident-1' : null,
     policy, effectivePolicy: effective ?? policy, uncoveredSymbols: [], groups: [
       { id: 'g-live', strategyId: 'task-live', asset: 'BTC', phase: 'MONITORING', eligible: true, authorized: policy.protectedGroupIds.includes('g-live'), reason: null },
@@ -17,6 +18,7 @@ export async function riskConfigFixture(page: Page) {
   const send = () => stream?.send(JSON.stringify({ type: 'risk.margin', payload: snapshot() }));
   await page.addInitScript(() => localStorage.setItem('crossex-language', 'zh'));
   await page.route('**/api/preferences', r => r.fulfill({ json: { preferences: { language: 'zh' } } }));
+  await page.route('**/api/risk/margin/clock', r => { const value=snapshot();return r.fulfill({json:{accountId:value.accountId,serverAt:value.sampledAt!+value.ageMs!}}); });
   await page.route('**/api/risk/margin', r => r.fulfill({ json: snapshot() }));
   await page.routeWebSocket('**/ws/stream', socket => { stream = socket; send(); });
   await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId, events: [], hasMore: false } }));

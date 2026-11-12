@@ -76,6 +76,47 @@ describe('normal margin recovery authority', () => {
 });
 
 describe('margin monitoring and persisted incidents', () => {
+  it('publishes only accepted account versions and reports both rejected comparison operands',async()=>{
+    const h=harness(), accept=vi.fn(), fault=vi.fn();h.monitor.sources.onReadFault=fault;
+    const initial=h.account();h.pending(Promise.resolve({...initial,accept}));await h.monitor.refresh();
+    expect(accept).toHaveBeenCalledTimes(1);
+    h.pending(Promise.resolve({...initial,account:{...initial.account,update_time:String(Number(initial.account.update_time)-1)},accept}));await h.monitor.refresh();
+    expect(accept).toHaveBeenCalledTimes(1);
+    expect(fault).toHaveBeenCalledWith(expect.objectContaining({fatal:false,exchangeType:'CROSSEX',previousVersion:initial.account.update_time,candidateVersion:String(Number(initial.account.update_time)-1)}));
+  });
+  it('retains per-unit high watermarks across a partially unavailable account read',async()=>{
+    const h=harness(),initial=h.account();
+    const units=['BINANCE','GATE'].map(exchange_type=>({...initial.account,account_mode:'ISOLATED_EXCHANGE',exchange_type}));
+    h.pending(Promise.resolve({...initial,account:units[0],units}));await h.monitor.refresh();
+    h.advance(1000);h.pending(Promise.resolve({...initial,account:units[0],units:[units[0]],unavailableUnits:['GATE']}));await h.monitor.refresh();
+    h.pending(Promise.resolve({...initial,account:units[0],units:[units[0],{...units[1],update_time:String(Number(units[1].update_time)-1)}]}));await h.monitor.refresh();
+    expect(h.monitor.snapshot()).toMatchObject({fresh:false,reason:'margin_account_version_regressed'});
+  });
+  it('rejects older versions after monitor reconstruction using the persisted recovery floor',async()=>{
+    const h=harness();await h.monitor.refresh();const floor=h.monitor.acceptedVersionEvidence()!;
+    await h.monitor.stop();const restored=new MarginRiskMonitor(h.store,{...h.monitor.sources,versionFloor:()=>floor});
+    const initial=h.account();h.pending(Promise.resolve({...initial,account:{...initial.account,update_time:String(Number(initial.account.update_time)-1)}}));
+    await restored.refresh();expect(restored.snapshot()).toMatchObject({fresh:false,reason:'margin_account_version_regressed'});
+    expect(restored.readFailureRequiresReview()).toBe(false);await restored.stop();
+  });
+  it('coalesces concurrent refresh calls instead of accepting two reordered responses', async () => {
+    const h=harness(); let release!: (value:MarginAccountRead)=>void;
+    const query=vi.spyOn(h.monitor.sources,'account');
+    h.pending(new Promise(resolve=>{release=resolve;}));
+    const a=h.monitor.refresh(), b=h.monitor.refresh(), c=h.monitor.refresh();
+    expect(query).toHaveBeenCalledTimes(1); expect(a).toBe(b); expect(b).toBe(c);
+    release(h.account()); await Promise.all([a,b,c]);
+    expect(h.monitor.snapshot().fresh).toBe(true);
+  });
+  it('accepts equal versions but rejects a one-millisecond regression as a recoverable read failure', async () => {
+    const h=harness(), original=h.account(); await h.monitor.refresh();
+    h.advance(2000); h.pending(Promise.resolve(original)); await h.monitor.refresh();
+    expect(h.monitor.snapshot().fresh).toBe(true);
+    h.pending(Promise.resolve({...original,account:{...original.account,update_time:String(Number(original.account.update_time)-1)}}));
+    await h.monitor.refresh();
+    expect(h.monitor.snapshot()).toMatchObject({fresh:false,reason:'margin_account_version_regressed'});
+    expect(h.monitor.readFailureRequiresReview()).toBe(false);
+  });
   it('reuses one full snapshot only inside one synchronous entry check', async () => {
     const h = harness(); await h.monitor.refresh();
     const snapshot = vi.spyOn(h.monitor, 'snapshot');
@@ -112,7 +153,7 @@ describe('margin monitoring and persisted incidents', () => {
     h.pending(Promise.resolve(older)); await h.monitor.refresh();
     expect(h.monitor.snapshot()).toMatchObject({ fresh: false, reason: 'margin_account_version_regressed',
       sampledAt: newer.sampledAt, metrics: { marginBalance: '130', remoteUpdatedAt: newer.metrics!.remoteUpdatedAt } });
-    expect(h.monitor.readFailureRequiresReview()).toBe(true);
+    expect(h.monitor.readFailureRequiresReview()).toBe(false);
   });
   it('registers the recovery-sized first batch and never expands an already persisted batch', async () => {
     const h = harness(); h.monitor.sources.live = () => true;

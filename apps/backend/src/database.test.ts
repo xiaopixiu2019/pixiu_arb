@@ -68,8 +68,8 @@ describe('database migrations', () => {
 
     expect(readDatabaseStatus(first)).toEqual({
       state: 'ok',
-      migrationCount: 34,
-      currentMigration: '0034_task_performance_projection.sql',
+      migrationCount: 35,
+      currentMigration: '0035_router_entry_recovery.sql',
     });
     const orderColumns = first.prepare('PRAGMA table_info(execution_orders)').all() as Array<{ name: string }>;
     expect(orderColumns.map((column) => column.name)).toContain('failure_reason');
@@ -92,7 +92,7 @@ describe('database migrations', () => {
     first.close();
 
     const reopened = openDatabase(location.path, migrationsDir);
-    expect(readDatabaseStatus(reopened).migrationCount).toBe(34);
+    expect(readDatabaseStatus(reopened).migrationCount).toBe(35);
     reopened.close();
   });
 
@@ -188,7 +188,7 @@ describe('database migrations', () => {
     const database = openDatabase(location.path, resolve(process.cwd(), '../../migrations'));
     const columns = database.prepare('PRAGMA table_info(audit_events)').all() as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain('correlation_id');
-    expect(readDatabaseStatus(database).currentMigration).toBe('0034_task_performance_projection.sql');
+    expect(readDatabaseStatus(database).currentMigration).toBe('0035_router_entry_recovery.sql');
     database.close();
   });
 

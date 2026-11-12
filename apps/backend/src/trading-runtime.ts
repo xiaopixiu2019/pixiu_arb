@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { assertCancellationIdentity, confirmedOrderTerminal, reconcileMissingCancellation, TERMINAL_ORDER_STATES } from './cancellation-proof.js';
 import { RequestNotDispatchedError } from './authenticated-scheduler.js';
 import { advanceOrderFromFills } from './execution-fill-progress.js';
 import type { PairedEntryController } from './paired-entry-admission.js';
@@ -8,8 +9,10 @@ import { assertHyperliquidLimitPrice, HyperliquidPriceError, isHyperliquidFuture
 import { z } from 'zod';
 import { PositionManagementConfigSchema, type ManagedPositionView, type LiveBalance, type PortfolioFill, type PortfolioFuturesPosition } from '@gate-crossex/shared-types';
 import { managedOrderBlock, managedRiskBlock, readManagedState } from './managed-position-store.js';
+import { recordRouterEvidence, recordNoDispatch, routerEntryBlock, captureRouterContext, routerRetry, consumeRouterOutcome } from './router-entry-retry.js';
 import { managedResumeView } from './managed-position-resume.js';
-import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault } from './credential-vault.js';
+import { preparationEntryBlock } from './entry-preparation-recovery.js';
+import { DEFAULT_CREDENTIAL_PROFILE, type CredentialVault, type GateCredentials } from './credential-vault.js';
 import { CrossExOrderRequestSchema, GateApiError, type GateCrossExAccount, type GateCrossExOrder, type GateCrossExRiskLimit, type ReadOnlyCrossExGateway, type TradingCrossExGateway } from './crossex-client.js';
 import type { PrivateCrossExEvent } from './private-stream.js';
 import type { TradingSession } from './trading-session.js';
@@ -188,11 +191,10 @@ function strategyFromRow(row: StrategyRow): StrategyRecord {
 
 function venueFromSymbol(symbol: string): string { return symbol.split('_', 1)[0] ?? 'UNKNOWN'; }
 
-const OPEN_ORDER_STATES = ['PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED'];
 const MAX_CANCEL_DISPATCHES = 3;
 
 export function isTerminalOrderState(state: string): boolean {
-  return !OPEN_ORDER_STATES.includes(state);
+  return TERMINAL_ORDER_STATES.some(terminal => terminal === state);
 }
 
 /**
@@ -202,6 +204,11 @@ export function isTerminalOrderState(state: string): boolean {
  */
 function isDefinitiveSubmitRejection(error: unknown): boolean {
   return error instanceof RequestNotDispatchedError || error instanceof GateApiError && error.statusCode >= 400 && error.statusCode < 500;
+}
+
+function isRemoteOrderMissing(error: unknown): boolean {
+  return error instanceof GateApiError
+    && ['TRADE_ORDER_NOT_FOUND_ERROR', 'ORDER_NOT_FOUND'].includes(error.label);
 }
 
 /** A missing/malformed tier is not evidence that the requested leverage exceeds a known ceiling. */
@@ -560,14 +567,14 @@ export class TradingRuntime {
   }
 
   listOpenOrders(strategyId?: string): ExecutionOrder[] {
-    const placeholders = OPEN_ORDER_STATES.map(() => '?').join(', ');
+    const placeholders = TERMINAL_ORDER_STATES.map(() => '?').join(', ');
     const rows = strategyId
       ? this.statement(`SELECT * FROM execution_orders
-          WHERE environment = 'live' AND strategy_id = ? AND state IN (${placeholders})
-          ORDER BY created_at`).all(strategyId, ...OPEN_ORDER_STATES) as OrderRow[]
+          WHERE environment = 'live' AND strategy_id = ? AND state NOT IN (${placeholders})
+          ORDER BY created_at`).all(strategyId, ...TERMINAL_ORDER_STATES) as OrderRow[]
       : this.statement(`SELECT * FROM execution_orders
-          WHERE environment = 'live' AND state IN (${placeholders})
-          ORDER BY created_at`).all(...OPEN_ORDER_STATES) as OrderRow[];
+          WHERE environment = 'live' AND state NOT IN (${placeholders})
+          ORDER BY created_at`).all(...TERMINAL_ORDER_STATES) as OrderRow[];
     return rows.map(orderFromRow);
   }
 
@@ -576,7 +583,7 @@ export class TradingRuntime {
     const realizedPnl = this.strategyRealizedPnl();
     return rows.map((row) => {
       const strategy = strategyFromRow(row);
-      return { ...strategy, management: managedResumeView(strategy, readManagedState(this.database, strategy.id)), realizedPnl: realizedPnl.get(strategy.id)?.toString() ?? '0' };
+      return { ...strategy, management: this.managedView(strategy), realizedPnl: realizedPnl.get(strategy.id)?.toString() ?? '0' };
     });
   }
 
@@ -722,7 +729,8 @@ export class TradingRuntime {
   ingestPrivateEvent(event: PrivateCrossExEvent): void {
     this.pairedEntry?.event?.(event);
     if (event.channel === 'order') {
-      const parsed = z.object({ order_id: z.string(), text: z.string().optional(), state: z.string(),
+      const parsed = z.object({ order_id: z.string(), text: z.string().optional(), state: z.enum([
+        'PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED', ...TERMINAL_ORDER_STATES]),
         executed_qty: z.string().optional(), executed_avg_price: z.string().optional(), reason: z.string().optional(),
         update_time: z.string().optional() }).passthrough().safeParse(event.payload);
       if (!parsed.success) return;
@@ -732,6 +740,8 @@ export class TradingRuntime {
         this.bufferUnmatchedPrivateEvent(event);
         return;
       }
+      if (row.remote_order_id && row.remote_order_id !== parsed.data.order_id
+        || parsed.data.text && parsed.data.text !== row.client_order_id) return;
       // Reconnect replays and out-of-order delivery happen: a terminal order must never regress
       // to an open state, and executed quantity only moves forward. A cancel raced by a fill may
       // still correct one terminal state to another (e.g. CANCELLED -> FILLED).
@@ -751,13 +761,17 @@ export class TradingRuntime {
       if (nextState === row.state && nextQuantity === row.executed_quantity
         && (nextAveragePrice ?? null) === row.executed_average_price && nextFailureReason === row.failure_reason
         && nextRemoteOrderId === row.remote_order_id) {
+        this.database.transaction(() => this.recordRouterObservation(this.getOrder(row.id), incoming))();
         return;
       }
       const updateTime = incoming.update_time && Number.isFinite(Number(incoming.update_time))
         ? new Date(Number(incoming.update_time)).toISOString() : new Date().toISOString();
-      this.database.prepare(`UPDATE execution_orders SET state = ?, executed_quantity = ?, executed_average_price = ?,
+      this.database.transaction(() => {
+        this.database.prepare(`UPDATE execution_orders SET state = ?, executed_quantity = ?, executed_average_price = ?,
         failure_reason = ?, remote_order_id = ?, updated_at = ? WHERE id = ?`)
         .run(nextState, nextQuantity, nextAveragePrice ?? null, nextFailureReason, nextRemoteOrderId, updateTime, row.id);
+        this.recordRouterObservation(this.getOrder(row.id), incoming);
+      })();
       const order = this.getOrder(row.id);
       if (new Decimal(nextQuantity).gt(row.executed_quantity)) this.noteExecution(order);
       this.emit({ type: 'execution.update', payload: order });
@@ -869,6 +883,12 @@ export class TradingRuntime {
       ?? (input.type === 'MARKET' && !!metadata && this.pairedEntry?.assertOrder(input, metadata, exclude) === true);
     const managedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
     if (managedBlock) throw new TradingRuntimeError(managedBlock, 409);
+    if (!input.reduceOnly && metadata?.strategyId) {
+      const block = routerEntryBlock(this.database, this.getStrategy(metadata.strategyId));
+      if (block) throw new TradingRuntimeError(block, 409);
+      const preparation = input.timeInForce === 'POC' ? preparationEntryBlock(this.database, this.getStrategy(metadata.strategyId)) : null;
+      if (preparation) throw new TradingRuntimeError(preparation, 409);
+    }
     if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection()) {
       throw new TradingRuntimeError('live_trading_locked', 403);
     }
@@ -953,6 +973,7 @@ export class TradingRuntime {
       'live', input.symbol, venueFromSymbol(input.symbol), input.side, input.type, input.timeInForce,
       input.quantity, input.price ?? null, input.reduceOnly ? 1 : 0, metadata?.strategyId ?? null,
       metadata?.strategyLeg ?? null, metadata?.strategyClip ?? null, metadata?.feePhase ?? null, now, now);
+    if (metadata?.strategyId) captureRouterContext(this.database, this.getStrategy(metadata.strategyId), id);
     let accepted;
     try {
       accepted = await tradingGateway.createOrder(credentials, gateInput, () => {
@@ -960,6 +981,12 @@ export class TradingRuntime {
         if (block) throw new TradingRuntimeError(block, 409);
         if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection(id)) throw new TradingRuntimeError('live_trading_locked', 403);
         metadata?.beforeDispatch?.(id);
+        if (!input.reduceOnly && metadata?.strategyId) {
+          const retryBlock = routerEntryBlock(this.database, this.getStrategy(metadata.strategyId));
+          if (retryBlock) throw new TradingRuntimeError(retryBlock, 409);
+          const preparation = input.timeInForce === 'POC' ? preparationEntryBlock(this.database, this.getStrategy(metadata.strategyId)) : null;
+          if (preparation) throw new TradingRuntimeError(preparation, 409);
+        }
         if (pairedAdmission && metadata) this.pairedEntry!.assertOrder(input, metadata, id);
       });
     } catch (error) {
@@ -972,6 +999,7 @@ export class TradingRuntime {
           .run(new Date().toISOString(), id);
         this.scheduleSubmitResolution(id);
       }
+      if (error instanceof RequestNotDispatchedError) recordNoDispatch(this.database, this.getOrder(id));
       this.emit({ type: 'execution.update', payload: this.getOrder(id) });
       this.notifyOrderListeners(this.getOrder(id));
       if (error instanceof RequestNotDispatchedError) throw new TradingRuntimeError(error.reason, 409);
@@ -1046,19 +1074,8 @@ export class TradingRuntime {
   }
 
   private assertRetryIdentity(local: ExecutionOrder, remote: GateCrossExOrder): void {
-    const client = remote.text?.trim() || remote.client_order_id?.trim() || undefined;
-    let sameQuantity = false;
-    try {
-      sameQuantity = new Decimal(remote.qty).eq(local.quantity)
-        && new Decimal(remote.executed_qty).eq(local.executedQuantity)
-        && new Decimal(remote.qty).minus(remote.executed_qty).eq(new Decimal(local.quantity).minus(local.executedQuantity));
-    } catch { /* Invalid remote decimal is not identity evidence. */ }
-    const same = local.remoteOrderId !== null && remote.order_id === local.remoteOrderId
-      && (client === undefined || client === local.clientOrderId)
-      && remote.symbol === local.symbol && remote.side.toUpperCase() === local.side
-      && remote.type.toUpperCase() === local.type && remote.time_in_force.toUpperCase() === local.timeInForce
-      && remote.reduce_only.toLowerCase() === String(local.reduceOnly) && sameQuantity;
-    if (!same) throw new TradingRuntimeError('cancel_retry_identity_changed', 409);
+    try { assertCancellationIdentity(local, remote); }
+    catch { throw new TradingRuntimeError('cancel_retry_identity_changed', 409); }
   }
 
   async retryConfirmedCancellation(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
@@ -1072,6 +1089,7 @@ export class TradingRuntime {
   }
 
   private async retryConfirmedCancellationOnce(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    const deadline = Date.now() + 2500;
     const order = this.getOrder(id);
     if (order.state !== 'PENDING_CANCEL' || order.failureReason === 'ORDER_CANCELLATION_UNKNOWN')
       throw new TradingRuntimeError('cancel_retry_not_allowed', 409);
@@ -1083,8 +1101,10 @@ export class TradingRuntime {
     if (!credentials || !gateway.queryOrder || !gateway.cancelOrder) throw new TradingRuntimeError('live_gateway_unavailable', 503);
     const remote = await gateway.queryOrder(credentials, order.remoteOrderId ?? order.clientOrderId);
     this.assertRetryIdentity(order, remote);
-    if (!['OPEN', 'PARTIALLY_FILLED'].includes(remote.state.toUpperCase()))
-      return await this.refreshOrderFromRemote(id) ?? this.getOrder(id);
+    if (isTerminalOrderState(remote.state) || new Decimal(remote.executed_qty).gt(order.executedQuantity)) {
+      this.ingestPrivateEvent({ channel: 'order', payload: remote });
+      return this.getOrder(id);
+    }
     const latest = this.getOrder(id);
     if (latest.state !== 'PENDING_CANCEL' || latest.remoteOrderId !== order.remoteOrderId
       || latest.executedQuantity !== order.executedQuantity) throw new TradingRuntimeError('cancel_retry_order_changed', 409);
@@ -1092,6 +1112,7 @@ export class TradingRuntime {
     try {
       await gateway.cancelOrder(credentials, remote.order_id, beforeDispatch);
     } catch (error) {
+      if (isRemoteOrderMissing(error)) return this.reconcileCancellation(order, error, deadline, credentials);
       if (!(error instanceof RequestNotDispatchedError) && !isDefinitiveSubmitRejection(error)) {
         this.database.prepare("UPDATE execution_orders SET failure_reason='ORDER_CANCELLATION_UNKNOWN',updated_at=? WHERE id=? AND state='PENDING_CANCEL'")
           .run(new Date().toISOString(), id);
@@ -1103,9 +1124,12 @@ export class TradingRuntime {
   }
 
   private async cancelOrderOnce(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    const deadline = Date.now() + 2500;
     const order = this.getOrder(id);
     if (isTerminalOrderState(order.state)) throw new TradingRuntimeError('order_not_cancellable', 409);
     if (order.state === 'PENDING_CANCEL') return order;
+    if (!['PENDING_SUBMIT', 'NEW', 'OPEN', 'PARTIALLY_FILLED'].includes(order.state))
+      throw new TradingRuntimeError('order_state_unresolved', 409);
     const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
     if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
     const tradingGateway = this.gateway as Partial<TradingCrossExGateway>;
@@ -1124,6 +1148,7 @@ export class TradingRuntime {
     try {
       await tradingGateway.cancelOrder(credentials, latest.remoteOrderId ?? latest.clientOrderId, beforeDispatch);
     } catch (error) {
+      if (isRemoteOrderMissing(error)) return this.reconcileCancellation(order, error, deadline, credentials);
       if (error instanceof RequestNotDispatchedError) {
         this.database.prepare(`UPDATE execution_orders SET state=CASE WHEN CAST(executed_quantity AS REAL)>0 THEN 'PARTIALLY_FILLED' ELSE ? END,
           updated_at=? WHERE id=? AND state='PENDING_CANCEL'`).run(latest.state, new Date().toISOString(), id);
@@ -1136,6 +1161,18 @@ export class TradingRuntime {
       throw error;
     }
     return this.getOrder(id);
+  }
+
+  private async reconcileCancellation(order: ExecutionOrder, error: unknown, deadline: number, credentials: GateCredentials): Promise<ExecutionOrder> {
+    const gateway = this.gateway as Partial<TradingCrossExGateway>;
+    if (!credentials || !gateway.queryOrder || !order.remoteOrderId) throw error;
+    return reconcileMissingCancellation({ original: order, error, deadline,
+      current: () => this.getOrder(order.id), listen: callback => this.onOrderUpdate(callback),
+      query: () => gateway.queryOrder!(credentials, order.remoteOrderId!),
+      apply: remote => {
+        this.ingestPrivateEvent({ channel: 'order', payload: remote });
+        return this.getOrder(order.id);
+      } });
   }
 
   /**
@@ -1151,32 +1188,20 @@ export class TradingRuntime {
     const attempts = this.listOpenOrders(options.strategyId).filter((o) => !options.orderIds || options.orderIds.includes(o.id)).map(async (initial) => {
       try {
         let current = initial;
-        try {
-          current = await this.refreshOrderFromRemote(initial.id) ?? current;
-        } catch (error) {
-          if (error instanceof GateApiError && error.statusCode === 404) {
-            current = this.markOrderRemoteMissing(initial.id);
-          } else {
-            throw error;
-          }
-        }
-        if (isTerminalOrderState(current.state)) return { resolved: current } as const;
+        current = await this.refreshOrderFromRemote(initial.id) ?? current;
+        if (confirmedOrderTerminal(current)) return { resolved: current } as const;
         if (current.state !== 'PENDING_CANCEL') await this.cancelOrder(current.id);
         const refreshedAfterCancel = await this.refreshOrderFromRemote(current.id);
-        const settled = refreshedAfterCancel && isTerminalOrderState(refreshedAfterCancel.state)
+        const settled = refreshedAfterCancel && confirmedOrderTerminal(refreshedAfterCancel)
           ? refreshedAfterCancel
           : await this.awaitTerminalOrder(current.id, timeoutMs);
-        if (isTerminalOrderState(settled.state)) return { resolved: settled } as const;
+        if (confirmedOrderTerminal(settled)) return { resolved: settled } as const;
         return { unresolved: { order: settled, reason: 'cancel_not_confirmed' } } as const;
       } catch (error) {
         try {
           const refreshed = await this.refreshOrderFromRemote(initial.id);
-          if (refreshed && isTerminalOrderState(refreshed.state)) return { resolved: refreshed } as const;
-        } catch (refreshError) {
-          if (refreshError instanceof GateApiError && refreshError.statusCode === 404) {
-            return { resolved: this.markOrderRemoteMissing(initial.id) } as const;
-          }
-        }
+          if (refreshed && confirmedOrderTerminal(refreshed)) return { resolved: refreshed } as const;
+        } catch { /* Failed reads retain the original unresolved responsibility below. */ }
         return {
           unresolved: {
             order: this.getOrder(initial.id),
@@ -1208,16 +1233,6 @@ export class TradingRuntime {
     this.emit({ type: 'execution.snapshot', payload: this.snapshot() });
   }
 
-  private markOrderRemoteMissing(id: string): ExecutionOrder {
-    this.database.prepare(`UPDATE execution_orders SET state = 'REMOTE_NOT_FOUND', updated_at = ?
-      WHERE id = ? AND state IN ('PENDING_SUBMIT', 'PENDING_CANCEL', 'NEW', 'OPEN', 'PARTIALLY_FILLED')`)
-      .run(new Date().toISOString(), id);
-    const order = this.getOrder(id);
-    this.emit({ type: 'execution.update', payload: order });
-    this.notifyOrderListeners(order);
-    return order;
-  }
-
   /** Refresh a local order row from the authenticated remote order-details endpoint. */
   async refreshOrderFromRemote(id: string): Promise<ExecutionOrder | null> {
     const inFlight = this.remoteRefreshes.get(id);
@@ -1243,12 +1258,15 @@ export class TradingRuntime {
     const updatedAt = Number.isFinite(Number(remote.update_time)) ? new Date(Number(remote.update_time)).toISOString() : new Date().toISOString();
     if (/^\d+$/.test(remote.update_time)) this.database.prepare('UPDATE execution_orders SET remote_update_time = ? WHERE id = ?').run(remote.update_time, id);
     const state = current.state === 'PENDING_CANCEL' && !isTerminalOrderState(remote.state) ? current.state : remote.state;
-    this.database.prepare(`UPDATE execution_orders SET state = ?, executed_quantity = ?, executed_average_price = ?,
+    this.database.transaction(() => {
+      this.database.prepare(`UPDATE execution_orders SET state = ?, executed_quantity = ?, executed_average_price = ?,
       failure_reason = COALESCE(NULLIF(?, ''), failure_reason), remote_order_id = COALESCE(remote_order_id, ?),
       updated_at = ? WHERE id = ?`)
       .run(state, Decimal.max(remote.executed_qty, current.executedQuantity).toString(),
         new Decimal(remote.executed_qty).gte(current.executedQuantity) ? remote.executed_avg_price : current.executedAveragePrice,
         remote.reason, remote.order_id, updatedAt, id);
+      this.recordRouterObservation(this.getOrder(id), remote);
+    })();
     const refreshed = this.getOrder(id);
     this.emit({ type: 'execution.update', payload: refreshed });
     this.notifyOrderListeners(refreshed);
@@ -1317,7 +1335,15 @@ export class TradingRuntime {
 
   private withStrategyMetrics(strategy: StrategyRecord): StrategyRecord {
     const realizedPnl = this.strategyRealizedPnl(strategy.id).get(strategy.id) ?? new Decimal(0);
-    return { ...strategy, management: managedResumeView(strategy, readManagedState(this.database, strategy.id)), realizedPnl: realizedPnl.toString() };
+    return { ...strategy, management: this.managedView(strategy), realizedPnl: realizedPnl.toString() };
+  }
+  private recordRouterObservation(order: ExecutionOrder, raw: Record<string, unknown>): void {
+    recordRouterEvidence(this.database, order, raw);
+    if (order.strategyId) consumeRouterOutcome(this.database, this.getStrategy(order.strategyId), order);
+  }
+  private managedView(strategy: StrategyRecord) {
+    const view = managedResumeView(strategy, readManagedState(this.database, strategy.id), this.database), retry = routerRetry(this.database, strategy.id);
+    return view && retry ? { ...view, routerRetry: { failures:retry.failures, nextAt:retry.next_at, review:!!retry.review } } : view;
   }
 
   /**

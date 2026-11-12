@@ -20,6 +20,8 @@ import { MarginRiskStore } from './margin-risk-store.js';
 import { RequestNotDispatchedError } from './authenticated-scheduler.js';
 import { PairedEntryPool } from './paired-entry-pool.js';
 import { Decimal } from 'decimal.js';
+import { routerRetry, ROUTER_REVIEW } from './router-entry-retry.js';
+import { readManagedState } from './managed-position-store.js';
 import { seedPairedPerformanceHistory, PAIRED_PERFORMANCE_SCALE } from './test-support/paired-performance.js';
 import { MarginReductionEvidence } from './margin-reduction-evidence.js';
 
@@ -538,6 +540,72 @@ async function managedDeferralHarness(executionMethod: 'MAKER_TAKER' | 'TAKER_TA
   return { h, record, facts, setRead: (value: typeof read) => { read = value; } };
 }
 
+describe('durable router rejection isolation',()=>{
+  it.each(['before','after'] as const)('bounds terminal rejections arriving %s the HTTP response and preserves six monitoring siblings',async timing=>{
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-10T00:00:00Z'));
+    const {h,record}=await managedDeferralHarness('MAKER_TAKER');
+    try {
+      const siblings:string[]=[];
+      for(let i=0;i<6;i++){
+        const asset=`TEST${i}`,left=`BINANCE_FUTURE_${asset}_USDT`,right=`OKX_FUTURE_${asset}_USDT`;
+        h.markets.set(left,'110','111');h.markets.set(right,'99','100');
+        const s=await h.engine.startStrategy({...takerTakerConfig,asset,totalAmount:'1',perOrderQuantity:'1',management:{perOrderQuantity:'1'}},{profileId:'account-1',label:'Synthetic'});
+        seedFilledStrategyOrder(h.database,s.id,`${i}-left`,left,'SELL','1','left');seedFilledStrategyOrder(h.database,s.id,`${i}-right`,right,'BUY','1','right');
+        h.gateway.positions.push(futuresPosition(left,'SHORT','1'),futuresPosition(right,'LONG','1'));
+        h.manager!.handoff(s.id,'1');siblings.push(s.id);
+      }
+      const reason=JSON.stringify({label:'NOT_BEST_ACCOUNT_ROUTER'}),create=h.gateway.createOrder.bind(h.gateway),query=h.gateway.queryOrder.bind(h.gateway);
+      const failed=new Set<string>();
+      h.gateway.queryOrder=async(...args)=>{const o=await query(...args);return failed.has(o.order_id)?{...o,state:'FAIL',executed_qty:'0',reason}:o;};
+      h.gateway.createOrder=async(...args)=>{
+        const accepted=await create(...args);
+        if(timing==='before') {failed.add(accepted.order_id);h.runtime.ingestPrivateEvent({channel:'order',payload:{order_id:accepted.order_id,text:args[1].text,state:'FAIL',executed_qty:'0',reason}});}
+        return accepted;
+      };
+      for(let i=0;i<5;i++){
+        h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111');h.markets.set('OKX_FUTURE_BTC_USDT','99','100');
+        await h.engine.tick();
+        expect(h.gateway.createdOrders).toHaveLength(i+1);
+        const remoteId=h.gateway.createdOrders[i].remoteId;
+        if(timing==='after'){failed.add(remoteId);ackOrder(h.runtime,remoteId,'FAIL','0','0',reason);}
+        ackOrder(h.runtime,remoteId,'FAIL','0','0',reason);
+        expect(routerRetry(h.database,record.id)?.failures).toBe(i+1);
+        await h.manager!.tick();
+        expect(h.database.prepare('SELECT * FROM managed_risk_lock').all()).toEqual([]);
+        if(i<4){
+          await h.engine.tick();expect(h.gateway.createdOrders).toHaveLength(i+1);
+          vi.setSystemTime(Date.now()+[4000,8000,16000,32000][i]);
+        }
+      }
+      await h.engine.tick();
+      expect(h.runtime.getStrategy(record.id)).toMatchObject({status:'PAUSED',management:{reason:ROUTER_REVIEW}});
+      expect(h.database.prepare('SELECT * FROM managed_risk_lock').all()).toEqual([]);
+      await h.manager!.tick();
+      for(const id of siblings) expect(h.runtime.getStrategy(id)).toMatchObject({status:'RUNNING',management:{phase:'MONITORING',checkedAt:new Date().toISOString()}});
+      expect(h.session.current).toBe('live');expect(h.gateway.createdOrders).toHaveLength(5);
+      h.markets.set('BINANCE_FUTURE_TEST0_USDT','110','111');h.markets.set('OKX_FUTURE_TEST0_USDT','99','100');
+      h.manager!.requestExit(siblings[0]);await h.manager!.tick();
+      expect(h.gateway.createdOrders).toHaveLength(6);
+      expect(h.gateway.createdOrders[5]).toMatchObject({reduce_only:'true',symbol:'BINANCE_FUTURE_TEST0_USDT'});
+    } finally {await h.manager!.stop();await h.engine.stop();vi.useRealTimers();}
+  });
+  it('retains the next retry deadline and failure count across an engine restart',async()=>{
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-11-10T00:00:00Z'));
+    const {h,record}=await managedDeferralHarness('MAKER_TAKER');
+    try {
+      await h.engine.tick();const id=h.gateway.createdOrders[0].remoteId;
+      ackOrder(h.runtime,id,'FAIL','0','0',JSON.stringify({label:'NOT_BEST_ACCOUNT_ROUTER'}));
+      const before=routerRetry(h.database,record.id);await h.engine.stop();
+      h.engine=new StrategyEngine(h.database,h.session,h.runtime,h.markets,{requoteIntervalMs:10});
+      h.engine.setPositionManager(h.manager!);h.engine.activatePersistedStrategies('account-1');
+      await h.engine.tick();expect(h.gateway.createdOrders).toHaveLength(1);expect(routerRetry(h.database,record.id)).toEqual(before);
+      vi.setSystemTime(before!.next_at);h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111');h.markets.set('OKX_FUTURE_BTC_USDT','99','100');
+      await h.engine.tick();expect(h.gateway.createdOrders).toHaveLength(2);
+      ackOrder(h.runtime,h.gateway.createdOrders[1].remoteId,'CANCELLED','0','0');
+    }finally{await h.manager!.stop();await h.engine.stop();vi.useRealTimers();}
+  });
+});
+
 async function pendingProgressHarness(now?: () => number) {
   let monitor!: MarginRiskMonitor;
   const result = await managedDeferralHarness('MAKER_TAKER', {}, h => {
@@ -558,6 +626,66 @@ async function pendingProgressHarness(now?: () => number) {
 }
 
 describe('pre-submit account recheck deferral', () => {
+  it('discards a delayed preparation timeout after the user switches to readonly',async()=>{
+    const {h,record}=await managedDeferralHarness('MAKER_TAKER');let reject!:(error:unknown)=>void;
+    const prepare=vi.spyOn(h.runtime,'preparePairedEntry').mockImplementation(()=>new Promise((_,fail)=>{reject=fail;}));
+    const evaluating=h.engine.tick();await waitFor(()=>!!reject);h.session.set('readonly');
+    reject(new TradingRuntimeError('paired_entry_read_failed',409,'{"kind":"timeout","stage":"catalog"}'));await evaluating;prepare.mockRestore();
+    expect(readManagedState(h.database,record.id)?.preparationRecovery).toBeUndefined();
+    expect(h.gateway.createAttempts).toHaveLength(0);expect(h.database.prepare('SELECT * FROM managed_risk_lock').all()).toEqual([]);
+  });
+  it('does not let an older ordinary account read complete a newly preparation-paused empty task',async()=>{
+    let clock=Date.now();const {h,record,facts,setRead}=await managedDeferralHarness('MAKER_TAKER',{now:()=>clock});
+    let release!:(value:Awaited<ReturnType<typeof facts>>)=>void;
+    setRead(()=>new Promise(resolve=>{release=resolve;}));const reading=h.manager!.tick();await waitFor(()=>!!release);
+    const prepare=vi.spyOn(h.runtime,'preparePairedEntry').mockRejectedValue(new TradingRuntimeError('paired_entry_read_failed',409,'{"kind":"timeout","stage":"catalog"}'));
+    try{
+      for(let i=0;i<5;i++){clock+=70000;h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111',new Date(clock).toISOString());h.markets.set('OKX_FUTURE_BTC_USDT','99','100',new Date(clock).toISOString());await h.engine.tick();}
+      release(await facts());await reading;setRead(null);
+      expect(h.runtime.getStrategy(record.id)).toMatchObject({status:'PAUSED',management:{phase:'RISK_PAUSED',reason:'managed_entry_preparation_review'}});
+      expect(h.database.prepare('SELECT * FROM managed_risk_lock').all()).toEqual([]);
+    }finally{prepare.mockRestore();setRead(null);}
+  });
+  it('retains preparation retry timing across restart and clears it only after a complete preparation',async()=>{
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-11-11T00:00:00Z'));
+    const {h,record}=await managedDeferralHarness('MAKER_TAKER');
+    const prepare=vi.spyOn(h.runtime,'preparePairedEntry').mockRejectedValue(new TradingRuntimeError('paired_entry_read_failed',409,'{"stage":"catalog","kind":"timeout"}'));
+    try{
+      await h.engine.tick();const before=readManagedState(h.database,record.id)!.preparationRecovery!;
+      await h.engine.stop();h.engine=new StrategyEngine(h.database,h.session,h.runtime,h.markets,{requoteIntervalMs:10});
+      h.engine.setPositionManager(h.manager!);h.engine.activatePersistedStrategies('account-1');
+      await h.engine.tick();expect(prepare).toHaveBeenCalledTimes(1);expect(readManagedState(h.database,record.id)!.preparationRecovery).toEqual(before);
+      vi.setSystemTime(before.nextAt);h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111');h.markets.set('OKX_FUTURE_BTC_USDT','99','100');
+      await h.engine.tick();expect(prepare).toHaveBeenCalledTimes(2);
+      expect(readManagedState(h.database,record.id)!.preparationRecovery).toMatchObject({failures:2,nextAt:before.nextAt+8000});
+      prepare.mockResolvedValue(undefined);vi.setSystemTime(before.nextAt+8000);
+      h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111');h.markets.set('OKX_FUTURE_BTC_USDT','99','100');await h.engine.tick();
+      expect(readManagedState(h.database,record.id)!.preparationRecovery).toBeUndefined();expect(h.gateway.createdOrders).toHaveLength(1);
+    }finally{prepare.mockRestore();await h.manager!.stop();await h.engine.stop();vi.useRealTimers();}
+  });
+  it('isolates five catalog preparation timeouts to one task and retains six running siblings', async () => {
+    let clock = Date.now();
+    const { h, record } = await managedDeferralHarness('MAKER_TAKER', { now: () => clock });
+    for (let i = 1; i <= 6; i++) {
+      h.database.prepare(`INSERT INTO execution_strategies(id,kind,environment,status,config_json,credential_profile_id,created_at,updated_at)
+        SELECT ?,kind,environment,status,config_json,credential_profile_id,created_at,updated_at FROM execution_strategies WHERE id=?`).run('PAIR-SIBLING'+i, record.id);
+      h.database.prepare('INSERT INTO managed_positions SELECT ?,account_id,state_json,updated_at FROM managed_positions WHERE strategy_id=?').run('PAIR-SIBLING'+i, record.id);
+    }
+    const prepare = vi.spyOn(h.runtime, 'preparePairedEntry').mockRejectedValue(
+      new TradingRuntimeError('paired_entry_read_failed', 409, JSON.stringify({ stage: 'catalog', kind: 'timeout' })));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      clock += 70000;
+      h.markets.set('BINANCE_FUTURE_BTC_USDT','110','111',new Date(clock).toISOString());
+      h.markets.set('OKX_FUTURE_BTC_USDT','99','100',new Date(clock).toISOString());
+      await h.engine.tick();
+      expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+    }
+    expect(prepare).toHaveBeenCalledTimes(5); expect(h.gateway.createAttempts).toHaveLength(0);
+    expect(h.runtime.getStrategy(record.id)).toMatchObject({ status:'PAUSED', management:{ reason:'managed_entry_preparation_review' } });
+    expect(h.database.prepare("SELECT count(*) n FROM execution_strategies WHERE status='RUNNING'").get()).toEqual({ n:6 });
+    expect(h.session.liveTradingEnabled).toBe(true);
+    prepare.mockRestore();
+  });
   it('retains the five-failure hard pause while identifying entry preparation failures', async () => {
     let clock = Date.now();
     const { h, record } = await managedDeferralHarness('MAKER_TAKER', { now: () => clock });
@@ -892,7 +1020,7 @@ describe('pre-submit account recheck deferral', () => {
     expect(h.engine.listActiveStrategyIds()).toEqual([record.id]);
     await h.engine.tick(); expect(h.gateway.createdOrders).toHaveLength(1);
   });
-  it('continues only the remaining target after partial entry recovery and rejects a duplicate resume', async () => {
+  it.each([false,true])('continues only the remaining target after partial entry recovery (verified=%s) and rejects a duplicate resume', async verified => {
     const { h, record } = await managedDeferralHarness('MAKER_TAKER');
     seedFilledStrategyOrder(h.database, record.id, 'history-left', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.1', 'left');
     seedFilledStrategyOrder(h.database, record.id, 'history-right', 'OKX_FUTURE_BTC_USDT', 'BUY', '0.1', 'right');
@@ -900,6 +1028,7 @@ describe('pre-submit account recheck deferral', () => {
     h.database.prepare("UPDATE execution_strategies SET filled_quantity='0.1',filled_left='0.1',filled_right='0.1',progress=50 WHERE id=?").run(record.id);
     h.gateway.positions = [futuresPosition('BINANCE_FUTURE_BTC_USDT', 'SHORT', '0.1'), futuresPosition('OKX_FUTURE_BTC_USDT', 'LONG', '0.1')];
     h.manager!.failAll('Maker cancellation confirmation expired'); await h.engine.pauseForManagedRisk(); h.session.set('live');
+    if (verified) h.database.prepare("UPDATE managed_positions SET state_json=json_set(state_json,'$.verified',json('true'),'$.maxLeft','0.1','$.maxRight','0.1') WHERE strategy_id=?").run(record.id);
     const resumed = await h.engine.resumeStrategy(record.id, 'account-1', 'OPENING');
     expect(resumed).toMatchObject({ filledQuantity: '0.1', management: { phase: 'OPENING', exitRequested: false } });
     await expect(h.engine.resumeStrategy(record.id, 'account-1', 'OPENING')).rejects.toMatchObject({ code: 'strategy_not_paused' });

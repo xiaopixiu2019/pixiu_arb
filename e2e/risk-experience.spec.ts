@@ -106,6 +106,7 @@ test('fresh stream observations stay valid between clock ticks and expire withou
 test('a newer account observation replaces the previous expiry without extending its own deadline', async ({ page }) => {
   await setup(page); const at=await pauseRiskClock(page); let stream!: WebSocketRoute, latest=current({sampledAt:at});
   await page.routeWebSocket('**/ws/stream', ws=>{stream=ws;});
+  await page.route('**/api/risk/margin/clock',r=>r.fulfill({json:{accountId:latest.accountId,serverAt:latest.sampledAt!+latest.ageMs!}}));
   await page.route('**/api/risk/margin', r=>r.fulfill({json:latest}));
   await page.route('**/api/risk/margin/events*', r=>r.fulfill({json:{accountId:latest.accountId,events:[],hasMore:false}}));
   await open(page); await page.clock.runFor(100);

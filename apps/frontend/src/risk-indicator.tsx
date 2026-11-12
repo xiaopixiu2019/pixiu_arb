@@ -7,7 +7,7 @@ import { useRiskClock } from './use-risk-clock.js';
 export function RiskIndicator({ snapshot, onOpen }: { snapshot: MarginSnapshot | null; onOpen: () => void }) {
   const { language } = useLanguage();
   useRiskClock(snapshot);
-  const fresh = riskFresh(snapshot, Date.now());
+  const fresh = riskFresh(snapshot);
   const value = fresh && snapshot?.metrics?.initialPct != null ? `${Number(snapshot.metrics.initialPct).toFixed(2)}%` : '—';
   const execution = riskExecutionStatus(snapshot, fresh);
   const blocked = execution.state === 'paused' || execution.state === 'locked';

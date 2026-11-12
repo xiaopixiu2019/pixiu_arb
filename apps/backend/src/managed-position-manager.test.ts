@@ -16,7 +16,9 @@ import { RequestNotDispatchedError } from './authenticated-scheduler.js';
 import type { LiveMarket } from './market-hub.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { MarginRiskStore } from './margin-risk-store.js';
+import { createMarginRiskService } from './margin-risk-service.js';
 import { ownedQuoteSymbols } from './owned-market-demand.js';
+import { consumeRouterOutcome, routerRetry, ROUTER_REVIEW, ROUTER_WAIT } from './router-entry-retry.js';
 import { knownMarginOrder, knownMarginPosition } from './managed-margin-batch.js';
 
 const directories: string[] = [];
@@ -106,6 +108,262 @@ async function harness(asset = 'BTC', leftVenue = 'BINANCE', book?: { bid: strin
 }
 
 describe('generic adopted position groups and explicit stop intent', () => {
+  async function routerHarness() {
+    const h = await harness(), id = await h.task('PAIR-ROUTER', false, 'MAKER_TAKER');
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='0',filled_left='0',filled_right='0',progress=0 WHERE id=?").run(id);
+    const input={ symbol:h.legs[0].symbol,side:'BUY',type:'LIMIT',timeInForce:'POC',quantity:'10',price:'100' };
+    const metadata={strategyId:id,strategyLeg:'left' as const,feePhase:'entry' as const};
+    const reject = async () => {
+      const order=await h.runtime.createOrder(input, metadata);
+      const reason=JSON.stringify({label:'NOT_BEST_ACCOUNT_ROUTER'});
+      const payload={order_id:order.remoteOrderId!,state:'FAIL',executed_qty:'0',reason,update_time:String(Date.now())};
+      h.remote.set(order.remoteOrderId!,{...h.remote.get(order.remoteOrderId!)!,...payload});
+      h.runtime.ingestPrivateEvent({channel:'order',payload});
+      consumeRouterOutcome(h.db,h.runtime.getStrategy(id),h.runtime.getOrder(order.id));
+      return {order,payload};
+    };
+    const threshold = async () => { for(let i=0;i<5;i++){ await reject(); if(i<4) vi.setSystemTime(Date.now()+[4000,8000,16000,32000][i]); } };
+    return {...h,id,input,metadata,reject,threshold};
+  }
+  it('persists deduplicated router backoff, blocks dispatch, and requires explicit local resume after five failures',async()=>{
+    const h=await routerHarness(); const first=await h.reject();
+    h.runtime.ingestPrivateEvent({channel:'order',payload:first.payload});
+    consumeRouterOutcome(h.db,h.runtime.getStrategy(h.id),h.runtime.getOrder(first.order.id));
+    expect(routerRetry(h.db,h.id)).toMatchObject({failures:1,next_at:Date.now()+4000});
+    const other=new Database(h.db.name); expect(other.prepare('SELECT failures FROM router_entry_retry').get()).toEqual({failures:1});other.close();
+    await expect(h.runtime.createOrder(h.input,h.metadata)).rejects.toMatchObject({code:ROUTER_WAIT});
+    vi.setSystemTime(Date.now()+4000);
+    for(let i=1;i<5;i++){ await h.reject(); if(i<4) vi.setSystemTime(Date.now()+[4000,8000,16000,32000][i]); }
+    await expect(h.runtime.createOrder(h.input,h.metadata)).rejects.toMatchObject({code:ROUTER_REVIEW});
+    await h.manager.reviewRouterTask(h.id);
+    expect(h.runtime.getStrategy(h.id)).toMatchObject({status:'PAUSED',management:{reason:ROUTER_REVIEW}});
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');expect(h.created).toHaveLength(5);
+    await h.manager.resume(h.id,'account-1','OPENING');
+    expect(routerRetry(h.db,h.id)?.failures).toBe(0); expect(h.runtime.getStrategy(h.id).status).toBe('RUNNING');
+    consumeRouterOutcome(h.db,h.runtime.getStrategy(h.id),h.runtime.getOrder(first.order.id));
+    expect(routerRetry(h.db,h.id)?.failures).toBe(0);
+  });
+  it.each(['position','claim','order','readonly'] as const)('refuses a local router pause when %s changes during verification',async change=>{
+    const h=await routerHarness(); await h.threshold();
+    let complete!:(facts:ManagedAccountFacts)=>void;h.setRead(()=>new Promise(r=>{complete=r;}));
+    const pending=h.manager.reviewRouterTask(h.id); const rejected=expect(pending).rejects.toBeInstanceOf(Error);
+    if(change==='position') {h.quantities('1','0');h.manager.notifyPosition({symbol:h.legs[0].symbol,position_qty:'1',update_time:String(Date.now())});}
+    if(change==='claim') h.db.prepare('DELETE FROM managed_position_claims WHERE symbol=?').run(h.legs[0].symbol);
+    if(change==='order') h.remote.set('external',{order_id:'external',symbol:h.legs[0].symbol,state:'OPEN',executed_qty:'0'} as GateCrossExOrder);
+    if(change==='readonly') h.session.set('readonly');
+    complete(h.facts()); await rejected;
+    expect(h.created).toHaveLength(5);
+    if(change==='readonly') expect(h.session.current).toBe('readonly'); else expect(managedRiskReason(h.db)).not.toBeNull();
+  });
+  it('does not clear an unrelated hard lock when manually resuming a router-paused task',async()=>{
+    const h=await routerHarness();await h.threshold();await h.manager.reviewRouterTask(h.id);
+    h.manager.failAll('other_risk'); h.session.set('live');
+    await expect(h.manager.resume(h.id,'account-1')).rejects.toBeInstanceOf(Error);
+    expect(managedRiskReason(h.db)).toBe('other_risk');
+  });
+  it('keeps an enrolled zero-position router pause under observation and detects later unexplained exposure',async()=>{
+    const h=await routerHarness(); const m=await continuous(h,h.id,false);
+    // Opening tasks enroll atomically at launch, rather than through the old-holdings configuration API.
+    h.manager.protection.authority.configure(m.monitor.snapshot().accountId!,[h.id],0,true);
+    await h.threshold();await h.manager.reviewRouterTask(h.id);
+    await protectTicks(h);
+    expect(h.runtime.getStrategy(h.id)).toMatchObject({status:'PAUSED',management:{reason:ROUTER_REVIEW}});
+    expect(hasManagedClaims(h.db)).toBe(true);expect(managedRiskReason(h.db)).toBeNull();
+    h.quantities('1','0');await protectTicks(h);
+    expect(managedRiskReason(h.db)).not.toBeNull();expect(h.created).toHaveLength(5);
+    await m.monitor.stop();
+  });
+  it('only resets the router streak on a proven later working lifecycle and ignores old successes',async()=>{
+    const h=await routerHarness();await h.reject();vi.setSystemTime(Date.now()+4000);
+    const order=await h.runtime.createOrder(h.input,h.metadata);
+    h.ack(2,'OPEN','0'); expect(routerRetry(h.db,h.id)?.failures).toBe(1);
+    const oldTime=String(Date.now());vi.setSystemTime(Date.now()+2000);
+    h.runtime.ingestPrivateEvent({channel:'order',payload:{order_id:order.remoteOrderId,state:'OPEN',executed_qty:'0',update_time:oldTime}});
+    expect(routerRetry(h.db,h.id)?.failures).toBe(1);
+    h.ack(2,'OPEN','0');expect(routerRetry(h.db,h.id)?.failures).toBe(0);
+    h.ack(2,'CANCELLED','0');vi.setSystemTime(Date.now()+1);await h.reject();
+    h.runtime.ingestPrivateEvent({channel:'order',payload:{order_id:order.remoteOrderId,state:'CANCELLED',executed_qty:'0'}});
+    expect(routerRetry(h.db,h.id)?.failures).toBe(1);
+  });
+  it('rechecks the durable retry gate after an asynchronous order preparation',async()=>{
+    const h=await routerHarness();let release!:()=>void;
+    h.setSubmitWait(()=>new Promise<void>(r=>{release=r;}));
+    const pending=h.runtime.createOrder(h.input,h.metadata);const rejected=expect(pending).rejects.toMatchObject({code:ROUTER_REVIEW});
+    for(let i=0;i<40&&!release;i++) await Promise.resolve();
+    h.db.prepare('INSERT INTO router_entry_retry VALUES (?,?,?,?,?,?)').run(h.id,'changed',5,Date.now(),1,0);
+    release();await rejected;expect(h.created).toHaveLength(0);
+    expect(h.runtime.listOrders()[0]).toMatchObject({state:'FAIL',failureReason:'ORDER_NOT_DISPATCHED'});
+  });
+  it.each(['missing_quantity','unknown_reason','partial','wrong_claim'] as const)('keeps %s router evidence on the conservative account path',async change=>{
+    const h=await routerHarness();const order=await h.runtime.createOrder(h.input,h.metadata);
+    let complete!:(facts:ManagedAccountFacts)=>void;h.setRead(()=>new Promise(r=>{complete=r;}));const pending=h.manager.tick();
+    if(change==='wrong_claim') h.db.prepare('UPDATE managed_position_claims SET account_id=? WHERE strategy_id=?').run('other',h.id);
+    h.runtime.ingestPrivateEvent({channel:'order',payload:{order_id:order.remoteOrderId,state:'FAIL',
+      ...(change==='missing_quantity'?{}:{executed_qty:change==='partial'?'1':'0'}),
+      reason:JSON.stringify({label:change==='unknown_reason'?'OTHER':'NOT_BEST_ACCOUNT_ROUTER'})}});
+    expect(managedRiskReason(h.db)).not.toBeNull(); complete(h.facts()); await pending;
+  });
+  it('isolates a proven zero-fill router rejection without invalidating an account read', async () => {
+    const h = await harness(), id = await h.task('PAIR-ROUTER', false, 'MAKER_TAKER');
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='0',filled_left='0',filled_right='0',progress=0 WHERE id=?").run(id);
+    await h.manager.tick();
+    const order = await h.runtime.createOrder({ symbol:h.legs[0].symbol,side:'BUY',type:'LIMIT',timeInForce:'POC',quantity:'10',price:'100' },
+      { strategyId:id,strategyLeg:'left',feePhase:'entry' });
+    let complete!: (facts:ManagedAccountFacts)=>void;
+    const published = vi.fn(); h.manager.setMarginFacts(published);
+    h.setRead(()=>new Promise(resolve=>{complete=resolve;})); const pending=h.manager.tick();
+    const reason=JSON.stringify({label:'NOT_BEST_ACCOUNT_ROUTER'});
+    h.remote.set('remote-1',{...h.remote.get('remote-1')!,state:'FAIL',executed_qty:'0',reason});
+    h.runtime.ingestPrivateEvent({channel:'order',payload:{order_id:order.remoteOrderId,state:'FAIL',executed_qty:'0',reason,update_time:String(Date.now())}});
+    complete(h.facts()); await pending;
+    expect(managedRiskReason(h.db)).toBeNull(); expect(published).toHaveBeenCalledTimes(1);
+    h.setRead(null); vi.setSystemTime(Date.now()+26000); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+  });
+  it('recovers a one-millisecond account regression only after two advancing versions and matching holdings', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    h.missingFunding(true); // Keep the fixture's independent two-second economic exit out of this read-recovery test.
+    const acceptedAt = Date.now(); let remoteTime = acceptedAt;
+    h.gateway.queryAccount = async () => ({ user_id: 'synthetic', available_margin: '1000', margin_balance: '1000',
+      initial_margin: '10', maintenance_margin: '1', initial_margin_rate: '100', maintenance_margin_rate: '1000',
+      account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', position_mode: 'SINGLE', assets: [], update_time: String(remoteTime) });
+    h.gateway.queryManagedState = async () => h.facts();
+    const monitor = createMarginRiskService({ db:h.db, gateway:h.gateway, runtime:h.runtime, manager:h.manager,
+      engine:{ haltForMarginRisk:vi.fn() } as unknown as import('./strategy-engine.js').StrategyEngine,
+      enforce:false, context:()=> 'account-1', profile:()=>({id:'account-1',label:'Synthetic'}),
+      live:()=>h.session.liveTradingEnabled, credentials:async()=>({apiKey:'fake',apiSecret:'fake'}),
+      markets:{market:()=>null} });
+    try {
+      await monitor.refresh(); expect(monitor.snapshot().fresh).toBe(true);
+      vi.setSystemTime(acceptedAt+2000); remoteTime=acceptedAt-1; await monitor.refresh();
+      expect(monitor.snapshot()).toMatchObject({fresh:false,reason:'margin_account_version_regressed'});
+      expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+      expect(h.runtime.getStrategy(id)).toMatchObject({status:'RUNNING',management:{phase:'MONITORING'}});
+      expect(h.session.current).toBe('live'); expect(h.created).toHaveLength(0);
+      h.missingFunding(true);vi.setSystemTime(Date.now()+2000);
+      remoteTime=Date.now(); await monitor.refresh();
+      expect(monitor.snapshot().fresh).toBe(true);
+      await h.manager.tick();expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+      vi.setSystemTime(Date.now()+1000);await monitor.refresh();await h.manager.tick();
+      expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+      vi.setSystemTime(Date.now()+1000);remoteTime=Date.now();await monitor.refresh();await h.manager.tick();
+      expect(managedRiskReason(h.db)).toBeNull();
+      expect(h.runtime.getStrategy(id).status).toBe('RUNNING'); expect(h.created).toHaveLength(0);
+    } finally { await monitor.stop(); }
+  });
+  async function versionService(h: Awaited<ReturnType<typeof harness>>) {
+    const account={user_id:'synthetic',available_margin:'1000',margin_balance:'1000',initial_margin:'10',maintenance_margin:'1',
+      initial_margin_rate:'100',maintenance_margin_rate:'1000',account_mode:'CROSS_EXCHANGE',exchange_type:'CROSSEX',position_mode:'SINGLE',assets:[],update_time:String(Date.now())};
+    h.gateway.queryAccount=async()=>({...account});h.gateway.queryManagedState=async()=>h.facts();
+    const monitor=createMarginRiskService({db:h.db,gateway:h.gateway,runtime:h.runtime,manager:h.manager,
+      engine:{haltForMarginRisk:vi.fn()} as unknown as import('./strategy-engine.js').StrategyEngine,enforce:false,
+      context:()=> 'account-1',profile:()=>({id:'account-1',label:'Synthetic'}),live:()=>h.session.liveTradingEnabled,
+      credentials:async()=>({apiKey:'fake',apiSecret:'fake'}),markets:{market:()=>null}});
+    await monitor.refresh();return {account,monitor};
+  }
+  it.each(['repeat','same','hard_lock','identity','position'] as const)('version recovery stays fail-closed for %s',async scenario=>{
+    const h=await harness(),id=await h.task();h.missingFunding(true);await h.manager.tick();
+    const {account,monitor}=await versionService(h),start=Date.now();
+    try {
+      vi.setSystemTime(start+1000);account.update_time=String(start-1);await monitor.refresh();
+      const lock=h.db.prepare('SELECT created_at FROM managed_risk_lock').get() as {created_at:string};
+      if(scenario==='repeat'||scenario==='same'){
+        for(const elapsed of [4000,8000,16000,24000]){
+          vi.setSystemTime(start+elapsed);account.update_time=String(scenario==='repeat'?start-1:start+2000);
+          await monitor.refresh();await h.manager.tick();expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+          expect(h.db.prepare('SELECT created_at FROM managed_risk_lock').get()).toEqual(lock);
+        }
+        vi.setSystemTime(start+26001);await h.manager.tick();
+        expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+      }else{
+        if(scenario==='hard_lock') h.manager.failAll('synthetic_risk');
+        if(scenario==='identity') account.user_id='different';
+        if(scenario==='position') h.quantities('99','100');
+        for(const elapsed of [4000,6000]){vi.setSystemTime(start+elapsed);account.update_time=String(Date.now());await monitor.refresh();await h.manager.tick();}
+        expect(managedRiskReason(h.db)).toBe(scenario==='hard_lock'?'synthetic_risk':scenario==='identity'?'margin_account_identity_changed':'managed_external_reduction');
+      }
+      expect(h.runtime.getStrategy(id).status).toBe('PAUSED');expect(h.created).toHaveLength(0);
+    }finally{await monitor.stop();}
+  });
+  it('keeps durable router retry state while recovering a margin version regression',async()=>{
+    const h=await routerHarness();h.missingFunding(true);await h.reject();
+    const retry=routerRetry(h.db,h.id),{account,monitor}=await versionService(h),start=Date.now();
+    try{
+      vi.setSystemTime(start+1000);account.update_time=String(start-1);await monitor.refresh();
+      expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+      for(const elapsed of [4000,6000]){vi.setSystemTime(start+elapsed);account.update_time=String(Date.now());await monitor.refresh();await h.manager.tick();}
+      expect(managedRiskReason(h.db)).toBeNull();expect(routerRetry(h.db,h.id)).toEqual(retry);expect(h.created).toHaveLength(1);
+    }finally{await monitor.stop();}
+  });
+  it('detects a position conflict while waiting for a second remote version',async()=>{
+    const h=await harness();await h.task();h.missingFunding(true);await h.manager.tick();
+    const {account,monitor}=await versionService(h),start=Date.now();
+    try{
+      vi.setSystemTime(start+1000);account.update_time=String(start-1);await monitor.refresh();
+      vi.setSystemTime(start+4000);account.update_time=String(Date.now());await monitor.refresh();await h.manager.tick();
+      expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+      vi.setSystemTime(start+5000);await monitor.refresh();h.quantities('99','100');await h.manager.tick();
+      expect(managedRiskReason(h.db)).toBe('managed_external_reduction');expect(h.created).toHaveLength(0);
+    }finally{await monitor.stop();}
+  });
+  it('preserves the version floor and original deadline across manager and monitor reconstruction',async()=>{
+    const h=await harness(),id=await h.task();h.missingFunding(true);await h.manager.tick();
+    const first=await versionService(h),start=Date.now();
+    vi.setSystemTime(start+1000);first.account.update_time=String(start-1);await first.monitor.refresh();
+    const before=h.db.prepare('SELECT * FROM managed_risk_lock').get();
+    const floor=readManagedState(h.db,id)!.marginVersionFloor;
+    await first.monitor.stop();await h.manager.stop();
+    h.manager=new ManagedPositionManager(h.db,h.session,h.runtime,{market:()=>null},h.sources);managers.push(h.manager);
+    const second=await versionService(h);
+    try{
+      expect(readManagedState(h.db,id)?.marginVersionFloor).toEqual(floor);
+      expect(h.db.prepare('SELECT * FROM managed_risk_lock').get()).toEqual(before);
+      second.account.update_time=String(start-1);await second.monitor.refresh();
+      expect(second.monitor.snapshot().reason).toBe('margin_account_version_regressed');
+      vi.setSystemTime(start+26001);await h.manager.tick();
+      expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    }finally{await second.monitor.stop();}
+  });
+  it.each([true, false])('incident replay: private terminal proof before cancel error=%s', async earlyPush => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    const sibling = 'PAIR-AUDIT-SIBLING', otherLegs = managedLegs({ ...h.config, asset: 'ETH' });
+    h.db.prepare(`INSERT INTO execution_strategies (id,kind,environment,status,config_json,progress,filled_quantity,
+      filled_left,filled_right,open_position,credential_profile_id,created_at,updated_at)
+      SELECT ?,kind,environment,status,?,progress,filled_quantity,filled_left,filled_right,open_position,
+      credential_profile_id,created_at,updated_at FROM execution_strategies WHERE id=?`)
+      .run(sibling, JSON.stringify({ ...h.config, asset: 'ETH' }), id);
+    h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run(sibling, 'account-1',
+      JSON.stringify({ ...readManagedState(h.db, id), groupId: sibling }), new Date().toISOString());
+    for (const leg of otherLegs) h.db.prepare('INSERT INTO managed_position_claims VALUES (?,?,?)').run('account-1', leg.symbol, sibling);
+    h.setRead(async () => ({ ...h.facts(), positions: [...h.facts().positions, ...otherLegs.map(leg => ({
+      symbol: leg.symbol, position_side: leg.side === 'BUY' ? 'LONG' : 'SHORT', position_qty: '100',
+    } as GateCrossExPosition))] }));
+    h.manager.requestExit(id); await h.manager.tick(); expect(h.created).toHaveLength(1);
+    const maker = h.runtime.listOpenOrders(id)[0];
+    h.gateway.cancelOrder = async (_credentials, remoteId) => {
+      h.cancelled.push(remoteId);
+      h.remote.set(remoteId, { ...h.remote.get(remoteId)!, state: 'FILLED', executed_qty: '10' });
+      if (earlyPush) h.ack(1, 'FILLED', '10');
+      throw new GateApiError(404, 'TRADE_ORDER_NOT_FOUND_ERROR');
+    };
+    vi.setSystemTime(Date.now() + 6000); await h.manager.tick();
+    expect(h.cancelled).toEqual([maker.remoteOrderId]);
+    expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.runtime.getStrategy(sibling).status).toBe('RUNNING');
+    expect(h.runtime.getOrder(maker.id)).toMatchObject({ state: 'FILLED', executedQuantity: '10' });
+    h.quantities('90', '100');
+    for (let i = 0; i < 5 && h.created.length < 2; i++) await h.manager.tick();
+    expect(h.created.filter(o => o.type === 'MARKET')).toEqual([
+      expect.objectContaining({ symbol: h.legs[1].symbol, qty: '10', reduce_only: 'true' }),
+    ]);
+    h.ack(1, 'FILLED', '10'); // duplicate maker notification cannot create a second hedge
+    h.ack(2, 'FILLED', '10'); h.quantities('90', '90');
+    await h.manager.tick(); await h.manager.tick();
+    expect(h.created.filter(o => o.type === 'MARKET')).toHaveLength(1);
+    expect(h.cancelled).toHaveLength(1);
+    expect(h.runtime.getStrategy(sibling).status).toBe('RUNNING');
+  });
+
   async function continuous(h: Awaited<ReturnType<typeof harness>>, id: string, enroll = true) {
     let balance = '240';
     const store = new MarginRiskStore(h.db);
@@ -227,6 +485,57 @@ describe('generic adopted position groups and explicit stop intent', () => {
       expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
       expect(managedRiskReason(h.db)).toBe('synthetic review');
     } finally { spy.mockRestore(); worker.close(); }
+  });
+  it('retries an unrelated SQLite writer conflict without creating an account hard pause', async () => {
+    const h=await harness(),id=await h.task();await h.manager.tick();
+    const worker=new Database(h.db.name);h.db.pragma('busy_timeout = 0');
+    const read=h.facts();h.setRead(async()=>{worker.exec('BEGIN IMMEDIATE');return read;});
+    try {
+      await h.manager.tick();
+      expect(h.runtime.getStrategy(id).status).toBe('RUNNING');expect(managedRiskReason(h.db)).toBeNull();
+      worker.exec('ROLLBACK');h.setRead(async()=>h.facts());await h.manager.tick();
+      expect(h.runtime.getStrategy(id)).toMatchObject({status:'RUNNING',management:{phase:'MONITORING'}});
+      expect(managedRiskReason(h.db)).toBeNull();
+    } finally {
+      if(worker.inTransaction)worker.exec('ROLLBACK');worker.close();
+    }
+  });
+  it('never treats SQLite busy as retryable after a remote write attempt', async () => {
+    const h=await harness(),manager=h.manager as unknown as {
+      remoteWriteSequence:number;deferDatabaseBusy(error:unknown,sequence?:number):boolean };
+    const error=Object.assign(new Error('database is locked'),{code:'SQLITE_BUSY'}),before=manager.remoteWriteSequence;
+    expect(manager.deferDatabaseBusy(error,before)).toBe(true);
+    manager.remoteWriteSequence+=1;
+    expect(manager.deferDatabaseBusy(error,before)).toBe(false);
+  });
+  it('pauses in memory immediately and persists a hard pause after the SQLite writer releases', async () => {
+    const h=await harness(),id=await h.task();await h.manager.tick();
+    const ordinaryConfig={...h.config,management:undefined};
+    h.db.prepare(`INSERT INTO execution_strategies (id,kind,environment,status,config_json,progress,
+      filled_quantity,filled_left,filled_right,open_position,credential_profile_id,created_at,updated_at)
+      VALUES ('PAIR-ORDINARY','position','live','RUNNING',?,0,'0','0','0','0',?,?,?)`)
+      .run(JSON.stringify(ordinaryConfig),'account-1',new Date().toISOString(),new Date().toISOString());
+    const worker=new Database(h.db.name);h.db.pragma('busy_timeout = 0');worker.exec('BEGIN IMMEDIATE');
+    try{
+      h.manager.failAll('remote_write_unknown');
+      expect(h.session.current).not.toBe('live');expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+      worker.exec('ROLLBACK');await vi.advanceTimersByTimeAsync(300);
+      expect(managedRiskReason(h.db)).toBe('remote_write_unknown');
+      expect(h.runtime.getStrategy(id)).toMatchObject({status:'PAUSED',management:{phase:'RISK_PAUSED',reason:'remote_write_unknown'}});
+      expect(h.runtime.getStrategy('PAIR-ORDINARY').status).toBe('PAUSED');
+    }finally{if(worker.inTransaction)worker.exec('ROLLBACK');worker.close();}
+  });
+  it('does not let shutdown discard a hard pause waiting on the SQLite writer', async () => {
+    const h=await harness(),id=await h.task();await h.manager.tick();
+    const worker=new Database(h.db.name);h.db.pragma('busy_timeout = 0');worker.exec('BEGIN IMMEDIATE');
+    try{
+      h.manager.failAll('shutdown_lock_race');
+      let stopped=false;const stopping=h.manager.stop().then(()=>{stopped=true;});
+      await vi.advanceTimersByTimeAsync(249);expect(stopped).toBe(false);
+      worker.exec('ROLLBACK');await vi.advanceTimersByTimeAsync(1);await stopping;
+      expect(managedRiskReason(h.db)).toBe('shutdown_lock_race');
+      expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    }finally{if(worker.inTransaction)worker.exec('ROLLBACK');worker.close();}
   });
   it('retains only still-fresh completed protection evidence during a routine read and invalidates it on failure',async()=>{
     const h=await harness(),id=await h.task();await h.manager.tick();await continuous(h,id);
@@ -646,7 +955,10 @@ describe('generic adopted position groups and explicit stop intent', () => {
     await h.runtime.createOrder({ symbol: h.legs[0].symbol, side: 'BUY', type: 'LIMIT', timeInForce: 'POC', quantity: '10', price: '100' },
       { strategyId: id, strategyLeg: 'left', feePhase: 'entry' }); h.ack(1, 'CANCELLED', '0');
     h.manager.failAll('managed_recovery_unresolved_orders'); h.session.set('live');
+    h.db.prepare("UPDATE managed_positions SET state_json=json_set(state_json,'$.marginReadPending',json('true'),'$.marginVersionFloor',json(?)) WHERE strategy_id=?")
+      .run(JSON.stringify({accountId:'synthetic',units:{CROSSEX:'123'}}),id);
     const resumed = await h.manager.resume(id, 'account-1');
+    expect(readManagedState(h.db,id)?.marginVersionFloor).toBeUndefined();expect(readManagedState(h.db,id)?.marginReadPending).toBe(false);
     expect(resumed).toMatchObject({ id, status: 'RUNNING', management: { phase: 'OPENING', exitRequested: false, verified: false } });
     expect(hasManagedClaims(h.db)).toBe(true); expect(h.created).toHaveLength(1); expect(managedRiskReason(h.db)).toBeNull();
   });

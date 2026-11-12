@@ -1,5 +1,8 @@
 import type Database from 'better-sqlite3';
 import { ContinuousProtection } from './continuous-protection.js';
+import { preparationIdentity, PREPARATION_REVIEW } from './entry-preparation-recovery.js';
+import { mergeMarginVersions, snapshotVersions, versionsAdvance, type MarginVersionEvidence } from './margin-version.js';
+import { isolatedRouterRejection, ROUTER_REVIEW, routerRetry, resetRouterRetry, provenRouterHistory, routerOwner } from './router-entry-retry.js';
 import { confirmedExitQuantity, ordinaryManagedOrder, ownsManagedExecution, projectedExitHoldings } from './managed-execution-proof.js';
 import { randomUUID } from 'node:crypto';
 import { Decimal } from 'decimal.js';
@@ -11,13 +14,14 @@ import { TradingRuntimeError, isTerminalOrderState, type TradingRuntime, type Cr
 import { managedHardRiskReason, managedRiskBlock, managedRiskReason,
   MANAGED_ACCOUNT_RECHECKING, MANAGED_RECOVERY_WINDOW_MS, readManagedState, writeManagedState, type ManagedState } from './managed-position-store.js';
 import { managedExitSignal, freshManagedQuote, pairedQuantities, reductionPlan, type ManagedLeg } from './managed-position-model.js';
-import { nativeMarketAsset } from './market-asset-aliases.js';
+import { managedLegs } from './managed-legs.js';
+export { managedLegs } from './managed-legs.js';
 import { quoteUnavailableReason } from './quote-recovery.js';
 import { managedOrderSizeIssue, managedConstraintsValid, isManagedQuantityIssue, type ManagedSizeIssue } from './managed-position-validation.js';
 import { ManagedAdoption, entryHoldings } from './managed-position-adoption.js';
 import type { ProtectionLaunchAuthorization } from './protection-authority.js';
 import { ManagedReadFailure, recoveryHoldings, recoveryOrder, type ControlledCancellation } from './managed-account-recovery.js';
-import { managedResumeAction, verifyResumableEntry, type ManagedResumeAction } from './managed-position-resume.js';
+import { canContinueEntry, managedResumeAction, verifyResumableEntry, type ManagedResumeAction } from './managed-position-resume.js';
 import { ManagedEntryProgress } from './managed-entry-progress.js';
 import type { MarginRiskMonitor, MarginLaunchAuthorization } from './margin-risk-monitor.js';
 import { assertMarginHoldings, assertMarginSubmission, marginBatchFills, managedReductionTotals, managedActionPriority, observedHoldings, knownMarginOrder, knownMarginPosition } from './managed-margin-batch.js';
@@ -32,13 +36,10 @@ export interface ManagedSources {
   now?: () => number;
   context?: () => string;
 }
-export function managedLegs(config: CreateStrategyInput): [ManagedLeg, ManagedLeg] {
-  const symbol = (venue: string, asset: string) => `${venue}_FUTURE_${nativeMarketAsset(venue, 'FUTURE', asset)}_${venue === 'KRAKEN' ? 'USD' : ['DERIBIT', 'HYPERLIQUID'].includes(venue) ? 'USDC' : 'USDT'}`;
-  return [{ symbol: symbol(config.leftVenue, config.asset), side: config.leftSide },
-    { symbol: symbol(config.rightVenue, config.kind === 'premium' ? config.hedgeAsset ?? config.asset : config.asset), side: config.rightSide }];
-}
 const opposite = (side: 'BUY' | 'SELL'): 'BUY' | 'SELL' => side === 'BUY' ? 'SELL' : 'BUY';
 const ACCOUNT_READ_TIMEOUT_MS = 8_000;
+const isDatabaseBusy = (error: unknown): boolean => error !== null && typeof error === 'object' && 'code' in error
+  && ['SQLITE_BUSY','SQLITE_BUSY_SNAPSHOT','SQLITE_LOCKED'].includes(String(error.code));
 interface CapacityProtection {
   startedAt: number; context: string; identity: string; before: [string, string];
 }
@@ -87,6 +88,7 @@ export class ManagedPositionManager {
   private readonly orderEvents = new Map<string, string>();
   private readFailures = 0;
   private controlEpoch = 0;
+  private ordinaryTurnDue = false;
   private readonly readControllers = new Set<AbortController>();
   private abortReads(): void { for (const controller of this.readControllers) controller.abort(); }
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -97,7 +99,7 @@ export class ManagedPositionManager {
   private entryRecovery: { cancel(id: string): void; evidence(id: string, orderId: string): ControlledCancellation | null; recovered?(account: string | null): void } | null = null;
   setEntryRecoveryController(controller: NonNullable<ManagedPositionManager['entryRecovery']>): void { this.entryRecovery = controller; }
   private readContext(): string { return `${this.sources.context?.() ?? this.sources.activeAccount()}:${this.controlEpoch}`; }
-  private resetConfirmations(): void { this.recoverySignature = null; this.recoveryConfirmations = 0; this.marginRecoveryAt = null; }
+  private resetConfirmations(): void { this.recoverySignature = null; this.recoveryConfirmations = 0; this.marginRecoveryAt = null; this.marginRecoveryVersions = null; }
   private recoveryDeadline(): number | null {
     const row = this.db.prepare('SELECT reason,created_at FROM managed_risk_lock WHERE singleton=1').get() as { reason: string; created_at: string } | undefined;
     const deadlines = [row?.reason === MANAGED_ACCOUNT_RECHECKING ? Date.parse(row.created_at) + MANAGED_RECOVERY_WINDOW_MS : null,
@@ -120,15 +122,28 @@ export class ManagedPositionManager {
   private recoverySignature: string | null = null;
   private recoveryConfirmations = 0;
   private marginRecoveryAt: number | null = null;
+  private marginRecoveryVersions: MarginVersionEvidence | null = null;
   private readonly adoption: ManagedAdoption;
   private haltEntry: ((id: string) => Promise<void>) | null = null;
   private readonly openingMismatch = new Map<string, string>();
+  private remoteWriteSequence = 0;
+  private pendingHardPause: { reason: string; records: string[] } | null = null;
+  private hardPauseTimer: ReturnType<typeof setTimeout> | null = null;
   setEntryController(halt: (id: string) => Promise<void>): void { this.haltEntry = halt; }
-  holdForMarginRead(): void {
+  pendingMarginVersionFloor(): MarginVersionEvidence | null {
+    return this.active().reduce<MarginVersionEvidence | null>((floor,record)=>{
+      const marker=readManagedState(this.db,record.id)?.marginVersionFloor;
+      return marker ? mergeMarginVersions(floor,marker) : floor;
+    },null);
+  }
+  holdForMarginRead(reason = 'margin_read_unavailable'): void {
     if (managedHardRiskReason(this.db)) return;
+    this.resetConfirmations();
+    const versions = reason === 'margin_account_version_regressed' ? this.marginMonitor?.acceptedVersionEvidence() : null;
     for (const record of this.active()) {
       const state = readManagedState(this.db, record.id)!;
-      this.save(record.id, { ...state, marginReadPending: true });
+      this.save(record.id, { ...state, marginReadPending: true,
+        ...(versions ? {marginVersionFloor:mergeMarginVersions(state.marginVersionFloor ?? null,versions)} : {}) });
     }
     this.recheck('margin_read_unavailable', true);
   }
@@ -167,6 +182,7 @@ export class ManagedPositionManager {
         this.failAll('managed_order_unresolved'); return;
       }
       try { this.entryProgress.confirm(); } catch (error) { this.failAll(error instanceof Error ? error.message : 'managed_entry_progress_invalid'); return; }
+      if (order.strategyId && isolatedRouterRejection(this.db, this.runtime.getStrategy(order.strategyId), order, this.sources.activeAccount())) return;
       const signature = `${order.state}:${order.executedQuantity}`;
       if (!this.claimed(order.symbol) || this.orderEvents.get(order.id) === signature) return;
       this.orderEvents.set(order.id, signature);
@@ -209,6 +225,9 @@ export class ManagedPositionManager {
     this.timer = null; this.wakeTimer = null;
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     await this.inFlight; await this.recoveryOrders; await Promise.all(this.fastPairing.values());
+    if (this.hardPauseTimer) clearTimeout(this.hardPauseTimer);
+    this.hardPauseTimer = null;
+    await this.persistHardPauseBeforeStop();
   }
   async waitForIdle(): Promise<void> { await Promise.all([this.inFlight, ...this.fastPairing.values()]); }
   async validateForActivation(): Promise<void> {
@@ -351,12 +370,22 @@ export class ManagedPositionManager {
     this.wakeTimer = setTimeout(() => { this.wakeTimer = null; this.lastWake = this.now(); void this.tick(); }, Math.max(0, 100 - (this.now() - this.lastWake), this.nextReadAt - this.now()));
     this.wakeTimer.unref?.();
   }
+  private deferDatabaseBusy(error: unknown, remoteWriteSequence = this.remoteWriteSequence): boolean {
+    if (!isDatabaseBusy(error) || remoteWriteSequence !== this.remoteWriteSequence) return false;
+    // SQLite transactions are atomic. Retry locally after the unrelated writer releases its lock;
+    // a transient storage conflict does not invalidate exchange evidence or justify an account pause.
+    this.nextReadAt = Math.max(this.nextReadAt, this.now() + 250);
+    if (this.wakeTimer) { clearTimeout(this.wakeTimer); this.wakeTimer = null; }
+    this.scheduleTick(); return true;
+  }
   async tick(): Promise<void> {
     if (!this.stopped) this.checkCapacityDeadline();
-    if (!this.stopped && this.protection.needsTick()) {
+    const ordinaryTurn = this.ordinaryTurnDue && this.session.liveTradingEnabled && !managedRiskReason(this.db);
+    if (!this.stopped && !ordinaryTurn && this.protection.needsTick()) {
       if (this.inFlight) return this.inFlight;
       this.inFlight = this.protection.run().finally(() => {
         this.inFlight = null;
+        this.ordinaryTurnDue = this.session.liveTradingEnabled && !managedRiskReason(this.db) && this.active().length > 0;
         // Completing a read schedules work; only actual events invalidate account facts.
         if (!this.stopped && this.session.liveTradingEnabled && !managedRiskReason(this.db)) this.scheduleTick();
       });
@@ -366,11 +395,16 @@ export class ManagedPositionManager {
     try {
       this.entryProgress.confirm(); this.checkRecheckDeadline(); this.armRecoveryTimer();
       this.observeDuringRecovery(); this.maintainRecoveryOrders();
-    } catch (error) { this.failAll(error instanceof Error ? error.message : 'managed_monitor_failed'); return; }
+    } catch (error) {
+      if (this.deferDatabaseBusy(error)) return;
+      this.failAll(error instanceof Error ? error.message : 'managed_monitor_failed'); return;
+    }
     if (this.inFlight) return this.inFlight;
     if (managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING && this.now() < this.nextReadAt) return;
+    this.ordinaryTurnDue = false;
     const context = this.readContext();
     this.pendingWake = false;
+    const remoteWriteSequence = this.remoteWriteSequence;
     this.inFlight = this.run().catch((error: unknown) => {
       if (this.stopped || context !== this.readContext() || !this.session.liveTradingEnabled || managedHardRiskReason(this.db)) return;
       if (error instanceof TradingRuntimeError && error.code === 'managed_task_stopped') return;
@@ -378,7 +412,7 @@ export class ManagedPositionManager {
         if (error.fault.fatal) this.failAll(error.fault.code);
         else this.recheck(error.fault.code, true);
         this.logReadFault(error);
-      } else this.failAll(error instanceof TradingRuntimeError && error.label
+      } else if (!this.deferDatabaseBusy(error, remoteWriteSequence)) this.failAll(error instanceof TradingRuntimeError && error.label
         ? `${error.code}:${error.label}` : error instanceof Error ? error.message : 'managed_monitor_failed');
     }).finally(() => { this.inFlight = null; if (this.pendingWake && !this.stopped) this.wake(); });
     return this.inFlight;
@@ -513,12 +547,19 @@ export class ManagedPositionManager {
       .get() as { created_at: string } | undefined;
     if (!lock || this.now() - Date.parse(lock.created_at) >= MANAGED_RECOVERY_WINDOW_MS)
       throw new Error('managed_account_recovery_expired');
-    const records = this.active(); let waiting = false;
+    const records = this.active(); let waiting = false, versionReady = true;
     if (records.some(record => readManagedState(this.db, record.id)?.marginReadPending)) {
       const margin = this.marginMonitor?.snapshot();
       if (!margin?.fresh || margin.entryBlocked || margin.sampledAt == null) { this.resetConfirmations(); return false; }
-      if (margin.sampledAt === this.marginRecoveryAt) return false;
-      this.marginRecoveryAt = margin.sampledAt;
+      if (margin.sampledAt === this.marginRecoveryAt) versionReady = false;
+      const floor = this.pendingMarginVersionFloor();
+      if (floor) {
+        const current = snapshotVersions(margin);
+        if (!current || !versionsAdvance(floor,current,false)) { this.resetConfirmations(); return false; }
+        if (this.marginRecoveryVersions && !versionsAdvance(this.marginRecoveryVersions,current,true)) versionReady = false;
+        if (versionReady) this.marginRecoveryVersions = current;
+      }
+      if (versionReady) this.marginRecoveryAt = margin.sampledAt;
     }
     const symbols = new Set(records.flatMap((record) => managedLegs(record.config).map((leg) => leg.symbol)));
     for (const record of records) {
@@ -561,6 +602,10 @@ export class ManagedPositionManager {
         .map((position) => [position.symbol, position.position_side, new Decimal(position.position_qty).toString()]).sort(),
       orders: remoteOrders.map((order) => [order.order_id, order.text, order.state, order.executed_qty]).sort(),
     });
+    if (!versionReady) {
+      if (signature !== this.recoverySignature) this.resetConfirmations();
+      return false;
+    }
     this.recoveryConfirmations = signature === this.recoverySignature ? this.recoveryConfirmations + 1 : 1;
     this.recoverySignature = signature;
     if (this.recoveryConfirmations < 2) return false;
@@ -568,7 +613,7 @@ export class ManagedPositionManager {
       this.db.prepare('DELETE FROM managed_risk_lock WHERE reason = ?').run(MANAGED_ACCOUNT_RECHECKING);
       for (const record of records) {
         const state = readManagedState(this.db, record.id)!;
-        writeManagedState(this.db, record.id, { ...state, marginReadPending: false, reason: state.reason === MANAGED_ACCOUNT_RECHECKING ? null : state.reason });
+        writeManagedState(this.db, record.id, { ...state, marginReadPending: false, marginVersionFloor:undefined, reason: state.reason === MANAGED_ACCOUNT_RECHECKING ? null : state.reason });
       }
     })();
     this.readFailures = 0; this.resetConfirmations(); this.clearRecoveryTimer(); this.recoveryKey = null; this.nextReadAt = 0;
@@ -703,13 +748,14 @@ export class ManagedPositionManager {
     const state = readManagedState(this.db, id)!;
     if (state.stopIntent || state.phase !== 'OPENING') return;
     const caps = entryHoldings(this.db, id);
-    this.save(id, { ...state, phase: 'VERIFYING', openingQuantity: quantity, maxLeft: caps[0], maxRight: caps[1], after: this.now() });
+    this.save(id, { ...state, entryIntent: 'MONITORING', phase: 'VERIFYING', openingQuantity: quantity, maxLeft: caps[0], maxRight: caps[1], after: this.now() });
     this.log(id, 'Entry completed', 'Verifying actual positions before monitoring');
     this.wake();
   }
   requestExit(id: string): void {
     this.marginMonitor?.invalidateNormalRecovery();
     if (!this.session.liveTradingEnabled || managedRiskReason(this.db)) throw new TradingRuntimeError('managed_review_required', 409);
+    this.ordinaryTurnDue = true;
     const state = readManagedState(this.db, id)!;
     const record = this.runtime.getStrategy(id);
     // A partially opened task may be stopped before handoff; bound ownership by executed quantities.
@@ -792,12 +838,20 @@ export class ManagedPositionManager {
     this.save(record.id, { ...readManagedState(this.db, record.id)!, maxLeft: caps[0], maxRight: caps[1], after: this.now() });
   }
   async resume(id: string, accountId: string, expectedAction?: ManagedResumeAction): Promise<StrategyRecord> {
+    if (readManagedState(this.db, id)?.reason === ROUTER_REVIEW) {
+      if (expectedAction && expectedAction !== 'OPENING') throw new TradingRuntimeError('managed_resume_action_changed', 409);
+      await this.reviewRouterTask(id, true, accountId); return this.runtime.getStrategy(id);
+    }
     const riskAtStart = managedRiskReason(this.db);
     const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id)!;
+    const continuing = expectedAction === 'OPENING' && canContinueEntry(this.db, record, state);
+    const localReview = state.reason === PREPARATION_REVIEW;
+    if ((continuing || localReview) && riskAtStart) throw new TradingRuntimeError('managed_global_risk_paused', 409);
+    if (localReview && state.preparationRecovery?.scope !== preparationIdentity(this.db, record)) throw new TradingRuntimeError('managed_review_changed', 409);
     if (state.phase === 'TRANSFERRED') throw new TradingRuntimeError('managed_group_transferred', 409);
     const claims = this.db.prepare('SELECT symbol FROM managed_position_claims WHERE strategy_id = ? AND account_id = ?').all(id, accountId) as Array<{ symbol: string }>;
     if (claims.length !== 2 || !managedLegs(record.config).every((l) => claims.some((c) => c.symbol === l.symbol))) throw new TradingRuntimeError('managed_group_released', 409);
-    if (!['PAUSED', 'STOPPED'].includes(record.status)) throw new TradingRuntimeError('strategy_not_paused', 409);
+    if (!continuing && !['PAUSED', 'STOPPED'].includes(record.status)) throw new TradingRuntimeError('strategy_not_paused', 409);
     if (record.accountProfileId !== accountId) throw new TradingRuntimeError('strategy_account_not_active', 409);
     if (this.runtime.listOpenOrders().length) throw new TradingRuntimeError('strategy_resume_unresolved_orders', 409);
     const revision = this.revision;
@@ -829,18 +883,19 @@ export class ManagedPositionManager {
       throw new TradingRuntimeError('managed_positions_settlement_pending', 409);
     const latestRecord = this.runtime.getStrategy(id);
     if (JSON.stringify(latestRecord.config) !== JSON.stringify(record.config)) throw new TradingRuntimeError('managed_review_changed', 409);
-    if (!current.verified && !current.stopIntent && !current.exitRequested) verifyResumableEntry(this.db, latestRecord, current, quantities, legs);
-    const action = managedResumeAction(latestRecord, current), opening = action === 'OPENING';
+    const action = continuing ? 'OPENING' : managedResumeAction(latestRecord, current), opening = action === 'OPENING';
+    if (opening) verifyResumableEntry(this.db, latestRecord, current, quantities, legs);
     if (expectedAction && expectedAction !== action) throw new TradingRuntimeError('managed_resume_action_changed', 409);
-    const resumed: ManagedState = { ...current, phase: action,
+    const resumed: ManagedState = { ...current, phase: action, entryIntent: opening ? 'OPENING' : 'MONITORING', preparationRecovery: undefined,
+      marginReadPending: false, marginVersionFloor: undefined,
       stopIntent: null, stopFromOpening: false, pauseAfterProtection: false,
       protectionIncident: null, observedReductions: managedReductionTotals(this.db, id), leftQuantity: quantities[0], rightQuantity: quantities[1],
       positionSettlementSince: undefined,
       exitRequested: action === 'EXITING', verified: !opening, maxLeft: quantities[0], maxRight: quantities[1],
       pendingOrderId: null, makerOrderId: null, pendingOrderIds: [], cancelRequestedAt: null, conditionSince: null, reason: null };
     this.db.transaction(() => {
-      this.db.prepare('DELETE FROM managed_risk_lock').run();
-      this.db.prepare("UPDATE execution_strategies SET status = 'RUNNING', stopped_at = NULL WHERE id = ? AND status IN ('PAUSED', 'STOPPED')").run(id);
+      if (!continuing && !localReview) this.db.prepare('DELETE FROM managed_risk_lock').run();
+      this.db.prepare("UPDATE execution_strategies SET status = 'RUNNING', stopped_at = NULL WHERE id = ? AND status = ?").run(id, record.status);
       writeManagedState(this.db, id, resumed);
     })();
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
@@ -849,26 +904,129 @@ export class ManagedPositionManager {
     return this.runtime.getStrategy(id);
   }
 
+  private routerReviewIdentity(id: string): string {
+    const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id);
+    return JSON.stringify([this.readContext(), record.status, record.config, record.accountProfileId,
+      state?.phase, state?.stopIntent, state?.exitRequested, state?.reason, this.protection.authority.grant(),
+      this.db.prepare('SELECT * FROM managed_position_claims WHERE strategy_id=? ORDER BY symbol').all(id)]);
+  }
+  private assertRouterFlat(record: StrategyRecord, facts: ManagedAccountFacts): void {
+    const state = readManagedState(this.db, record.id), legs = managedLegs(record.config);
+    if (!state || state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident
+      || state.positionSettlementSince || state.pauseAfterProtection || this.adoption.reservedOwner(record.id)
+      || ![state.adoptedLeft, state.adoptedRight, record.filledLeft, record.filledRight, record.filledQuantity].every(v => v !== undefined && new Decimal(v).isZero())
+      || pairedQuantities(facts.positions, legs).some(q => !new Decimal(q).isZero())
+      || facts.openOrders.some(o => legs.some(l => l.symbol === o.symbol)) || this.runtime.listOpenOrders(record.id).length)
+      throw new Error('router_entry_review_unverified');
+    const orders = (this.db.prepare('SELECT id FROM execution_orders WHERE strategy_id=? ORDER BY rowid').all(record.id) as Array<{id:string}>).map(o => this.runtime.getOrder(o.id));
+    if (!orders.length || orders.some(o => !routerOwner(this.db, record, o) || !provenRouterHistory(this.db, o)))
+      throw new Error('router_entry_history_unverified');
+    if (this.db.prepare('SELECT 1 FROM execution_fills f JOIN execution_orders o ON o.id=f.order_id WHERE o.strategy_id=? LIMIT 1').get(record.id))
+      throw new Error('router_entry_fill_conflict');
+  }
+  async reviewRouterTask(id: string, resume = false, account = this.sources.activeAccount()): Promise<void> {
+    const record = this.runtime.getStrategy(id), retry = routerRetry(this.db, id);
+    if (!retry?.review || !this.session.liveTradingEnabled || managedRiskReason(this.db)
+      || account !== this.sources.activeAccount() || record.accountProfileId !== account)
+      throw new TradingRuntimeError('router_entry_review_unavailable', 409);
+    if (resume ? record.status !== 'PAUSED' || record.management?.reason !== ROUTER_REVIEW
+      : record.status !== 'RUNNING' || record.management?.phase !== 'OPENING') throw new TradingRuntimeError('managed_review_changed', 409);
+    const identity = this.routerReviewIdentity(id), revision = this.revision, context = this.readContext();
+    try {
+      const facts = await this.factsForAction();
+      if (!this.session.liveTradingEnabled || context !== this.readContext()) throw new TradingRuntimeError('managed_review_changed', 409);
+      if (identity !== this.routerReviewIdentity(id) || revision !== this.revision || managedRiskReason(this.db)) throw new Error('router_entry_review_changed');
+      this.assertRouterFlat(record, facts);
+      this.db.transaction(() => {
+        if (resume) resetRouterRetry(this.db, record);
+        this.db.prepare('UPDATE execution_strategies SET status=? WHERE id=?').run(resume ? 'RUNNING' : 'PAUSED', id);
+        writeManagedState(this.db, id, { ...readManagedState(this.db, id)!, phase:resume ? 'OPENING' : 'RISK_PAUSED',
+          reason:resume ? null : ROUTER_REVIEW, leftQuantity:'0', rightQuantity:'0', verified:false, conditionSince:null });
+      })();
+      this.revision += 1; this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
+      this.log(id, resume ? 'Risk reviewed' : 'Entry route unavailable', resume ? 'Verified zero-position router entry resumed' : 'Five proven router rejections; task-local manual review required');
+    } catch (error) {
+      if (!resume && this.session.liveTradingEnabled && context === this.readContext()
+        && !readManagedState(this.db, id)?.stopIntent) this.failAll(error instanceof Error ? error.message : 'router_entry_review_failed');
+      throw error;
+    }
+  }
+
+  pauseEntryPreparation(id: string): void {
+    const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id);
+    if (!state?.preparationRecovery || record.status !== 'RUNNING' || state.phase !== 'OPENING') return;
+    const claims = this.db.prepare('SELECT symbol,account_id FROM managed_position_claims WHERE strategy_id=?').all(id) as Array<{symbol:string;account_id:string}>;
+    if (record.accountProfileId !== this.sources.activeAccount() || this.runtime.listOpenOrders(id).length
+      || state.preparationRecovery.scope !== preparationIdentity(this.db, record)
+      || claims.length !== 2 || !managedLegs(record.config).every(l => claims.some(c => c.symbol === l.symbol && c.account_id === record.accountProfileId))) {
+      this.failAll('managed_entry_preparation_scope_changed'); return;
+    }
+    if (!state.preparationRecovery.review) return;
+    this.db.transaction(() => {
+      writeManagedState(this.db, id, { ...state, phase: 'RISK_PAUSED', entryIntent: 'OPENING', reason: PREPARATION_REVIEW, conditionSince: null });
+      this.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id=?").run(id);
+    })();
+    this.runtime.addStrategyLog(id, 'warning', 'Entry preparation paused', PREPARATION_REVIEW, '—', 'Only this task; existing holdings retain authorized protection');
+    this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id)); this.scheduleTick();
+  }
   failAll(reason: string): void {
     this.marginMonitor?.invalidateNormalRecovery();
     this.abortReads(); this.clearRecoveryTimer();
-    this.marginMonitor?.blockIncident(reason);
-    const current = managedRiskReason(this.db);
-    if (current && current !== MANAGED_ACCOUNT_RECHECKING) return;
-    if (current) this.db.prepare('UPDATE managed_risk_lock SET reason = ? WHERE singleton = 1').run(reason);
-    else this.db.prepare('INSERT INTO managed_risk_lock VALUES (1, ?, ?)').run(reason, new Date(this.now()).toISOString());
-    const incident = this.db.prepare('SELECT created_at FROM managed_risk_lock WHERE singleton=1').get() as { created_at: string };
-    this.db.prepare('INSERT INTO audit_events (id,created_at,type,correlation_id,payload_json) VALUES (?,?,?,?,?)')
-      .run(randomUUID(), new Date(this.now()).toISOString(), 'managed_account_hard_pause', incident.created_at, JSON.stringify({ reason }));
-    const records = this.active();
-    this.db.prepare("UPDATE execution_strategies SET status = 'PAUSED' WHERE status = 'RUNNING'").run();
-    for (const record of records) {
-      const state = readManagedState(this.db, record.id);
-      if (state) this.save(record.id, { ...state, phase: 'RISK_PAUSED', reason, conditionSince: null });
-      this.runtime.addStrategyLog(record.id, 'error', 'Managed risk pause', reason, '—', 'Global pause; reconcile before explicit resume');
-    }
+    // Fail closed in memory before touching the contended database. Persistence retries below.
     this.session.pause();
     this.sources.riskPause();
+    const records = [...new Set([...(this.pendingHardPause?.records ?? []),...this.active().map(record=>record.id)])];
+    this.pendingHardPause={reason,records};
+    try { this.persistHardPause(); }
+    catch (error) {
+      if (isDatabaseBusy(error)) { this.scheduleHardPausePersistence(); return; }
+      throw error;
+    }
+  }
+  private persistHardPause(): void {
+    const pending=this.pendingHardPause;if(!pending)return;
+    const records=[...new Set([...pending.records,...this.active().map(record=>record.id)])];
+    let audited=false,incidentAt='',effectiveReason=pending.reason;
+    this.db.transaction(()=>{
+      const current=managedRiskReason(this.db);
+      if(current&&current!==MANAGED_ACCOUNT_RECHECKING)effectiveReason=current;
+      else if(current===MANAGED_ACCOUNT_RECHECKING){audited=true;effectiveReason=pending.reason;
+        this.db.prepare('UPDATE managed_risk_lock SET reason=? WHERE singleton=1').run(effectiveReason);
+        incidentAt=(this.db.prepare('SELECT created_at FROM managed_risk_lock WHERE singleton=1').get() as {created_at:string}).created_at;}
+      else if(!current){incidentAt=new Date(this.now()).toISOString();audited=true;
+        this.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)').run(pending.reason,incidentAt);}
+      else incidentAt=(this.db.prepare('SELECT created_at FROM managed_risk_lock WHERE singleton=1').get() as {created_at:string}).created_at;
+      if(audited)this.db.prepare('INSERT INTO audit_events (id,created_at,type,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+        .run(randomUUID(),new Date(this.now()).toISOString(),'managed_account_hard_pause',incidentAt,JSON.stringify({reason:effectiveReason}));
+      this.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE status='RUNNING'").run();
+      for(const id of records){
+        const state=readManagedState(this.db,id);
+        if(state)writeManagedState(this.db,id,{...state,phase:'RISK_PAUSED',reason:effectiveReason,conditionSince:null});
+      }
+    })();
+    this.marginMonitor?.blockIncident(effectiveReason);
+    if(audited)for(const id of records){
+      this.runtime.addStrategyLog(id,'error','Managed risk pause',effectiveReason,'—','Global pause; reconcile before explicit resume');
+      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
+    }
+    this.pendingHardPause=null;
+  }
+  private scheduleHardPausePersistence(): void {
+    if(this.hardPauseTimer||!this.pendingHardPause)return;
+    this.hardPauseTimer=setTimeout(()=>{this.hardPauseTimer=null;
+      try{this.persistHardPause();}
+      catch(error){if(isDatabaseBusy(error)){this.scheduleHardPausePersistence();return;}setTimeout(()=>{throw error;},0);}
+    },250);this.hardPauseTimer.unref?.();
+  }
+  private async persistHardPauseBeforeStop(): Promise<void> {
+    for(let attempt=0;this.pendingHardPause&&attempt<20;attempt+=1){
+      try{this.persistHardPause();return;}
+      catch(error){
+        if(!isDatabaseBusy(error))throw error;
+        await new Promise<void>(resolve=>setTimeout(resolve,250));
+      }
+    }
+    if(this.pendingHardPause)throw new Error('managed_hard_pause_persistence_timeout');
   }
   private capacityRecords(): StrategyRecord[] {
     return this.runtime.listStrategies().filter(r => (readManagedState(this.db, r.id) as CapacityState)?.capacityProtection
@@ -937,6 +1095,11 @@ export class ManagedPositionManager {
     } catch (error) { this.failAll(error instanceof Error ? error.message : 'capacity_protection_failed'); throw error; }
   }
   private async evaluateProtection(record: StrategyRecord, facts: ManagedAccountFacts, at: number): Promise<void> {
+    if (record.status === 'PAUSED' && record.management?.reason === ROUTER_REVIEW) {
+      try { this.assertRouterFlat(record, facts); }
+      catch (error) { this.failAll(error instanceof Error ? error.message : 'router_entry_protection_conflict'); throw error; }
+      return;
+    }
     const marker = (readManagedState(this.db, record.id) as CapacityState)?.capacityProtection;
     if (!marker) { await this.evaluate(record, facts, at); return; }
     try {
@@ -975,6 +1138,7 @@ export class ManagedPositionManager {
   private log(id: string, event: string, reason: string): void { this.runtime.addStrategyLog(id, 'info', event, reason, '—', 'Managed paired position'); }
 
   private async evaluate(record: StrategyRecord, facts: ManagedAccountFacts, started: number): Promise<void> {
+    if (!this.protection.isEvaluating(record.id) && this.runtime.getStrategy(record.id).status !== 'RUNNING') return;
     if (this.fastPairing.has(record.id)) return;
     let state = readManagedState(this.db, record.id)!;
     if ((state as CapacityState).capacityProtection && !this.protection.isEvaluating(record.id)) return;
@@ -990,6 +1154,7 @@ export class ManagedPositionManager {
     if (contradictory) throw new Error('managed_order_state_conflict');
     if (state.phase === 'OPENING' && !this.protection.isEvaluating(record.id)) { await this.evaluateOpening(record, facts, state); return; }
     if (await this.settlePending(record, state)) return;
+    if (!this.protection.isEvaluating(record.id) && this.runtime.getStrategy(record.id).status !== 'RUNNING') return;
     state = readManagedState(this.db, record.id)!;
     if (['STOPPING', 'STOPPED', 'TRANSFERRED', 'COMPLETED'].includes(state.phase)) return;
     const quantities = pairedQuantities(facts.positions, legs);
@@ -1201,7 +1366,10 @@ export class ManagedPositionManager {
       this.save(record.id, { ...state, cancelRequestedAt });
       if (this.now() - cancelRequestedAt > 5000) throw new Error('managed_cancel_unresolved');
       if (order.state === 'PENDING_CANCEL') await this.bounded(this.runtime.refreshOrderFromRemote(order.id), 'managed_cancel_unresolved');
-      else await this.bounded(this.runtime.cancelOrder(order.id, () => { if (authorize && !authorize()) throw new TradingRuntimeError('managed_review_changed', 409); }), 'managed_cancel_unresolved');
+      else await this.bounded(this.runtime.cancelOrder(order.id, () => {
+        if (authorize && !authorize()) throw new TradingRuntimeError('managed_review_changed', 409);
+        this.remoteWriteSequence += 1;
+      }), 'managed_cancel_unresolved');
       return false;
     }
     this.save(record.id, { ...state, makerOrderId: null, makerStartedAt: null, cancelRequestedAt: null, after: this.now() });
@@ -1285,7 +1453,9 @@ export class ManagedPositionManager {
       timeInForce: maker ? 'POC' : 'IOC', quantity: quantity.toString(), reduceOnly: true, ...(price ? { price } : {}) },
     { feePhase, strategyId: record.id, strategyLeg: index === 0 ? 'left' : 'right', strategyClip: batch?.id ? `margin:${batch.id}` : `managed-${this.now()}`,
       ...(protectionPermit ? { protectionPermit } : {}),
-      confirmedPairing: pairing, beforeSubmit: () => authorize(), beforeDispatch: authorize }), 'managed_submission_unknown');
+      confirmedPairing: pairing, beforeSubmit: () => authorize(), beforeDispatch: (excludeOrderId?: string) => {
+        authorize(excludeOrderId); this.remoteWriteSequence += 1;
+      } }), 'managed_submission_unknown');
     const state = readManagedState(this.db, record.id)!;
     this.save(record.id, { ...state, phase: maker ? 'EXITING' : 'BALANCING',
       ...(maker ? { makerOrderId: order.id, makerStartedAt: this.now() } : { pendingOrderId: order.id }),

@@ -628,7 +628,7 @@ describe('local backend', () => {
       authenticatedTradingEnabled: false,
       tradingMode: 'unset',
       mode: 'live',
-      database: { migrationCount: 34, currentMigration: '0034_task_performance_projection.sql' },
+      database: { migrationCount: 35, currentMigration: '0035_router_entry_recovery.sql' },
       security: {
         credentialStorage: 'memory_test_only',
         credentialEntryPath: '/secure/credentials',

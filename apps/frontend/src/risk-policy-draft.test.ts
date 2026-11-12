@@ -43,7 +43,7 @@ describe('risk editor preserves the policy contract', () => {
   });
   it('does not let invalid future timestamps prevent a valid observation from recovering', () => {
     const future = { ...snapshot(), sampledAt: Date.now() + 60000 };
-    expect(olderRiskSnapshot({ ...future, sampledAt: Date.now() }, future)).toBe(false);
+    expect(olderRiskSnapshot({ ...future, sampledAt: Date.now() }, future, Date.now())).toBe(false);
   });
   it('keeps newer control state when an older request returns the same financial sample', () => {
     const before = snapshot(), blocked = { ...before, status: 'blocked' as const, entryBlocked: true };

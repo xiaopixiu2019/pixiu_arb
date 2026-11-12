@@ -4,6 +4,7 @@ import type { MarginEntryCheck, MarginRiskMonitor } from './margin-risk-monitor.
 import type { MarginSnapshot } from '@gate-crossex/shared-types';
 import type { GateCrossExOrder, GateCrossExPosition, TradingCrossExGateway } from './crossex-client.js';
 import { admissionReadFailure, readCrossMarginEvidence } from './cross-margin-admission.js';
+import { isPreparationTimeout } from './entry-preparation-recovery.js';
 import { freshManagedQuote, pairedQuantities } from './managed-position-model.js';
 import { managedLegs } from './managed-position-manager.js';
 import { managedRiskReason, readManagedState } from './managed-position-store.js';
@@ -112,12 +113,12 @@ export class PairedEntryAdmission implements PairedEntryController {
     const key = JSON.stringify([account, context, hash, epoch]), pending = this.pending.get(id);
     if (pending?.key === key) return pending.work;
     if (this.preparedRecently(id, hash)) return Promise.resolve();
-    let drained = Promise.resolve();
+    const ownedReads: Promise<unknown>[] = [];
     const work: Promise<void> = this.tail.then(async () => {
       if (this.stopped || epoch !== this.preparationEpoch || context !== this.o.context()
         || account !== this.o.profile()?.id || !this.o.live()) fail('paired_entry_account_changed');
-      if (!this.preparedRecently(id, hash)) await this.prepareOnce(id, requested, account, epoch, reads => {
-        drained = Promise.allSettled(reads).then(() => undefined);
+      if (!this.preparedRecently(id, hash)) await this.prepareBounded(id, requested, account, epoch, reads => {
+        ownedReads.push(...reads);
       });
     }).finally(() => {
       // Completed failures must not be counted again by a later Maker attempt.
@@ -125,33 +126,55 @@ export class PairedEntryAdmission implements PairedEntryController {
     });
     this.pending.set(id, { key, work });
     // Report the first failure promptly, but keep its reads owned until the entire batch drains.
-    this.tail = work.catch(() => undefined).then(() => drained);
+    this.tail = work.catch(() => undefined).then(() => Promise.allSettled(ownedReads)).then(() => undefined);
     return work;
   }
   private preparedRecently(id: string, hash: string): boolean {
     return this.ready(id) && this.certificates.get(id)?.hash === hash && Date.now() - this.certificates.get(id)!.at < 4000;
   }
-  private async prepareOnce(id: string, config: CreateStrategyInput, account: string | null, epoch: number,
+  private async prepareBounded(id: string, config: CreateStrategyInput, account: string | null, epoch: number,
     track: (reads: readonly Promise<unknown>[]) => void): Promise<void> {
-    const context = this.o.context(), legs = managedLegs(config), preparedAt = Date.now(), generation = this.pools.generation;
+    const started = Date.now(), controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new TradingRuntimeError('paired_entry_preparation_unavailable', 409);
+        controller.abort(error); reject(error);
+      }, 10000);
+    });
+    const physical = this.prepareOnce(id, config, account, epoch, track, controller.signal, started);
+    track([physical]);
+    try { await Promise.race([physical, expired]); } finally { clearTimeout(timer); }
+  }
+  private async prepareOnce(id: string, config: CreateStrategyInput, account: string | null, epoch: number,
+    track: (reads: readonly Promise<unknown>[]) => void, signal: AbortSignal, preparedAt: number): Promise<void> {
+    const context = this.o.context(), legs = managedLegs(config), generation = this.pools.generation;
     if (this.stopped || !account || account !== this.o.profile()?.id || !this.o.live()) fail('paired_entry_account_changed');
     await this.monitor.refresh();
+    signal.throwIfAborted();
     const credentials = await this.o.credentials(), gateway = this.o.gateway as TradingCrossExGateway;
+    signal.throwIfAborted();
+    if (Date.now() - preparedAt >= 10000) fail('paired_entry_preparation_unavailable');
     if (!credentials) fail('paired_entry_account_changed');
     const proofEnabled = this.pools.enabled && !!this.monitor.snapshot().metrics?.assets.length;
-    const factsSignal = proofEnabled && gateway.queryManagedState ? AbortSignal.timeout(4000) : undefined;
+    const factsSignal = proofEnabled && gateway.queryManagedState ? AbortSignal.any([signal, AbortSignal.timeout(4000)]) : undefined;
     const factsRead: Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] | null }> = proofEnabled && gateway.queryManagedState
       ? gateway.queryManagedState(credentials!, factsSignal!)
       : gateway.queryPositions(credentials!).then(positions => ({ positions, openOrders: null }));
     const reads = [
-      entryRead('catalog', readCrossMarginEvidence(gateway, credentials!, legs.map(l => l.symbol), AbortSignal.timeout(4000))),
+      entryRead('catalog', readCrossMarginEvidence(gateway, credentials!, legs.map(l => l.symbol), signal, { deadline: preparedAt + 10000, track })),
       entryRead('risk_limits', gateway.queryRiskLimits(legs.map(l => l.symbol))),
       entryRead('leverage', gateway.queryLeverages(credentials!, legs.map(l => l.symbol))), entryRead('positions_orders', factsRead, factsSignal),
       proofEnabled ? gateway.queryValuationRates?.([...new Set(legs.map(l => l.symbol.split('_').at(-1)!))], AbortSignal.timeout(4000))
         .catch(() => ({})) ?? {} : {},
     ] as const;
     track(reads.map(read => Promise.resolve(read)));
-    const [cross, limits, leverages, facts, rates] = await Promise.all(reads);
+    const [cross, limits, leverages, facts, rates] = await Promise.all(reads).catch(error => {
+      if (Date.now() - preparedAt >= 10000 && error instanceof TradingRuntimeError && isPreparationTimeout(error.code, error.label))
+        fail('paired_entry_preparation_unavailable');
+      throw error;
+    });
+    signal.throwIfAborted();
     if (this.stopped || epoch !== this.preparationEpoch || context !== this.o.context() || !this.o.live() || account !== this.o.profile()?.id)
       fail('paired_entry_account_changed');
     const snapshot = this.monitor.snapshot();
