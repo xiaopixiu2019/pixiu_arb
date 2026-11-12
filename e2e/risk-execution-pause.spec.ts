@@ -34,6 +34,7 @@ test('healthy margin never conceals paused tasks, readonly, partial recovery or 
     return r.fallback();
   });
   await page.route('**/api/strategies', r => r.fulfill({ json: { strategies: tasks } }));
+  await page.route('**/api/risk/margin/clock',r=>r.fulfill({json:{accountId:current.accountId,serverAt:current.sampledAt!+current.ageMs!}}));
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current }));
   await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId: current.accountId, events: [], hasMore: false } }));
   await page.goto('/risk-management');

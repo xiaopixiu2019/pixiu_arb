@@ -22,7 +22,7 @@ function RiskWorkspace({ snapshot, onSnapshot, tasks }: Props) {
   const active = useRef(true);
   const latest = useRef(snapshot); latest.current = snapshot;
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
-  const fresh = riskFresh(snapshot, Date.now()), accountId = snapshot?.accountId ?? null;
+  const fresh = riskFresh(snapshot), accountId = snapshot?.accountId ?? null;
   const accept = (next: MarginSnapshot) => { if (active.current && next.accountId === accountId && (!latest.current || !olderRiskSnapshot(next, latest.current))) onSnapshot(next); };
   const refresh = async () => {
     const before = latest.current;

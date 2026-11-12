@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import type { ManagedPositionView } from '@gate-crossex/shared-types';
+import type { MarginVersionEvidence } from './margin-version.js';
 
 export interface ManagedMarginBatch {
   before: string; quantity: string; incidentId: string;
@@ -8,7 +9,10 @@ export interface ManagedMarginBatch {
 }
 
 export interface ManagedState extends ManagedPositionView {
+  entryIntent?: 'OPENING' | 'MONITORING';
+  preparationRecovery?: { scope: string; attempt: string; failures: number; nextAt: number; review: boolean };
   marginReadPending?: boolean;
+  marginVersionFloor?: MarginVersionEvidence;
   marginBatch?: ManagedMarginBatch | null;
   protectionIncident?: { reason: string; before: [string, string]; at: number } | null;
   observedReductions?: [string, string];
@@ -29,7 +33,7 @@ export interface ManagedState extends ManagedPositionView {
   pauseAfterProtection?: boolean;
 }
 export function initialManagedState(): ManagedState {
-  return { phase: 'OPENING', leftQuantity: null, rightQuantity: null, checkedAt: null,
+  return { phase: 'OPENING', entryIntent: 'OPENING', leftQuantity: null, rightQuantity: null, checkedAt: null,
     spreadBps: null, fundingAprPct: null, fundingCheckedAt: null, conditionSince: null,
     exitRequested: false, reason: null, signalReason: null, signalMissingSince: null,
     pendingOrderIds: [], makerOrderId: null, pendingOrderId: null,
@@ -41,6 +45,8 @@ export function readManagedState(db: Database.Database, id: string): ManagedStat
   return row ? JSON.parse(row.state_json) as ManagedState : undefined;
 }
 export function writeManagedState(db: Database.Database, id: string, state: ManagedState): void {
+  if (state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident || state.pauseAfterProtection
+    || ['STOPPING', 'STOPPED', 'TRANSFERRED', 'COMPLETED', 'EXITING'].includes(state.phase)) state = { ...state, entryIntent: 'MONITORING' };
   db.prepare('UPDATE managed_positions SET state_json = ?, updated_at = ? WHERE strategy_id = ?')
     .run(JSON.stringify(state), new Date().toISOString(), id);
 }

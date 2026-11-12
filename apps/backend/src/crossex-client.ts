@@ -182,9 +182,11 @@ export interface ReadOnlyCrossExGateway {
   queryFeeTrades?(credentials: GateCredentials, query: { from: number; to: number; page: number; limit: number }, signal?: AbortSignal): Promise<GateCrossExTrade[]>;
   /** Keep scheduled statistics reads out of the order/reconciliation request queue. */
   createStatisticsReader?(): ReadOnlyCrossExGateway;
+  /** Give the periodic margin account read its own bounded slot without changing ordinary throughput. */
+  createRiskControlReader?(): ReadOnlyCrossExGateway;
   queryValuationRates?(coins: string[], signal?: AbortSignal): Promise<Record<string, string>>;
   queryAccount(credentials: GateCredentials, exchangeType?: string, signal?: AbortSignal): Promise<GateCrossExAccount>;
-  querySymbols(): Promise<GateCrossExSymbol[]>;
+  querySymbols(signal?: AbortSignal): Promise<GateCrossExSymbol[]>;
   queryPositionMarginMode?(credentials: GateCredentials, symbol: string, signal?: AbortSignal): Promise<'CROSS' | 'ISOLATED'>;
   queryRiskLimits(symbols: string[], signal?: AbortSignal): Promise<GateCrossExRiskLimit[]>;
   queryCoinDiscountRates?(credentials: GateCredentials, signal?: AbortSignal): Promise<GateCoinDiscount[]>;
@@ -400,10 +402,16 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     private readonly authenticatedRequestSpacingMs = 100,
     private readonly onAuthenticatedTiming?: (timing: AuthenticatedRequestTiming) => void,
     private readonly pacing = { nextAt: 0, cooldownUntil: 0 },
+    private readonly riskControlReads = false,
   ) {}
 
   createStatisticsReader(): ReadOnlyCrossExGateway {
     return new GateCrossExClient(this.fetchImplementation, this.now, this.baseUrl, this.authenticatedRequestSpacingMs, this.onAuthenticatedTiming, this.pacing);
+  }
+
+  createRiskControlReader(): ReadOnlyCrossExGateway {
+    return new GateCrossExClient(this.fetchImplementation, this.now, this.baseUrl, this.authenticatedRequestSpacingMs,
+      this.onAuthenticatedTiming, this.pacing, true);
   }
 
   async queryAccount(credentials: GateCredentials, exchangeType?: string, signal?: AbortSignal): Promise<GateCrossExAccount> {
@@ -740,7 +748,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
           queueMs: startedAt - queuedAt, requestMs: Date.now() - startedAt,
           phase: 'request', requestId }); } catch { /* diagnostics cannot change execution */ }
       }
-    }, write, AUTHENTICATED_REQUEST_PRIORITY[priority], signal, this.readLane).catch((error: unknown) => {
+    }, write, AUTHENTICATED_REQUEST_PRIORITY[priority], signal, this.readLane, this.riskControlReads).catch((error: unknown) => {
       if (error instanceof RequestNotDispatchedError && signal?.aborted) {
         throw new GateApiError(0, 'REQUEST_ABORTED', undefined, { endpoint, phase: 'queue' });
       }
@@ -769,16 +777,17 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
 
-  async querySymbols(): Promise<GateCrossExSymbol[]> {
+  async querySymbols(signal?: AbortSignal): Promise<GateCrossExSymbol[]> {
     let response: Response;
     try {
       response = await this.fetchImplementation(`${this.baseUrl}${SYMBOLS_ENDPOINT}`, {
         method: 'GET',
         headers: { Accept: 'application/json' },
         redirect: 'error',
-        signal: AbortSignal.timeout(15_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
       });
     } catch {
+      if (signal?.aborted) throw signal.reason;
       throw new GateApiError(0, 'NETWORK_ERROR');
     }
 

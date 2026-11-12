@@ -1,5 +1,28 @@
 import { expect, test } from '@playwright/test';
 
+test('continuing a legacy partial entry requires the visible remaining-quantity action',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('crossex-language','zh'));
+  await page.route('**/api/preferences',r=>r.request().method()==='GET'?r.fulfill({json:{preferences:{language:'zh'}}}):r.continue());
+  await page.request.post('/__e2e/paused-managed-strategy');
+  await page.request.post('/__e2e/trading-mode',{data:{mode:'live'}});
+  const original=(await(await page.request.get('/api/strategies')).json()).strategies.find((s:{id:string})=>s.id==='PAIR-LAYOUT01');
+  const requests:unknown[]=[];
+  await page.route('**/api/strategies',r=>r.fulfill({json:{strategies:[{...original,status:'RUNNING',filledQuantity:'3',filledLeft:'3',filledRight:'3',progress:30,
+    config:{...original.config,totalAmount:'10'},management:{...original.management,phase:'MONITORING',leftQuantity:'3',rightQuantity:'3',reason:null,remainingEntryQuantity:'7',resumeAction:'MONITORING'}}]}}));
+  await page.route('**/api/strategies/PAIR-LAYOUT01/resume',r=>{requests.push(r.request().postDataJSON());return r.fulfill({status:409,json:{error:'managed_review_changed'}});});
+  try{
+    await page.goto('/strategies/paired-position');
+    const dialog=page.getByRole('dialog',{name:/Risk disclaimer|风险免责声明/});
+    await dialog.waitFor({state:'visible',timeout:1500}).catch(()=>undefined);
+    if(await dialog.isVisible()){await dialog.getByRole('checkbox').check();await dialog.getByRole('button',{name:/Continue in read-only mode|以只读模式继续/}).click();}
+    const row=page.locator('.running-row').filter({hasText:'PAIR-LAYOUT01'});
+    await expect(row.getByRole('button',{name:'继续建仓剩余 7'})).toBeVisible();expect(requests).toEqual([]);
+    await row.getByRole('button',{name:'继续建仓剩余 7'}).click();await expect.poll(()=>requests).toEqual([{expectedAction:'OPENING'}]);
+    await expect(row).toContainText('持仓监控中');await expect(row).toContainText('RUNNING');
+    await expect(row.getByRole('button',{name:'继续建仓剩余 7'})).toBeEnabled();
+  }finally{await page.request.post('/__e2e/trading-mode',{data:{mode:'readonly'}});await page.request.delete('/__e2e/paused-managed-strategy');}
+});
+
 for (const [action, label] of [['OPENING', '继续建仓'], ['MONITORING', '恢复监控'], ['EXITING', '继续平仓']] as const) {
   test(`managed resume binds the visible ${action} intent and preserves a rejected task`, async ({ page }) => {
     await page.addInitScript(() => window.localStorage.setItem('crossex-language', 'zh'));

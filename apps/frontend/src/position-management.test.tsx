@@ -5,6 +5,19 @@ import { ManagementSettings, ManagedPositionStatus } from './position-management
 import type { StrategyRecord } from './api.js';
 
 describe('position management launch controls', () => {
+  it.each([false,true])('shows router retry review=%s locally without claiming an account recheck',review=>{
+    const strategy:StrategyRecord={id:'PAIR-ROUTER',kind:'position',status:review?'PAUSED':'RUNNING',accountProfileId:'synthetic',accountLabel:'Synthetic',
+      progress:0,filledQuantity:'0',openPosition:'0',realizedPnl:'0',createdAt:'2026-11-10T00:00:00Z',updatedAt:'2026-11-10T00:00:00Z',stoppedAt:null,
+      config:{kind:'position',asset:'UNITREE',leftVenue:'GATE',rightVenue:'BINANCE',leftSide:'SELL',rightSide:'BUY',perOrderQuantity:'2.5',
+        reduceOnly:false,executionMethod:'MAKER_TAKER',management:managementConfig(defaultManagementDraft,'2.5','right')!},filledLeft:'0',filledRight:'0',
+      management:{phase:review?'RISK_PAUSED':'OPENING',reason:review?'managed_router_entry_review':null,
+        routerRetry:{failures:review?5:1,nextAt:Date.now()+4000,review},leftQuantity:'0',rightQuantity:'0',
+        spreadBps:null,fundingAprPct:null,checkedAt:null,fundingCheckedAt:null,conditionSince:null,
+        exitRequested:false,pendingOrderIds:[]}};
+    const html=renderToStaticMarkup(<ManagedPositionStatus strategy={strategy} language="zh" tradingMode="live" />);
+    expect(html).toContain(review?'建仓路由繁忙 · 待人工复核':'建仓路由繁忙 · 等待重试');
+    expect(html).not.toContain('账户核实中');
+  });
   it.each(['EXITING', 'COMPLETED'] as const)('does not present a persisted economic warning as a current %s error', (phase) => {
     const strategy: StrategyRecord = { id: 'PAIR-STATUS01', kind: 'position', status: phase === 'COMPLETED' ? 'COMPLETED' : 'RUNNING',
       accountProfileId: null, accountLabel: null, progress: 100, filledQuantity: '4000', filledLeft: '4000', filledRight: '4000',

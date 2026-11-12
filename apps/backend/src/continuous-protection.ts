@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { preparationIdentity, PREPARATION_REVIEW } from './entry-preparation-recovery.js';
 import { Decimal } from 'decimal.js';
 import type { TradingSession } from './trading-session.js';
 import type { TradingRuntime, StrategyRecord } from './trading-runtime.js';
@@ -10,6 +11,7 @@ import { pairedQuantities } from './managed-position-model.js';
 import { assertMarginSubmission } from './managed-margin-batch.js';
 import type { MarginRiskMonitor } from './margin-risk-monitor.js';
 import type { MarginSnapshot } from '@gate-crossex/shared-types';
+import { ROUTER_REVIEW } from './router-entry-retry.js';
 
 interface Sources {
   profile(): string | null; version(): string; read(): Promise<ManagedAccountFacts>; stopped(): boolean;
@@ -198,11 +200,24 @@ export class ContinuousProtection {
   }
   private async evaluateGroup(record: StrategyRecord, facts: ManagedAccountFacts): Promise<void> {
     try {
+      if (record.management?.reason === PREPARATION_REVIEW) {
+        const retry = readManagedState(this.db, record.id)?.preparationRecovery;
+        if (!retry?.review || retry.scope !== preparationIdentity(this.db, record)) throw new Error('managed_entry_preparation_scope_changed');
+      }
+      if (record.status === 'PAUSED' && record.management?.reason === ROUTER_REVIEW) {
+        this.evaluating = record.id;
+        await this.sources.evaluate(record, facts, this.observation!.at);
+        this.authority.status(record.id, 'WATCHING', ROUTER_REVIEW);
+        return;
+      }
       this.checkHoldings(record, facts);
       if (await this.cancelConfirmedMaker(record, facts)) {
         this.authority.status(record.id, 'RECONCILING', 'protection_cancellation_pending'); return;
       }
       this.assertOrders(record, facts);
+      if (record.management?.reason === PREPARATION_REVIEW && pairedQuantities(facts.positions, managedLegs(record.config)).every(q => new Decimal(q).isZero())) {
+        this.authority.status(record.id, 'WATCHING', PREPARATION_REVIEW); return;
+      }
       if (!this.prepareEntryHoldings(record, facts)) return;
       this.evaluating = record.id;
       await this.sources.evaluate(record, facts, this.observation!.at);

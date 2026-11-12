@@ -28,6 +28,8 @@ describe('risk page evidence and human-readable meaning', () => {
     expect(riskFresh({ ...s, metrics: null }, 10000)).toBe(false);
     expect(riskFresh({ ...s, accountId: null }, 10000)).toBe(false);
     expect(riskFresh({ ...s, status: 'unavailable' }, 10000)).toBe(false);
+    expect(riskFresh({ ...s, ageMs: -1 }, 10000)).toBe(false);
+    expect(riskFresh({ ...s, ageMs: 5001 }, 10000)).toBe(false);
     expect(riskFresh(s, 15001)).toBe(false);
     expect(riskFresh(s, 9999)).toBe(false);
   });

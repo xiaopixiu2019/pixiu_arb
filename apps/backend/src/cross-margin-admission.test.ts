@@ -3,6 +3,32 @@ import { readCrossMarginEvidence } from './cross-margin-admission.js';
 import { GateApiError, GateCrossExClient, type ReadOnlyCrossExGateway } from './crossex-client.js';
 const symbol = 'GATE_FUTURE_BTC_USDT', credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
 describe('cross margin capability and actual mode are separate', () => {
+  it('gives the mode read its own bounded stage after a slow successful catalog', async () => {
+    vi.useFakeTimers();
+    try {
+      const reads: Promise<unknown>[] = [];
+      const gateway = { querySymbols: () => new Promise(resolve => setTimeout(() => resolve([{symbol,support_cross:'true'}]),3500)),
+        queryPositionMarginMode: () => new Promise(resolve => setTimeout(() => resolve('CROSS'),600)) } as unknown as ReadOnlyCrossExGateway;
+      const result = readCrossMarginEvidence(gateway,credentials,[symbol],undefined,{deadline:Date.now()+10000,track:r=>reads.push(...r)});
+      await vi.advanceTimersByTimeAsync(4100);
+      expect(await result).toMatchObject([{mode:'CROSS',reason:null}]); expect(reads).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it('caps each stage by the remaining total deadline and retains ownership of uncancellable reads', async () => {
+    vi.useFakeTimers();
+    try {
+      const reads: Promise<unknown>[] = []; let release!: () => void;
+      const gateway = { querySymbols: () => new Promise(resolve => { release=()=>resolve([{symbol,support_cross:'true'}]); }),
+        queryPositionMarginMode: vi.fn() } as unknown as ReadOnlyCrossExGateway;
+      const result=readCrossMarginEvidence(gateway,credentials,[symbol],undefined,{deadline:Date.now()+2500,track:r=>reads.push(...r)})
+        .then(()=>null,error=>error);
+      await vi.advanceTimersByTimeAsync(2500); expect(await result).toMatchObject({name:'TimeoutError'});
+      let settled=false; void Promise.allSettled(reads).then(()=>{settled=true;}); await Promise.resolve();
+      expect(settled).toBe(false); expect(gateway.queryPositionMarginMode).not.toHaveBeenCalled();
+      release(); await Promise.allSettled(reads); expect(settled).toBe(true); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
   it.each([['false', false, 'cross_margin_unsupported'], [undefined, null, 'cross_margin_capability_unknown'],
     ['bad', null, 'cross_margin_capability_unknown']])('fails closed for capability %s', async (support_cross, supportCross, reason) => {
     const mode = vi.fn(async () => 'CROSS');

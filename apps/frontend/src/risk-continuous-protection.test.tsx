@@ -2,9 +2,15 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MarginSnapshotSchema } from '@gate-crossex/shared-types';
 import { ContinuousProtectionSettings } from './risk-continuous-protection.js';
+import { riskEvidenceClock } from './risk-evidence-clock.js';
 
-beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(1000); });
-afterEach(() => { vi.useRealTimers(); });
+let elapsed=0;
+beforeEach(() => {
+  vi.useFakeTimers(); vi.setSystemTime(1000); elapsed=0;
+  vi.spyOn(performance,'now').mockImplementation(()=>elapsed);
+  riskEvidenceClock.reset();riskEvidenceClock.calibrate('synthetic',1000,0,0);
+});
+afterEach(() => { riskEvidenceClock.reset();vi.restoreAllMocks();vi.useRealTimers(); });
 
 function snapshot() {
   return MarginSnapshotSchema.parse({ accountId: 'synthetic', accountLabel: 'Synthetic', sampledAt: 1000, ageMs: 0,
@@ -35,9 +41,14 @@ describe('continuous protection coverage disclosure', () => {
     expect(html).toContain('Entry in progress; awaiting verified holdings');
   });
   it('does not count expired observations as verified protection', () => {
+    elapsed=5001;
     vi.setSystemTime(6001);
     const html = renderToStaticMarkup(<ContinuousProtectionSettings snapshot={snapshot()} zh />);
     expect(html).toContain('当前托管组 3 · 已登记 2 · 已核实保护 0');
     expect(html).toContain('保护核对已过期，等待新数据');
+  });
+  it('does not expire verified protection because the local wall clock jumps',()=>{
+    vi.setSystemTime(61000);
+    expect(renderToStaticMarkup(<ContinuousProtectionSettings snapshot={snapshot()} zh />)).toContain('已核实保护 1');
   });
 });

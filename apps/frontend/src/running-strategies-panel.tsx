@@ -18,6 +18,8 @@ import { useLanguage, type Language } from './i18n.js';
 const HISTORICAL_STRATEGIES_PAGE_SIZE = 10;
 function resumeLabel(strategy: StrategyRecord, language: Language): string {
   const action = strategy.management?.resumeAction;
+  if (strategy.management?.remainingEntryQuantity) return language === 'zh'
+    ? `继续建仓剩余 ${strategy.management.remainingEntryQuantity}` : `Continue remaining ${strategy.management.remainingEntryQuantity}`;
   if (action === 'OPENING') return language === 'zh' ? '继续建仓' : 'Continue entry';
   if (action === 'MONITORING') return language === 'zh' ? '恢复监控' : 'Resume monitoring';
   if (action === 'EXITING') return language === 'zh' ? '继续平仓' : 'Continue exit';
@@ -155,7 +157,8 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     setResumingIds((current) => [...current, id]);
     setStopNotice(null);
     try {
-      await api.resumeStrategy(id, strategies.find(strategy => strategy.id === id)?.management?.resumeAction);
+      const management = strategies.find(strategy => strategy.id === id)?.management;
+      await api.resumeStrategy(id, management?.remainingEntryQuantity ? 'OPENING' : management?.resumeAction);
       await onStrategiesChanged();
     } catch (error) {
       setStopNotice(`${t('Resume failed')} (${id}): ${error instanceof ApiError ? strategyErrorMessage(error, language) : t('Backend unavailable')}`);
@@ -281,7 +284,7 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
         {feesEnabled && <TaskFeeCell metric={fees?.tasks.find((f) => f.taskId === strategy.id)?.metric} language={language} stale={feeStale} expanded={feeTask === strategy.id} onClick={() => setFeeTask((id) => id === strategy.id ? null : strategy.id)} />}
         <span>{strategyRuntime(strategy, showingHistory)}</span>
         <span className={`strategy-status ${strategy.status.toLowerCase()}`}><span className="strategy-status-head"><i />{strategy.status}<small>{strategy.progress.toFixed(0)}%</small></span><ManagedPositionStatus strategy={strategy} language={language} tradingMode={tradingMode} /></span>
-        {!showingHistory && <span className="strategy-actions">{(strategy.status === 'PAUSED' || strategy.management?.phase === 'STOPPED') && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : resumeLabel(strategy, language)}</button>}<button className="stop-button" onClick={() => strategy.config.management ? setStopSelection(strategy) : void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
+        {!showingHistory && <span className="strategy-actions">{(strategy.status === 'PAUSED' || strategy.management?.phase === 'STOPPED' || strategy.management?.remainingEntryQuantity) && <button className="resume-button" onClick={() => void resumeStrategy(strategy.id)} disabled={resumingIds.includes(strategy.id) || stoppingIds.includes(strategy.id)}>{resumingIds.includes(strategy.id) ? t('Resuming…') : resumeLabel(strategy, language)}</button>}<button className="stop-button" onClick={() => strategy.config.management ? setStopSelection(strategy) : void stopStrategy(strategy.id)} disabled={stoppingIds.includes(strategy.id) || resumingIds.includes(strategy.id)}>{stoppingIds.includes(strategy.id) ? t('Stopping…') : t('Stop')}</button></span>}
       </div>{feesEnabled && feeTask === strategy.id && <TaskFeeDetails taskId={strategy.id} profileId={feeProfileId ?? null} language={language} />}</Fragment>;
     })}</div>{showingHistory && historicalStrategies.length >= HISTORICAL_STRATEGIES_PAGE_SIZE && <div className="funding-pagination strategy-pagination"><span className="page-range">{historyStart + 1}–{Math.min(historyStart + HISTORICAL_STRATEGIES_PAGE_SIZE, historicalStrategies.length)} / {historicalStrategies.length}</span><div className="page-controls"><button onClick={() => setHistoryPage((current) => Math.max(1, current - 1))} disabled={historyPage === 1}>{t('Prev')}</button><span className="page-indicator">{t('Page')} {historyPage} / {historyPages}</span><button onClick={() => setHistoryPage((current) => Math.min(historyPages, current + 1))} disabled={historyPage === historyPages}>{t('Next')}</button></div><span className="page-size">10 {t('per page')}</span></div>}{stopNotice && <div className="launch-notice error panel-notice">{stopNotice}</div>}{visibleStrategies.length === 0 && <div className="no-strategies"><span>◎</span><strong>{t(showingHistory ? 'No historical strategies' : 'No strategies running')}</strong><small>{t(showingHistory ? 'Stopped and completed strategies will appear here.' : emptyRunningHint ?? 'Configure a strategy above and start it when ready.')}</small></div>}
       </>}

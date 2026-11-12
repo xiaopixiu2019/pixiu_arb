@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import type { ContinuousProtectionResponse, MarginSnapshot } from '@gate-crossex/shared-types';
 import { riskApi } from './risk-api.js';
 import { riskReason } from './risk-presentation.js';
+import { riskEvidenceClock } from './risk-evidence-clock.js';
 
 function protectionReason(reason: string, zh: boolean): string {
   const labels: Record<string, [string, string]> = {
@@ -41,8 +42,8 @@ export function ContinuousProtectionSettings({ snapshot, zh }: { snapshot: Margi
   };
   const live = snapshot.continuousProtection ?? status?.protection;
   const coverage = live?.coverage;
-  const at = Date.now();
-  const groups = live?.groups.map(g => g.reason === 'protection_entry_in_progress' || g.checkedAt > 0 && g.checkedAt <= at && at - g.checkedAt <= 5000
+  const at = riskEvidenceClock.now(snapshot.accountId);
+  const groups = live?.groups.map(g => g.reason === 'protection_entry_in_progress' || at !== null && g.checkedAt > 0 && g.checkedAt <= at && at - g.checkedAt <= 5000
     ? g : { ...g, state: 'RECONCILING', reason: 'protection_observation_stale' });
   const enrolled = coverage?.filter(g => g.enrolled).length ?? 0;
   const verified = groups?.filter(g => ['WATCHING', 'EXECUTING'].includes(g.state)).length ?? 0;

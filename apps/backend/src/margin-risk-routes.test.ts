@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { resolve } from 'node:path';
 import { openDatabase } from './database.js';
@@ -10,10 +10,19 @@ afterEach(async () => { for (const r of resources.splice(0)) { await r.app.close
 describe('risk configuration API', () => {
   it('requires explicit intent, one-use CSRF and the same account before changing risk policy', async () => {
     const db = openDatabase(':memory:', resolve('../../migrations')), app = Fastify();
+    let accountReads = 0;
     const monitor = new MarginRiskMonitor(new MarginRiskStore(db), { context: () => 'account', live: () => false, groups: () => [], uncovered: () => [],
-      account: async () => ({ profileId: 'profile', userId: 'fake', label: 'Test', account: { available_margin: '100', margin_balance: '200', initial_margin: '100', maintenance_margin: '10',
-        initial_margin_rate: '2', maintenance_margin_rate: '20', assets: [], account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', position_mode: 'SINGLE', update_time: String(Date.now()) } }) });
+      account: async () => {
+        accountReads += 1;
+        return { profileId: 'profile', userId: 'fake', label: 'Test', account: { available_margin: '100', margin_balance: '200', initial_margin: '100', maintenance_margin: '10',
+          initial_margin_rate: '2', maintenance_margin_rate: '20', assets: [], account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', position_mode: 'SINGLE', update_time: String(Date.now()) } };
+      } });
     registerMarginRiskRoutes(app, monitor); resources.push({ app, db, monitor }); await monitor.refresh();
+    const accountId=monitor.snapshot().accountId,snapshot=vi.spyOn(monitor,'snapshot').mockImplementation(()=>{throw new Error('clock_endpoint_used_snapshot');});
+    const before=Date.now(),clock=await app.inject('/api/risk/margin/clock'),after=Date.now();snapshot.mockRestore();
+    expect(clock.statusCode).toBe(200);expect(clock.json()).toMatchObject({accountId});
+    expect(clock.json().serverAt).toBeGreaterThanOrEqual(before);expect(clock.json().serverAt).toBeLessThanOrEqual(after);
+    expect(accountReads).toBe(1);
     const config = (await app.inject('/api/risk/margin/policy')).json();
     const payload = { ...config, policy: { ...config.policy, initial: { warn: 111, reduce: 105, recover: 115 } } };
     expect((await app.inject({ method: 'PUT', url: '/api/risk/margin/policy', payload })).statusCode).toBe(403);

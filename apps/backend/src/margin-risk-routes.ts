@@ -13,6 +13,12 @@ export function registerMarginRiskRoutes(app: FastifyInstance, monitor: MarginRi
     try { return await monitor.sources.modes?.(parsed.data.symbols) ?? reply.code(503).send({ error: 'margin_modes_unavailable' }); }
     catch { return reply.code(409).send({ error: 'margin_modes_unavailable' }); }
   });
+  app.get('/api/risk/margin/clock', async (_request, reply) => {
+    // Clock calibration must never wait for an authenticated account refresh. A slow refresh widens
+    // the browser's safe time bound and can make a still-fresh five-second sample look expired.
+    reply.header('Cache-Control', 'no-store');
+    return { accountId: monitor.clockAccountId(), serverAt: Date.now() };
+  });
   app.get('/api/risk/margin', async (_request, reply) => {
     reply.header('Cache-Control', 'no-store');
     if (!monitor.snapshot().fresh) await monitor.refresh();

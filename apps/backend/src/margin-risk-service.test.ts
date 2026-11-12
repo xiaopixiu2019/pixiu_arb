@@ -23,6 +23,7 @@ async function harness() {
     initial_margin_rate: '1.2', maintenance_margin_rate: '12', assets: [], account_mode: 'CROSS_EXCHANGE', exchange_type: 'CROSSEX', position_mode: 'SINGLE', update_time: String(Date.now()) };
   let submitted = 0;
   const createOrder = vi.fn(async () => { submitted += 1; if (reject) throw new GateApiError(400, 'INVALID_PARAM_VALUE'); return { order_id: `order-${submitted}` }; });
+  let controlReads=0;
   const gateway = { queryAccount: async (_: unknown, venue?: string) => {
     if (split && !venue) throw new GateApiError(400, 'INVALID_PARAM_VALUE');
     return split ? { ...base, ...venueAccounts[venue!], account_mode: 'ISOLATED_EXCHANGE', exchange_type: venue! } : base;
@@ -31,17 +32,32 @@ async function harness() {
   queryLeverages: async (_: unknown, symbols: string[]) => Object.fromEntries(symbols.map((s) => [s, '10'])),
   queryRiskLimits: async (symbols: string[]) => symbols.map((symbol) => ({ symbol, tiers: [{ maintenance_rate: '0.01' }] })),
   createOrder } as unknown as TradingCrossExGateway;
+  gateway.createRiskControlReader=()=>({ ...gateway,
+    queryAccount: (...args: Parameters<TradingCrossExGateway['queryAccount']>) => { controlReads+=1; return gateway.queryAccount(...args); } });
   const runtime = new TradingRuntime(db, session, vault, gateway);
   const monitor = createMarginRiskService({ db, gateway, runtime, manager: { setMarginMonitor: vi.fn(), setMarginFacts: vi.fn(), failAll: vi.fn() } as unknown as ManagedPositionManager,
     engine: { haltForMarginRisk: vi.fn() } as unknown as StrategyEngine, enforce: true, context: () => 'account:1',
     profile: () => ({ id: 'account', label: 'Synthetic' }), live: () => true, credentials: () => vault.get(DEFAULT_CREDENTIAL_PROFILE),
     markets: { market: (symbol) => ({ symbol, source: 'gate_crossex_websocket', bidPrice: '10', askPrice: '10', updatedAt: new Date().toISOString(), receivedAt: new Date().toISOString() } as LiveMarket) } });
   resources.push({ db, monitor });
-  return { db, gateway, monitor, runtime, createOrder, base, reject: (value: boolean) => { reject = value; }, split: () => { split = true; },
+  return { db, gateway, monitor, runtime, createOrder, base, controlReads:()=>controlReads,
+    reject: (value: boolean) => { reject = value; }, split: () => { split = true; },
     venueAccount: (venue: string, values: Partial<GateCrossExAccount>) => { venueAccounts[venue] = values; } };
 }
 const order = { symbol: 'GATE_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', quantity: '5', price: '10' };
 describe('account admission at the real order boundary', () => {
+  it('does not publish rejected raw accounts to reduction evidence consumers',async()=>{
+    const h=await harness(), observed=vi.spyOn(MarginReductionEvidence.prototype,'refresh');
+    try {
+      await h.monitor.refresh();await Promise.resolve();
+      const accepted=h.base.update_time;h.base.update_time=String(Number(accepted)+1);await h.monitor.refresh();
+      const calls=observed.mock.calls.length;expect(calls).toBeGreaterThan(0);
+      h.base.update_time=String(Number(accepted)-1);await h.monitor.refresh();
+      expect(h.monitor.snapshot()).toMatchObject({fresh:false,reason:'margin_account_version_regressed'});
+      expect(observed).toHaveBeenCalledTimes(calls);
+      h.base.update_time=String(Number(accepted)+2);await h.monitor.refresh();expect(h.monitor.snapshot().fresh).toBe(true);
+    }finally{observed.mockRestore();}
+  });
   it.each(['one', 'all'])('keeps %s transient isolated-unit failures in read recovery instead of identity failure', async scope => {
     const h = await harness(); h.split(); await h.monitor.refresh();
     const query = h.gateway.queryAccount.bind(h.gateway);
@@ -114,6 +130,7 @@ describe('account admission at the real order boundary', () => {
   });
   it('queries split-exchange units separately without adding their ratios', async () => {
     const h = await harness(); h.split(); await h.monitor.refresh();
+    expect(h.controlReads()).toBe(1); // Only the aggregate probe uses the control slot; seven venue fallbacks stay ordinary.
     expect(h.monitor.snapshot().units).toHaveLength(7);
     expect(h.monitor.snapshot().units?.map(unit => unit.exchangeType)).not.toContain('LIGHTER'); // The authenticated client rejects this unsupported exchange type.
     expect(h.monitor.snapshot().metrics?.initialPct).toBe('120');

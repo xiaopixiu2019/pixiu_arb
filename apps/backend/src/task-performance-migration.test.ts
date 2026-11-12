@@ -24,7 +24,9 @@ it('upgrades retained evidence additively, preserves protection authority and re
     const store=new TaskPerformanceStore(db);store.save('key',[],100000,110000);store.save('key',[],120000,310000);
     const names=(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name").all() as {name:string}[]).map(r=>r.name);
     const rows=()=>Object.fromEntries(names.map(name=>[name,db!.prepare(`SELECT * FROM "${name}"`).all()]));
-    const before=rows();db.close();db=openDatabase(path,migrations);expect(readDatabaseStatus(db).migrationCount).toBe(34);expect(rows()).toEqual(before);
+    const before=rows();db.close();db=openDatabase(path,migrations);expect(readDatabaseStatus(db).migrationCount).toBe(35);expect(rows()).toEqual(before);
+    for(const name of ['router_order_context','router_order_evidence','router_retry_events','router_entry_retry'])
+      expect(db.prepare(`SELECT count(*) n FROM ${name}`).get()).toEqual({n:0});
     expect(new TaskPerformanceStore(db).knownThrough('key',100000)).toBe(100000);
     const projection=new TaskPerformanceProjection(db,'key','p');await projection.update(310000);
     expect(new TaskPerformanceStore(db).knownThrough('key',100000)).toBe(110000);

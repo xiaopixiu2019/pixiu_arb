@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type { MarginSnapshot } from '@gate-crossex/shared-types';
 import { RISK_FRESHNESS_MS } from './risk-presentation.js';
+import { riskEvidenceClock } from './risk-evidence-clock.js';
 
 export function riskExpiryDelay(sampledAt: number | null | undefined, renderedAt: number, effectAt: number): number | null {
   const expiresAt = (sampledAt ?? NaN) + RISK_FRESHNESS_MS + 1;
@@ -14,7 +15,8 @@ export function riskExpiryDelay(sampledAt: number | null | undefined, renderedAt
 /** Repaint at expiry; every render still evaluates freshness against the real current time. */
 export function useRiskClock(snapshot: MarginSnapshot | null | undefined): void {
   const [tick, setTick] = useState(0);
-  const renderedAt = Date.now();
+  const renderedAt = riskEvidenceClock.now(snapshot?.accountId);
+  const remainingAtRender = riskEvidenceClock.remaining(snapshot?.accountId, snapshot?.sampledAt);
   useEffect(() => {
     const redraw = () => setTick(value => value + 1);
     const interval = window.setInterval(redraw, 1000);
@@ -27,9 +29,14 @@ export function useRiskClock(snapshot: MarginSnapshot | null | undefined): void 
     };
   }, []);
   useEffect(() => {
-    const delay = riskExpiryDelay(snapshot?.sampledAt, renderedAt, Date.now());
+    const effectAt = riskEvidenceClock.now(snapshot?.accountId);
+    if (renderedAt === null || effectAt === null) return;
+    const remaining = riskEvidenceClock.remaining(snapshot?.accountId, snapshot?.sampledAt);
+    if (remaining === null) return;
+    const delay = remaining < 0 ? remainingAtRender !== null && remainingAtRender >= 0 ? 0 : null
+      : Math.min(remaining + 1, riskExpiryDelay(snapshot?.sampledAt, renderedAt, effectAt) ?? remaining + 1);
     if (delay === null) return;
     const timer = window.setTimeout(() => setTick(value => value + 1), delay);
     return () => window.clearTimeout(timer);
-  }, [snapshot?.accountId, snapshot?.sampledAt, tick, renderedAt]);
+  }, [snapshot?.accountId, snapshot?.sampledAt, tick, renderedAt, remainingAtRender]);
 }

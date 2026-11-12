@@ -8,6 +8,6 @@ export function marginReadFault(error: unknown): { reason: string; fatal: boolea
     return { reason: transient ? 'margin_read_unavailable' : 'margin_account_verification_failed', fatal: !transient };
   }
   const reason = error instanceof Error ? error.message : '';
-  if (['margin_read_timeout', 'margin_read_pending', 'margin_data_stale'].includes(reason)) return { reason, fatal: false };
+  if (['margin_read_timeout', 'margin_read_pending', 'margin_data_stale', 'margin_account_version_regressed'].includes(reason)) return { reason, fatal: false };
   return { reason: reason.startsWith('margin_') ? reason : 'margin_account_verification_failed', fatal: true };
 }

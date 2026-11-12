@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ContinuousProtectionResponseSchema, MarginSnapshotSchema, MarginPolicySchema, MarginRiskEventSchema, TelegramStatusSchema, type MarginPolicy } from '@gate-crossex/shared-types';
+import { recordRiskHttpTiming } from './risk-evidence-clock.js';
 
 async function read<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, signal: AbortSignal.timeout(15000),
@@ -23,7 +24,15 @@ export const riskApi = {
   modes: (symbols: string[]) => read(`/api/risk/margin/modes?symbols=${encodeURIComponent(symbols.join(','))}`,
     z.object({ profileId: z.string().nullable(), items: z.array(z.object({ symbol: z.string(), supportCross: z.boolean().nullable(),
       mode: z.enum(['CROSS', 'ISOLATED']).nullable(), checkedAt: z.number(), reason: z.string().nullable() })) })),
-  snapshot: () => read('/api/risk/margin', MarginSnapshotSchema),
+  clock: async () => {
+    const sent=performance.now();
+    const value=await read('/api/risk/margin/clock',z.object({accountId:z.string().nullable(),serverAt:z.number().finite()}));
+    return {...value,sent,received:performance.now()};
+  },
+  snapshot: async () => {
+    const sent = performance.now(), snapshot = await read('/api/risk/margin', MarginSnapshotSchema);
+    recordRiskHttpTiming(snapshot, sent, performance.now()); return snapshot;
+  },
   events: async (accountId: string, before?: number) => {
     const query = new URLSearchParams({ accountId }); if (before) query.set('before', String(before));
     const data = await read(`/api/risk/margin/events?${query}`, z.object({ accountId: z.string(), events: z.array(MarginRiskEventSchema), hasMore: z.boolean() }));

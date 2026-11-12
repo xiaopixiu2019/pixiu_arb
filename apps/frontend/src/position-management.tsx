@@ -55,11 +55,18 @@ export function ManagedPositionStatus({ strategy, language, tradingMode }: { str
   const number = (v: string | null, suffix = '') => v === null ? '—' : `${Number(v).toFixed(2)}${suffix}`;
   return <details className="managed-position-status"><summary>{state.reason === 'managed_account_rechecking'
     ? (zh ? '账户核实中 · 暂停新交易' : 'Rechecking account · new trades blocked')
+    : state.entryPreparation?.failures ? (state.entryPreparation.review
+      ? (zh ? '本任务暂停新增 · 保护按当前授权执行' : 'Task entry paused · protection follows current authority')
+      : (zh ? '建仓准备等待重试 · 持仓责任保留' : 'Entry preparation awaiting retry · holdings responsibility retained'))
+    : state.routerRetry?.review ? (zh ? '建仓路由繁忙 · 待人工复核' : 'Entry route unavailable · manual review')
+    : state.phase === 'OPENING' && state.routerRetry && state.routerRetry.nextAt > Date.now()
+    ? (zh ? '建仓路由繁忙 · 等待重试' : 'Entry route busy · waiting to retry')
     : tradingMode !== undefined && tradingMode !== 'live' && !['COMPLETED', 'STOPPED', 'TRANSFERRED'].includes(state.phase)
     ? (zh ? '等待恢复交易权限' : 'Awaiting live reactivation') : zh ? phases[state.phase] : state.phase}</summary>
     <span>{zh ? phases[state.phase] : state.phase}</span>
     <span>A {state.leftQuantity ?? '—'} / B {state.rightQuantity ?? '—'} {strategy.config.asset}</span>
     {state.adoptedLeft !== undefined && <span>{zh ? '接管' : 'Adopted'}: {state.adoptedLeft} / {state.adoptedRight} · {zh ? '本次成交' : 'Entry fills'}: {strategy.filledLeft} / {strategy.filledRight}</span>}
+    {state.remainingEntryQuantity && <span>{zh ? '原目标' : 'Original target'} {strategy.config.totalAmount} · {zh ? '已成交' : 'Filled'} {strategy.filledQuantity} · {zh ? '待明确继续' : 'Awaiting explicit continuation'} {state.remainingEntryQuantity}</span>}
     {state.phase === 'STOPPED' && <span>{zh ? '自动监控和退出已停止，仓位仍有市场风险。' : 'Monitoring and automatic exits are stopped; holdings remain exposed.'}</span>}
     {state.transferredTo && <span>{zh ? '当前任务' : 'Current task'}: {state.transferredTo}</span>}
     <span>{zh ? '未对冲' : 'Unhedged'}: {state.leftQuantity === null || state.rightQuantity === null ? '—' : Math.abs(Number(state.leftQuantity) - Number(state.rightQuantity))}</span>

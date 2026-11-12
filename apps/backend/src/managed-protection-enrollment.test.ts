@@ -10,6 +10,7 @@ import { readManagedState, writeManagedState, managedRiskReason } from './manage
 import { MarginRiskStore } from './margin-risk-store.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { ProtectionAuthority } from './protection-authority.js';
+import { failedPreparation, clearPreparationRecovery, preparationEntryBlock, PREPARATION_REVIEW, PREPARATION_WAIT, isPreparationTimeout } from './entry-preparation-recovery.js';
 import type { GateCrossExOrder, GateCrossExPosition, TradingCrossExGateway, CrossExOrderRequest } from './crossex-client.js';
 import type { LiveMarket } from './market-hub.js';
 
@@ -98,6 +99,77 @@ async function setup() {
 }
 
 describe('atomic launch enrollment into continuous protection', () => {
+  it('persists preparation backoff, deduplicates attempts and does not reset manual review on success callbacks', async () => {
+    const h=await setup(); await h.launch('retry'); const record=h.runtime.getStrategy('retry'), at=Date.now();
+    failedPreparation(h.db,record,'one',at); failedPreparation(h.db,record,'one',at);
+    expect(readManagedState(h.db,'retry')?.preparationRecovery).toMatchObject({failures:1,nextAt:at+4000});
+    expect(preparationEntryBlock(h.db,record,at+3999)).toBe(PREPARATION_WAIT);
+    expect(preparationEntryBlock(h.db,record,at+4000)).toBeNull();
+    for(let i=2;i<=5;i++)failedPreparation(h.db,record,String(i),at+i*70000);
+    expect(preparationEntryBlock(h.db,record,at+999999)).toBe(PREPARATION_REVIEW);
+    clearPreparationRecovery(h.db,record); expect(readManagedState(h.db,'retry')?.preparationRecovery?.failures).toBe(5);
+    expect(isPreparationTimeout('paired_entry_read_failed','{"kind":"timeout","stage":"catalog"}')).toBe(true);
+    expect(isPreparationTimeout('paired_entry_read_failed','{"kind":"authentication","stage":"catalog"}')).toBe(false);
+    expect(isPreparationTimeout('paired_entry_margin_mode_unverified','{"kind":"timeout","stage":"margin_mode","reason":"cross_margin_mode_isolated","actual":"ISOLATED"}')).toBe(false);
+    expect(isPreparationTimeout('paired_entry_read_failed','{"kind":"timeout","stage":"positions_orders"}')).toBe(false);
+  });
+  it('keeps balanced partial holdings protected and resumes the unfinished intent despite verified=true', async () => {
+    const h=await setup(), config={...h.config(),totalAmount:'10'};
+    await h.manager.reserve('partial',config,'profile');h.initialize('partial',config);await h.filled('partial',config,'3','3');
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='3',filled_left='3',filled_right='3',progress=30 WHERE id='partial'").run();
+    const record=h.runtime.getStrategy('partial');for(let i=0;i<5;i++)failedPreparation(h.db,record,String(i),Date.now()+i*70000);
+    h.manager.pauseEntryPreparation('partial');await h.ticks();
+    expect(h.session.current).toBe('live');expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.manager.protection.view().groups[0].state).toBe('WATCHING');
+    expect(readManagedState(h.db,'partial')).toMatchObject({verified:true,entryIntent:'OPENING',maxLeft:'3',maxRight:'3'});
+    expect(h.runtime.getStrategy('partial').management?.resumeAction).toBe('OPENING');
+    h.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)').run('unrelated risk',new Date().toISOString());
+    await expect(h.manager.resume('partial','profile','OPENING')).rejects.toMatchObject({code:'managed_global_risk_paused'});
+    expect(managedRiskReason(h.db)).toBe('unrelated risk');h.db.prepare('DELETE FROM managed_risk_lock').run();
+    const resumed=await h.manager.resume('partial','profile','OPENING');
+    expect(resumed).toMatchObject({id:'partial',filledQuantity:'3',config:{totalAmount:'10'},management:{phase:'OPENING'}});
+    expect(h.submitted).toHaveLength(2);expect(readManagedState(h.db,'partial')?.preparationRecovery).toBeUndefined();
+  });
+  it('verifies an empty preparation-paused task without completing or reopening it', async () => {
+    const h=await setup();await h.launch('empty');const record=h.runtime.getStrategy('empty');
+    for(let i=0;i<5;i++)failedPreparation(h.db,record,String(i),Date.now()+i*70000);
+    h.manager.pauseEntryPreparation('empty');await h.ticks();
+    expect(h.runtime.getStrategy('empty').status).toBe('PAUSED');
+    expect(h.manager.protection.view().groups[0]).toMatchObject({state:'WATCHING',reason:PREPARATION_REVIEW});
+    expect(h.submitted).toHaveLength(0);expect(managedRiskReason(h.db)).toBeNull();
+  });
+  it('does not classify a task with an unfinished order as a safe local preparation pause',async()=>{
+    const h=await setup(),config=await h.launch('unresolved');const leg=managedLegs(config)[0];
+    await h.runtime.createOrder({symbol:leg.symbol,side:leg.side,type:'MARKET',quantity:'1'},{strategyId:'unresolved',strategyLeg:'left'});
+    const record=h.runtime.getStrategy('unresolved');for(let i=0;i<5;i++)failedPreparation(h.db,record,String(i),Date.now()+i*70000);
+    h.manager.pauseEntryPreparation('unresolved');
+    expect(managedRiskReason(h.db)).toBe('managed_entry_preparation_scope_changed');expect(h.session.liveTradingEnabled).toBe(false);
+    expect(h.runtime.listOpenOrders('unresolved')).toHaveLength(1);
+  });
+  it('requires explicit continuation for legacy monitoring holdings and never infers it from deployment', async () => {
+    const h=await setup(),config={...h.config(),totalAmount:'10'};
+    await h.manager.reserve('legacy',config,'profile');h.initialize('legacy',config);await h.filled('legacy',config,'3','3');
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='3',filled_left='3',filled_right='3',progress=30 WHERE id='legacy'").run();
+    writeManagedState(h.db,'legacy',{...readManagedState(h.db,'legacy')!,phase:'MONITORING',entryIntent:undefined,verified:true,leftQuantity:'3',rightQuantity:'3',maxLeft:'3',maxRight:'3'});
+    expect(h.runtime.getStrategy('legacy').management).toMatchObject({resumeAction:'MONITORING',remainingEntryQuantity:'7'});
+    await expect(h.manager.resume('legacy','profile')).rejects.toMatchObject({code:'strategy_not_paused'});
+    expect(h.submitted).toHaveLength(2);
+    expect((await h.manager.resume('legacy','profile','OPENING')).management?.phase).toBe('OPENING');
+    expect(h.submitted).toHaveLength(2);
+  });
+  it('gives ordinary tasks an execution turn when local protection work exceeds one second', async () => {
+    const h=await setup(), first=await h.launch('paused');await h.filled('paused',first,'10','10');h.manager.handoff('paused','10');await h.manager.tick();
+    const second=await h.launch('running','ETH');await h.filled('running',second,'10','10');h.manager.handoff('running','10');await h.manager.tick();
+    h.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id='paused'").run();
+    writeManagedState(h.db,'paused',{...readManagedState(h.db,'paused')!,phase:'RISK_PAUSED'});
+    const protection=vi.spyOn(h.manager.protection,'run').mockImplementation(async()=>{vi.setSystemTime(Date.now()+1500);});
+    const before=readManagedState(h.db,'running')!.checkedAt;
+    await h.manager.tick();await h.manager.tick();
+    expect(protection).toHaveBeenCalled();expect(readManagedState(h.db,'running')!.checkedAt).not.toBe(before);
+    h.manager.requestExit('running');await h.manager.tick();
+    expect(h.submitted.some(o=>o.symbol.endsWith('_ETH_USDT')&&o.reduce_only==='true')).toBe(true);
+    expect(managedRiskReason(h.db)).toBeNull();
+  });
   it('rejects a mismatched launch profile as a conflict and releases its reservation', async () => {
     const h = await setup();
     await expect(h.manager.reserve('new', h.config(), 'other-profile')).rejects.toMatchObject({ code: 'protection_launch_permission_changed', statusCode: 409 });

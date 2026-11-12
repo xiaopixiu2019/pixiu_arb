@@ -461,6 +461,19 @@ describe('paired entry through the real order runtime', () => {
     await expect(h.runtime.preparePairedEntry('ORPHAN', h.config, 'account')).rejects.toMatchObject({ code: 'paired_entry_preparation_unavailable' });
     expect(readEntryBudget(h.db, 'ORPHAN')).toBeNull();
   });
+  it('ends preparation at the total deadline while retaining ownership of a delayed physical read',async()=>{
+    vi.useFakeTimers();const h=await harness();
+    let release!:(rows:Awaited<ReturnType<typeof h.reads.limits>>)=>void;
+    h.reads.limits.mockImplementationOnce(()=>new Promise(resolve=>{release=resolve;}));
+    let outcome:unknown;
+    const work=h.runtime.preparePairedEntry('DELAYED',h.config,'account').then(()=>{outcome='accepted';},error=>{outcome=error;});
+    try{
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(outcome).toMatchObject({code:'paired_entry_preparation_unavailable'});
+      expect(readEntryBudget(h.db,'DELAYED')).toBeNull();expect(h.writes).toEqual([]);
+    }finally{release([]);await work;}
+    expect(readEntryBudget(h.db,'DELAYED')).toBeNull();
+  });
   it('cleans a provisional approval on activation failure without deleting a real task budget', async () => {
     const h = await harness(); await h.runtime.preparePairedEntry('ORPHAN', h.config, 'account');
     expect(readEntryBudget(h.db, 'ORPHAN')).not.toBeNull(); h.runtime.abortPairedPreparation('ORPHAN');

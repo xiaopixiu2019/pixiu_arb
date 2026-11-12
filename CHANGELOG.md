@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.5
+
+- Give periodic margin-risk reads an independent bounded scheduler slot while preserving shared rate limits, so ordinary authenticated traffic cannot repeatedly starve account verification.
+- Reject regressed remote account versions and recover only through bounded, strictly advancing evidence; identity, position, order and hard-risk conflicts remain fail-closed.
+- Persist per-order router rejection evidence and bounded backoff; a fully verified zero-position route failure can pause only its task without stopping unrelated balanced groups.
+- Retry transient SQLite writer conflicts only before any remote side effect, and persist real hard pauses across normal shutdown.
+- Reconcile cancellation/fill races from exact order evidence; unknown writes are never replayed and confirmed fills cannot be overwritten by late failure responses.
+- Calibrate risk-page freshness against bounded server time, retain a valid clock through one noisy probe and preserve the five-second expiry boundary.
+
 ## 1.0.4
 
 - Keep displayed, confirmed and submitted leverage aligned with the selected account and contract; uncertain writes are reconciled by reads and never replayed automatically.

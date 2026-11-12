@@ -3,6 +3,7 @@ import { Decimal } from 'decimal.js';
 import type { ManagedState } from './managed-position-store.js';
 import { TradingRuntimeError, type StrategyRecord } from './trading-runtime.js';
 import type { ManagedLeg } from './managed-position-model.js';
+import { managedLegs } from './managed-legs.js';
 
 export type ManagedResumeAction = 'OPENING' | 'MONITORING' | 'EXITING';
 
@@ -10,13 +11,26 @@ export type ManagedResumeAction = 'OPENING' | 'MONITORING' | 'EXITING';
 export function managedResumeAction(record: StrategyRecord, state: ManagedState): ManagedResumeAction {
   if (state.stopIntent === 'KEEP') return 'MONITORING';
   if (state.exitRequested || state.stopIntent === 'EXIT') return 'EXITING';
-  if (state.verified) return 'MONITORING';
+  if (state.entryIntent === 'MONITORING' || state.protectionIncident || state.marginBatch || state.pauseAfterProtection) return 'MONITORING';
+  if (state.verified && state.entryIntent !== 'OPENING') return 'MONITORING';
   const filled = Decimal.min(record.filledLeft, record.filledRight);
   return filled.gte(record.config.totalAmount ?? '0') ? 'MONITORING' : 'OPENING';
 }
 
-export function managedResumeView(record: StrategyRecord, state: ManagedState | undefined) {
-  return state ? { ...state, resumeAction: managedResumeAction(record, state) } : undefined;
+export function canContinueEntry(db: Database.Database, record: StrategyRecord, state: ManagedState): boolean {
+  if (record.status !== 'RUNNING' || state.phase !== 'MONITORING' || state.entryIntent === 'MONITORING'
+    || state.stopIntent || state.exitRequested || state.openingQuantity !== '0'
+    || state.leftQuantity === null || state.rightQuantity === null
+    || new Decimal(record.filledQuantity).gte(record.config.totalAmount ?? '0')
+    || db.prepare("SELECT 1 FROM execution_strategy_logs WHERE strategy_id=? AND event='Stop requested' LIMIT 1").get(record.id)) return false;
+  try { verifyResumableEntry(db, record, state, [state.leftQuantity, state.rightQuantity], managedLegs(record.config)); return true; }
+  catch { return false; }
+}
+export function managedResumeView(record: StrategyRecord, state: ManagedState | undefined, db?: Database.Database) {
+  return state ? { ...state, resumeAction: managedResumeAction(record, state),
+    ...(state.preparationRecovery ? { entryPreparation: { failures: state.preparationRecovery.failures,
+      nextAt: state.preparationRecovery.nextAt, review: state.preparationRecovery.review } } : {}),
+    ...(db && canContinueEntry(db, record, state) ? { remainingEntryQuantity: new Decimal(record.config.totalAmount!).minus(record.filledQuantity).toString() } : {}) } : undefined;
 }
 
 /** An interrupted entry may continue only from fully explained, balanced holdings. */

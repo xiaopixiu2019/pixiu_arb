@@ -1,4 +1,5 @@
 import { MarginPolicySchema, type MarginPolicy, type MarginSnapshot } from '@gate-crossex/shared-types';
+import { riskEvidenceClock } from './risk-evidence-clock.js';
 
 export const riskKinds = ['initial', 'maintenance'] as const;
 export const riskLevels = ['warn', 'reduce', 'recover'] as const;
@@ -24,9 +25,9 @@ export function policyContent(policy: MarginPolicy): string {
 }
 export function samePolicy(a: MarginPolicy, b: MarginPolicy): boolean { return a.revision === b.revision && policyContent(a) === policyContent(b); }
 
-export function olderRiskSnapshot(next: MarginSnapshot, current: MarginSnapshot): boolean {
+export function olderRiskSnapshot(next: MarginSnapshot, current: MarginSnapshot, serverNow = riskEvidenceClock.now(current.accountId)): boolean {
   return next.policy.revision < current.policy.revision || next.policy.revision === current.policy.revision
-    && (current.sampledAt ?? -Infinity) <= Date.now()
+    && (serverNow === null || (current.sampledAt ?? -Infinity) <= serverNow)
     && (next.sampledAt ?? -Infinity) < (current.sampledAt ?? -Infinity);
 }
 

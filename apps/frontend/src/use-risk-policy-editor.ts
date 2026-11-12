@@ -60,7 +60,7 @@ function useEditorSave(editor: Editor | null, ready: boolean, active: Flag, pend
     const target = editor.confirmed, before = latest.current, accountId = before.accountId;
     pending.current = true; set(old => old ? { ...old, attempted: target, phase: 'saving' } : old);
     const authorize = () => {
-      if (!active.current || latest.current.accountId !== accountId || !riskFresh(latest.current, Date.now()) || newer(editor.base, latest.current.policy)) throw new Error('margin_policy_conflict');
+      if (!active.current || latest.current.accountId !== accountId || !riskFresh(latest.current) || newer(editor.base, latest.current.policy)) throw new Error('margin_policy_conflict');
     };
     try {
       authorize(); const next = await riskApi.save(target, accountId, authorize);
@@ -88,7 +88,7 @@ function useEditorReconcile(editor: Editor | null, active: Flag, pending: Flag, 
     try {
       const next = await riskApi.snapshot();
       if (!active.current) return;
-      if (next.accountId !== accountId || !riskFresh(next, Date.now())) throw new Error('unverified');
+      if (next.accountId !== accountId || !riskFresh(next)) throw new Error('unverified');
       if (supersededRiskReply(next, latest.current, before)) throw new Error('obsolete_response');
       onSaved(next);
       const matches = editor.attempted && policyContent(next.policy) === policyContent(editor.attempted) && next.policy.revision > editor.base.revision;

@@ -1,12 +1,19 @@
 import type { MarginSnapshot } from '@gate-crossex/shared-types';
 import { managedReasonMessage } from './strategy-error-message.js';
+import { riskEvidenceClock } from './risk-evidence-clock.js';
 
 export const riskAmount = (value: string | number | null | undefined) => value == null || String(value).trim() === '' || !Number.isFinite(Number(value))
   ? '—' : Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
 export const riskTime = (value: number | null | undefined) => value != null && Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString() : '—';
 export const RISK_FRESHNESS_MS = 5000;
-export const riskFresh = (s: MarginSnapshot | null, now: number) => Boolean(s?.fresh && s.accountId && s.metrics && s.status !== 'unavailable'
-  && s.sampledAt != null && now >= s.sampledAt && now - s.sampledAt <= RISK_FRESHNESS_MS);
+export function riskFresh(s: MarginSnapshot | null, serverNow?: number | null): boolean {
+  const now = serverNow === undefined ? riskEvidenceClock.now(s?.accountId) : serverNow;
+  const remaining = serverNow === undefined ? riskEvidenceClock.remaining(s?.accountId, s?.sampledAt)
+    : now != null && s?.sampledAt != null ? RISK_FRESHNESS_MS - (now - s.sampledAt) : null;
+  return Boolean(s?.fresh && s.accountId && s.metrics && s.status !== 'unavailable'
+    && s.ageMs != null && s.ageMs >= 0 && s.ageMs <= RISK_FRESHNESS_MS
+    && s.sampledAt != null && now !== null && now >= s.sampledAt && remaining !== null && remaining >= 0);
+}
 type Copy = { title: string; action: string; label: string; tone: 'green' | 'amber' | 'red' | 'neutral' };
 const events: Record<string, [string, string, string, string, string, string, Copy['tone']]> = {
   clear: ['本次检查未触发预警', '没有触发保证金规则；不代表没有风险。', '普通检查', 'No alert at this check', 'No margin rule was triggered. This is not a safety guarantee.', 'Routine', 'neutral'],
