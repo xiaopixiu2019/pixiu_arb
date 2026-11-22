@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DeploymentFenceStore } from './deployment-fence-store.js';
@@ -7,12 +7,27 @@ import { CredentialOperationGate } from './credential-operation-gate.js';
 
 const folders: string[] = [];
 afterEach(() => { for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true }); });
-function store() {
-  const folder = mkdtempSync(join(tmpdir(), 'deployment-handoff-')); folders.push(folder);
+function store(tempRoot = tmpdir()) {
+  const folder = mkdtempSync(join(tempRoot, 'deployment-handoff-')); folders.push(folder);
   return new DeploymentFenceStore(join(folder, 'maintenance.json'));
 }
 
 describe('durable deployment admission', () => {
+  it.runIf(process.platform === 'darwin')('persists a maintenance record through the standard macOS temp alias', () => {
+    const disk = store('/tmp');
+    disk.save(null);
+    expect(disk.load()).toBeNull();
+  });
+
+  it('refuses a linked directory underneath an otherwise valid data path', () => {
+    const link = join(store().path, '..', 'linked');
+    const target = join(store().path, '..');
+    symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const disk = new DeploymentFenceStore(join(link, 'maintenance.json'));
+    expect(() => disk.load()).toThrow('deployment_store_link_forbidden');
+    expect(() => disk.save(null)).toThrow('deployment_store_link_forbidden');
+  });
+
   it('retains the in-memory fence if persistence reports an uncertain failure', async () => {
     const disk = store(), gate = new CredentialOperationGate(disk);
     vi.spyOn(disk, 'save').mockImplementation(() => { throw new Error('fsync uncertain'); });

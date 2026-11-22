@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -25,7 +25,11 @@ export class DeploymentFenceStore {
   private checkPath(): void {
     let current = this.path;
     for (;;) {
-      if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw new Error('deployment_store_link_forbidden');
+      if (lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        const systemAlias = process.platform === 'darwin' && (current === '/tmp' || current === '/var')
+          && realpathSync(current) === `/private${current}`;
+        if (!systemAlias) throw new Error('deployment_store_link_forbidden');
+      }
       const parent = dirname(current);
       if (parent === current) break;
       current = parent;
