@@ -3,6 +3,7 @@
 | Topic | Current reference |
 | --- | --- |
 | Installation, update and recovery | [Deployment](deployment.md) |
+| Windows SSH client and automatic reconnect | [Windows SSH connector](windows-ssh-client.md) |
 | Trading and data safety | [Safety](safety.md), [Threat model](threat-model.md) |
 | Local development and verification | [Local development](local-development.md) |
 | Architecture and local APIs | [Architecture](architecture.md), [Integration](integration.md) |
