@@ -16,7 +16,7 @@ export class ReferenceQuotesService {
   private readonly bulk = new Map<FundingStatVenue, Cached<VenueFundingStat[]>>();
   private readonly books = new Map<string, Cached<ReferenceQuote>>();
   private active = 0;
-  private readonly nativeBudget = new Map<string, { startedAt: number; calls: number }>();
+  private readonly targetedBudget = new Map<string, { startedAt: number; calls: number }>();
   private readonly waiters: Array<() => void> = [];
 
   constructor(private readonly gateway: PublicMarketDataGateway, private readonly now = Date.now) {}
@@ -49,14 +49,18 @@ export class ReferenceQuotesService {
     return next.value;
   }
 
-  private nativeBook(symbol: string, venue: string) {
+  private targetedBook(symbol: string, venue: string) {
     return this.bounded(() => {
       const now = this.now();
-      const previous = this.nativeBudget.get(venue);
+      const previous = this.targetedBudget.get(venue);
       const budget = previous && now - previous.startedAt < 60_000 ? previous : { startedAt: now, calls: 0 };
-      this.nativeBudget.set(venue, budget);
+      this.targetedBudget.set(venue, budget);
       if (budget.calls >= 300) throw new Error('REFERENCE_QUOTE_BUSY');
       budget.calls += 1;
+      if (venue === 'GATE' || venue === 'OKX') return this.gateway.querySnapshot(symbol).then(snapshot => ({
+        bidPrice: snapshot.bidPrice ?? undefined, askPrice: snapshot.askPrice ?? undefined,
+        bookObservedAt: snapshot.sourceTimestamp,
+      }));
       return this.gateway.queryReferenceBook?.(symbol) ?? Promise.reject(new Error('UNSUPPORTED'));
     });
   }
@@ -69,22 +73,16 @@ export class ReferenceQuotesService {
   }
 
   private async bulkBook(venue: FundingStatVenue, base: string, quote: string) {
-    try { return (await this.bulkRows(venue)).find((row) => row.venue === venue && row.base === base && row.quote === quote); }
-    catch (error) {
-      // Binance's funding-feed failure cannot suppress its independent public depth read.
-      if (venue === 'BINANCE' && this.gateway.queryReferenceBook) return undefined;
-      throw error;
-    }
+    return (await this.bulkRows(venue)).find((row) => row.venue === venue && row.base === base && row.quote === quote);
   }
 
   private async load(symbol: string): Promise<ReferenceQuote> {
     const stamp = () => new Date(this.now()).toISOString();
     const [, venue, base, quote] = /^(\w+)_FUTURE_([A-Z0-9]+)_([A-Z0-9]+)$/.exec(symbol)!;
     try {
-      let book = venue === 'HYPERLIQUID'
-        ? await this.nativeBook(symbol, venue)
+      const book = ['BINANCE', 'GATE', 'OKX', 'HYPERLIQUID'].includes(venue)
+        ? await this.targetedBook(symbol, venue)
         : await this.bulkBook(venue as FundingStatVenue, base, quote);
-      if (venue === 'BINANCE' && !this.validBook(book) && this.gateway.queryReferenceBook) book = await this.nativeBook(symbol, venue);
       if (!this.validBook(book)) {
         return { symbol, status: 'unavailable', reason: 'missing_book', fetchedAt: stamp() };
       }

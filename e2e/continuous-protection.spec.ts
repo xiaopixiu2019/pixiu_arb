@@ -25,7 +25,9 @@ test('continuous protection requires explicit scoped confirmation and shows paus
       reason: null, readiness: { status: 'ready', reason: null, maxBatchQuantity: '1', checkedAt: Date.now() } }],
   });
   await page.route('**/api/risk/margin', r => r.fulfill({ json: snapshot() }));
-  await page.routeWebSocket('**/ws/stream', socket => { stream = socket; socket.send(JSON.stringify({ type: 'risk.margin', payload: snapshot() })); });
+  await page.routeWebSocket('**/ws/stream', socket => { stream = socket;
+    socket.send(JSON.stringify({ type: 'mode.update', payload: { mode: 'protect_only' } }));
+    socket.send(JSON.stringify({ type: 'risk.margin', payload: snapshot() })); });
   await page.route('**/api/risk/protection', r => {
     if (r.request().method() === 'PUT') {
       const input = r.request().postDataJSON(); writes.push(input);
@@ -72,7 +74,9 @@ test('completion frames update protection without refresh, writes or renewing ex
       availableMargin: '1400', initialHeadroom: '1300', maintenanceHeadroom: '2100', accountMode: 'CROSS_EXCHANGE',
       exchangeType: 'CROSSEX', remoteUpdatedAt: String(at), assets: [] } });
   let stream: WebSocketRoute | undefined;
-  await page.routeWebSocket('**/ws/stream', ws => { stream = ws; ws.send(JSON.stringify({ type: 'risk.margin', payload: current })); });
+  await page.routeWebSocket('**/ws/stream', ws => { stream = ws;
+    ws.send(JSON.stringify({ type: 'mode.update', payload: { mode: 'protect_only' } }));
+    ws.send(JSON.stringify({ type: 'risk.margin', payload: current })); });
   await page.route('**/api/risk/margin/clock',r=>r.fulfill({json:{accountId:current.accountId,serverAt:current.sampledAt!+current.ageMs!}}));
   await page.route('**/api/risk/margin', r => r.fulfill({ json: current }));
   await page.route('**/api/risk/margin/events*', r => r.fulfill({ json: { accountId: current.accountId, events: [], hasMore: false } }));

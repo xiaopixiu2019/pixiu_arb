@@ -12,6 +12,7 @@ export interface FinancialReadScope { taskIds: string[]; symbols: string[] }
 export interface FinancialTaskRow { id: string; status: string; created_at: string; stopped_at: string | null; config_json: string;
   state_json: string | null; filled_left: string; filled_right: string; open_position: string }
 interface OrderProof { strategy_id: string | null; credential_profile_id: string | null; created_at: string; fee_phase: string | null; strategy_leg: string | null; client_order_id: string; symbol: string; executed_quantity: string; order_created_at: string }
+const RATE_HEARTBEAT_MS = 60_000;
 export class TransactionFeeStore {
   constructor(readonly db: Database.Database, readonly scope?: FinancialReadScope,
     private readonly onRateRead?: (coin: string, at: number, rate: string | null) => void) {}
@@ -31,6 +32,9 @@ export class TransactionFeeStore {
   }
   rates(key: string, at: number, rates: Record<string, string>): void {
     const payload = JSON.stringify(Object.fromEntries(Object.entries(rates).sort(([a], [b]) => a.localeCompare(b))));
+    const latest = this.db.prepare('SELECT at,payload FROM fee_rates WHERE account_key=? AND at<=? ORDER BY at DESC LIMIT 1')
+      .get(key, at) as { at: number; payload: string } | undefined;
+    if (latest?.payload === payload && at - latest.at < RATE_HEARTBEAT_MS) return;
     this.db.prepare(`INSERT INTO fee_rates VALUES (?,?,?) ON CONFLICT(account_key,at) DO UPDATE SET payload=excluded.payload
       WHERE payload IS NOT excluded.payload`).run(key, at, payload);
   }

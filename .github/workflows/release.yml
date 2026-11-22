@@ -53,11 +53,12 @@ jobs:
         run: |
           git archive --format=tar.gz --prefix="pixiu-arb-${SOURCE_TAG}/" --output="pixiu-arb-${SOURCE_TAG}.tar.gz" "$GITHUB_SHA"
           sha256sum "pixiu-arb-${SOURCE_TAG}.tar.gz" > SHA256SUMS
-          cat > RELEASE_NOTES.md <<'NOTES'
-          Source and deployment documentation only. No precompiled installers are included.
-          The source archive corresponds to the verified public tag and commit.
-          Follow README.md and docs/deployment.md. Trading starts unset; preserve data and unresolved responsibility when upgrading.
-          NOTES
+          awk -v version="${SOURCE_TAG#v}" '
+            $0 == "## " version { in_release = 1; found = 1 }
+            in_release && /^## / && $0 != "## " version { exit }
+            in_release { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > RELEASE_NOTES.md
       - name: Publish the verified source archive
         env:
           GH_TOKEN: ${{ github.token }}

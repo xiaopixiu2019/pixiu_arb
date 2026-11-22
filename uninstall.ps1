@@ -18,6 +18,27 @@ function Get-Setting([string]$Name, [string]$Default) {
     return $Value
 }
 
+function Assert-OwnedTask([string]$InstallRoot, [string]$InstalledTaskName) {
+    $Tasks = @(Get-ScheduledTask -TaskName $InstalledTaskName -ErrorAction SilentlyContinue)
+    if ($Tasks.Count -eq 0) { return }
+    $ExpectedRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+    $ExpectedPowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $ExpectedArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + (Join-Path $ExpectedRoot 'bin\service.ps1') + '"'
+    $Owned = $false
+    try {
+        $Task = $Tasks[0]
+        $Owner = [string]$Task.Principal.UserId
+        $Sid = if ($Owner.StartsWith('S-1-')) { $Owner } else { ([Security.Principal.NTAccount]$Owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+        $Actions = @($Task.Actions)
+        $Owned = $Tasks.Count -eq 1 -and $Task.TaskPath -eq '\' -and $Actions.Count -eq 1 -and
+            $Sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -and
+            [IO.Path]::GetFullPath([string]$Actions[0].Execute) -ieq $ExpectedPowerShell -and
+            [IO.Path]::GetFullPath([string]$Actions[0].WorkingDirectory).TrimEnd('\') -ieq $ExpectedRoot -and
+            [string]$Actions[0].Arguments -ceq $ExpectedArguments
+    } catch { $Owned = $false }
+    if (-not $Owned) { throw "Scheduled task $InstalledTaskName belongs to another installation or user; nothing was changed." }
+}
+
 function Test-OwnedBackend([string]$InstallRoot) {
     $LockPath = Join-Path $InstallRoot 'data\backend.lock'
     if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { return $null }
@@ -74,6 +95,7 @@ if ([string]::IsNullOrWhiteSpace($ShortcutOverride)) {
 }
 
 if (-not $SkipService) {
+    Assert-OwnedTask $Root $TaskName
     if ($null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
         Write-Host 'Stopping Gate CrossEx safely...'
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -86,6 +108,7 @@ if (-not $SkipService) {
         throw 'The backend is still shutting down; no files were removed.'
     }
     if ($null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        Assert-OwnedTask $Root $TaskName
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
 }

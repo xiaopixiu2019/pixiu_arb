@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+/** Bump only when an unchanged migration ledger can no longer be opened safely by the prior runtime. */
+export const DATABASE_RUNTIME_VERSION = 2;
+
 export interface DatabaseStatus {
   state: 'ok' | 'error';
   migrationCount: number;

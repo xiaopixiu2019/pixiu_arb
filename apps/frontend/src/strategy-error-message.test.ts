@@ -31,14 +31,22 @@ describe('actionable strategy rejection messages', () => {
   it('uses the same explanation for persisted protective failures', () => {
     expect(managedReasonMessage(`managed_market_data_unavailable:${JSON.stringify({ symbol, quantity: '20' })}`, 'zh')).toContain('不会因此扩大减仓数量');
   });
-  it('does not describe missing funding evidence as a minimum-notional rejection', () => {
+  it('does not invent a funding outage or timer reset from a bare execution quote failure', () => {
     const text = managedReasonMessage('managed_market_data_unavailable', 'zh');
-    expect(text).toContain('资金费率'); expect(text).toContain('计时已重置'); expect(text).not.toContain('最低');
+    expect(text).toContain('执行行情'); expect(text).toContain('风险锁');
+    expect(text).not.toContain('资金费率'); expect(text).not.toContain('计时已重置'); expect(text).not.toContain('最低');
+    const english = managedReasonMessage('managed_market_data_unavailable', 'en');
+    expect(english).toContain('risk locks'); expect(english).not.toContain('funding'); expect(english).not.toContain('reset');
   });
   it('shows the failed leg and separate quote/funding recovery status', () => {
     expect(managedReasonMessage(`managed_quote_unavailable:${symbol}`, 'zh')).toContain('Kraken CRO');
     expect(managedReasonMessage(`managed_quote_unavailable:${symbol}`, 'zh')).toContain('正在重连');
     expect(managedReasonMessage(`managed_funding_unavailable:${symbol}`, 'zh')).toContain('正在重取');
+  });
+  it('distinguishes bounded pairing recovery from a manual risk pause', () => {
+    const text = managedReasonMessage('managed_pairing_quote_rechecking', 'zh');
+    expect(text).toContain('减仓配对行情正在恢复'); expect(text).toContain('新增交易暂时冻结');
+    expect(text).not.toContain('人工复核');
   });
   it('handles old labels, malformed details and unrelated errors without changing their meaning', () => {
     expect(strategyErrorMessage({ code: 'managed_market_data_unavailable', label: '{invalid' }, 'en')).toContain('Selected market');

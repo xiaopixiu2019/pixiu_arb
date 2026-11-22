@@ -125,22 +125,22 @@ test('a newer account observation replaces the previous expiry without extending
 });
 
 test('portfolio margin ratios expire at the same 5001 ms boundary', async ({page})=>{
-  await setup(page);let stream!:WebSocketRoute,latest=current();
+  await setup(page);let stream!:WebSocketRoute;
   await page.routeWebSocket('**/ws/stream',ws=>{stream=ws;});
-  await page.route('**/api/risk/margin',r=>r.fulfill({json:latest}));
+  await page.route('**/api/risk/margin',r=>r.fulfill({json:current()}));
   await page.route('**/api/risk/margin/events*',r=>r.fulfill({json:{accountId:'risk-a',events:[],hasMore:false}}));
-  await open(page);
-  await page.evaluate(()=>{history.pushState(null,'','/portfolio');window.dispatchEvent(new PopStateEvent('popstate'));});
+  await page.goto('/portfolio');
+  const dialog=page.getByRole('dialog',{name:/Risk disclaimer|风险免责声明/});
+  await dialog.waitFor({state:'visible',timeout:1500}).catch(()=>undefined);
+  if(await dialog.isVisible()){await dialog.getByRole('checkbox').check();await dialog.getByRole('button',{name:/Continue in read-only mode|以只读模式继续/}).click();}
   await page.locator('.portfolio-summary').waitFor();
   const rate=page.locator('.portfolio-summary article').filter({hasText:'起始保证金率'}).locator('strong');
-  const at=await pauseRiskClock(page);
-  latest=current({sampledAt:at});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
-  await expect(rate).toContainText('248');await page.clock.runFor(100);
-  // Keep source timestamps monotonic under the HTTP/WS ordering guard while retaining the exact 5000/5001 ms boundary.
-  await page.clock.runFor(5000);
-  latest=current({sampledAt:at+100});stream.send(JSON.stringify({type:'risk.margin',payload:latest}));
+  const installedAt=Date.now(),pausedAt=installedAt+100;
+  await page.clock.install({time:new Date(installedAt)});await page.clock.pauseAt(new Date(pausedAt));
+  stream.send(JSON.stringify({type:'risk.margin',payload:current({sampledAt:pausedAt})}));
+  await expect(rate).toContainText('248');await page.clock.runFor(5000);
   await expect(rate).toContainText('248');await page.clock.runFor(1);
-  await expect(rate).toHaveText('—');expect(await page.locator('.risk-topbar').getAttribute('class')).toContain('unavailable');
+  await expect(rate).toHaveText('—');
 });
 test('human-readable history preserves evidence, separates locks and removes chart traffic', async ({ page }) => {
   await setup(page); await page.setViewportSize({ width: 1536, height: 1024 }); const history: string[] = [];

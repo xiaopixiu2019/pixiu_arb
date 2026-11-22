@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { trackRuntimeMutation } from './runtime-mutation-ledger.js';
 import { assertCancellationIdentity, confirmedOrderTerminal, reconcileMissingCancellation, TERMINAL_ORDER_STATES } from './cancellation-proof.js';
 import { RequestNotDispatchedError } from './authenticated-scheduler.js';
 import { advanceOrderFromFills } from './execution-fill-progress.js';
@@ -181,9 +182,10 @@ function orderFromRow(row: OrderRow): ExecutionOrder {
 }
 
 function strategyFromRow(row: StrategyRow): StrategyRecord {
+  const stored = CreateStrategyInputSchema.parse(JSON.parse(row.config_json));
   return { id: row.id, kind: row.kind, status: row.status,
     accountProfileId: row.credential_profile_id, accountLabel: row.credential_profile_label,
-    config: CreateStrategyInputSchema.parse(JSON.parse(row.config_json)), progress: row.progress,
+    config: stored.management?.monitorOnly ? { ...stored, totalAmount: '0' } : stored, progress: row.progress,
     filledQuantity: row.filled_quantity, filledLeft: row.filled_left, filledRight: row.filled_right,
     openPosition: row.open_position, realizedPnl: '0',
     createdAt: row.created_at, updatedAt: row.updated_at, stoppedAt: row.stopped_at };
@@ -257,6 +259,8 @@ export interface PlaceOrderMetadata {
   beforeDispatch?: (localOrderId: string) => void;
   /** Internal proof recomputed from exact owned fills; never supplied by an HTTP order body. */
   confirmedPairing?: (excludeOrderId?: string) => boolean;
+  /** A fresh recovery-turn capability; ordinary fill proof cannot bypass an account hold. */
+  recoveryPairing?: (excludeOrderId?: string) => boolean;
 }
 
 export interface TradingRuntimeOptions {
@@ -333,6 +337,8 @@ export class TradingRuntime {
 
   subscribe(listener: RuntimeListener): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
 
+  runApplicationTurn<T>(work: () => Promise<T>): Promise<T> { return this.runAuthenticatedWrite(work); }
+
   onFill(listener: (fill: RecordedFill) => void): () => void {
     this.fillListeners.add(listener);
     return () => this.fillListeners.delete(listener);
@@ -362,6 +368,10 @@ export class TradingRuntime {
    * between this check and the actual entry.
    */
   async prepareStrategyMargin(legs: StrategyMarginLeg[], authorize?: () => void): Promise<StrategyMarginPreflight> {
+    return this.runAuthenticatedWrite(() => this.prepareStrategyMarginWrite(legs, authorize));
+  }
+
+  private async prepareStrategyMarginWrite(legs: StrategyMarginLeg[], authorize?: () => void): Promise<StrategyMarginPreflight> {
     if (this.marginAdmission) for (const leg of legs) await this.marginAdmission({ symbol: leg.symbol, quantity: leg.estimatedQuantity, price: leg.estimatedPrice }, true);
     if (!this.session.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
     const credentials = await this.vault.get(DEFAULT_CREDENTIAL_PROFILE);
@@ -505,7 +515,8 @@ export class TradingRuntime {
         if (riskBlock) throw new TradingRuntimeError(riskBlock, 409);
         if (!this.session.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
         authorize?.();
-        await tradingGateway.setLeverage(credentials, leg.symbol, leg.leverage);
+        await trackRuntimeMutation(this.database, { kind: 'leverage', symbol: leg.symbol, leverage: leg.leverage },
+          () => tradingGateway.setLeverage!(credentials, leg.symbol, leg.leverage), credentials);
       }
     } catch (error) {
       if (error instanceof GateApiError && error.statusCode === 429) {
@@ -564,6 +575,13 @@ export class TradingRuntime {
   listOrders(limit = 100): ExecutionOrder[] {
     const rows = this.statement("SELECT * FROM execution_orders WHERE environment = 'live' ORDER BY created_at DESC LIMIT ?").all(limit) as OrderRow[];
     return rows.map(orderFromRow);
+  }
+
+  deploymentUnresolvedWriteCount(): number {
+    const row = this.statement(`SELECT COUNT(*) AS count FROM execution_orders
+      WHERE environment = 'live'
+        AND state IN ('PENDING_SUBMIT', 'PENDING_CANCEL', 'REMOTE_NOT_FOUND')`).get() as { count: number };
+    return row.count;
   }
 
   listOpenOrders(strategyId?: string): ExecutionOrder[] {
@@ -881,8 +899,9 @@ export class TradingRuntime {
     };
     const confirmedPairing = (exclude?: string) => metadata?.confirmedPairing?.(exclude)
       ?? (input.type === 'MARKET' && !!metadata && this.pairedEntry?.assertOrder(input, metadata, exclude) === true);
-    const managedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
-    if (managedBlock) throw new TradingRuntimeError(managedBlock, 409);
+    const recoveryPairing = (exclude?: string) => metadata?.recoveryPairing?.(exclude) === true;
+    const managedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(), recoveryPairing());
+    if (managedBlock) throw new TradingRuntimeError(managedBlock, 409, undefined, true, metadata?.strategyId);
     if (!input.reduceOnly && metadata?.strategyId) {
       const block = routerEntryBlock(this.database, this.getStrategy(metadata.strategyId));
       if (block) throw new TradingRuntimeError(block, 409);
@@ -935,8 +954,8 @@ export class TradingRuntime {
     }
     // Recheck after credential/preflight awaits: a manager may have claimed this symbol or
     // raised a global risk lock while the ordinary order was preparing.
-    const finalManagedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing());
-    if (finalManagedBlock) throw new TradingRuntimeError(finalManagedBlock, 409);
+    const finalManagedBlock = protection() ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(), recoveryPairing());
+    if (finalManagedBlock) throw new TradingRuntimeError(finalManagedBlock, 409, undefined, true, metadata?.strategyId);
     if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection()) throw new TradingRuntimeError('live_trading_locked', 403);
     let releaseAdmission: void | (() => void) = undefined;
     const pairedAdmission = metadata ? this.pairedEntry?.assertOrder(input, metadata) === true : false;
@@ -977,7 +996,7 @@ export class TradingRuntime {
     let accepted;
     try {
       accepted = await tradingGateway.createOrder(credentials, gateInput, () => {
-        const block = protection(id) ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(id));
+        const block = protection(id) ? null : managedOrderBlock(this.database, input.symbol, metadata?.strategyId, input.reduceOnly, confirmedPairing(id), recoveryPairing(id));
         if (block) throw new TradingRuntimeError(block, 409);
         if (!this.session.liveTradingEnabled && !metadata?.riskReducing && !protection(id)) throw new TradingRuntimeError('live_trading_locked', 403);
         metadata?.beforeDispatch?.(id);
@@ -1002,7 +1021,8 @@ export class TradingRuntime {
       if (error instanceof RequestNotDispatchedError) recordNoDispatch(this.database, this.getOrder(id));
       this.emit({ type: 'execution.update', payload: this.getOrder(id) });
       this.notifyOrderListeners(this.getOrder(id));
-      if (error instanceof RequestNotDispatchedError) throw new TradingRuntimeError(error.reason, 409);
+      if (error instanceof RequestNotDispatchedError)
+        throw new TradingRuntimeError(error.reason, 409, undefined, true, metadata?.strategyId);
       throw error;
     }
     // A racing push may have already advanced the row via client_order_id — never regress it.
@@ -1048,6 +1068,10 @@ export class TradingRuntime {
   }
 
   async cancelOrder(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    return this.runAuthenticatedWrite(() => this.cancelOrderTracked(id, beforeDispatch));
+  }
+
+  private async cancelOrderTracked(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
     const inFlight = this.cancelRequests.get(id);
     if (inFlight) return inFlight;
     const cancellation = this.cancelOrderOnce(id, beforeDispatch).finally(() => {
@@ -1079,6 +1103,10 @@ export class TradingRuntime {
   }
 
   async retryConfirmedCancellation(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
+    return this.runAuthenticatedWrite(() => this.retryConfirmedCancellationTracked(id, beforeDispatch));
+  }
+
+  private async retryConfirmedCancellationTracked(id: string, beforeDispatch?: () => void): Promise<ExecutionOrder> {
     const inFlight = this.cancelRequests.get(id);
     if (inFlight) return inFlight;
     const retry = this.retryConfirmedCancellationOnce(id, beforeDispatch).finally(() => {
@@ -1404,6 +1432,8 @@ export class TradingRuntimeError extends Error {
     readonly code: string,
     readonly statusCode: number,
     readonly label?: string,
+    readonly notDispatched = false,
+    readonly strategyId?: string,
   ) {
     super(code);
     this.name = 'TradingRuntimeError';

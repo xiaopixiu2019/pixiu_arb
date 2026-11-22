@@ -46,6 +46,21 @@ export function entryLegUsage(leg: PairedEntryLeg, orders: EntryOrder[]) {
   if (filled.plus(pending).gt(leg.target)) throw new Error('paired_entry_quantity_exceeded');
   return { filled, pending, covered, outstanding: Decimal.max(0, new Decimal(leg.target).minus(covered)) };
 }
+
+/** A trim retires confirmed maker exposure without returning its original spending authority. */
+export function retiredMakerQuantity(leg: PairedEntryLeg, index: number, orders: EntryOrder[]): Decimal {
+  let total = new Decimal(0);
+  for (const order of orders.filter(row => row.reduce_only)) {
+    if (!['FILLED', 'CANCELLED', 'FAIL', 'REJECT'].includes(order.state)) throw new Error('paired_entry_unconfirmed_hedge');
+    if (order.symbol !== leg.symbol) continue;
+    const quantity = new Decimal(order.executed_quantity), requested = new Decimal(order.quantity);
+    if (order.strategy_leg !== (index === 0 ? 'left' : 'right') || order.side !== (leg.side === 'BUY' ? 'SELL' : 'BUY')
+      || !quantity.isFinite() || quantity.lt(0) || !requested.isFinite() || requested.lte(0) || quantity.gt(requested))
+      throw new Error('paired_entry_order_changed');
+    total = total.plus(quantity);
+  }
+  return total;
+}
 export function readEntryBudget(db: Database.Database, id: string): PairedEntryBudget | null {
   const row = db.prepare('SELECT payload_json FROM paired_entry_reservations WHERE strategy_id=?').get(id) as { payload_json: string } | undefined;
   return row ? PairedEntryBudgetSchema.parse(JSON.parse(row.payload_json)) : null;

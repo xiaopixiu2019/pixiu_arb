@@ -8,7 +8,10 @@ import type { ManagedLeg } from './managed-position-model.js';
 export function marginBatchFills(db: Database.Database, strategyId: string, batch: ManagedMarginBatch, excludeOrderId?: string) {
   if (batch.version !== 2 || !batch.id || batch.firstLeg === undefined) throw new Error('margin_legacy_batch_requires_review');
   const rows = db.prepare(`SELECT id, strategy_leg AS leg, state, executed_quantity AS filled, quantity,
-    remote_update_time AS remoteAt FROM execution_orders WHERE strategy_id = ? AND strategy_clip = ?`)
+    remote_update_time AS remoteAt FROM execution_orders WHERE strategy_id = ? AND strategy_clip = ?
+    AND NOT (state='FAIL' AND remote_order_id IS NULL AND executed_quantity='0' AND COALESCE(failure_reason,'')='ORDER_NOT_DISPATCHED'
+      AND NOT EXISTS (SELECT 1 FROM execution_fills f WHERE f.order_id=execution_orders.id)
+      AND EXISTS (SELECT 1 FROM router_order_evidence e WHERE e.order_id=execution_orders.id AND e.kind='not_dispatched' AND e.remote_id IS NULL))`)
     .all(strategyId, `margin:${batch.id}`) as Array<{ id: string; leg: string; state: string; filled: string; quantity: string; remoteAt: string | null }>;
   const included = rows.filter(row => row.id !== excludeOrderId);
   const filled: [Decimal, Decimal] = [new Decimal(0), new Decimal(0)];

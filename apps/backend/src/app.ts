@@ -1,6 +1,7 @@
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { ManagedCloseScopeSchema } from '@gate-crossex/shared-types';
 import { assertManagedCloseTarget, managedCloseTargets } from './managed-close-targets.js';
+import { ReplacementRequest } from './managed-replacement.js';
 import { ownedQuoteSymbols } from './owned-market-demand.js';
 import { NativeMarketData } from './native-market-data.js';
 import { ReferenceQuotesService } from './reference-quotes.js';
@@ -19,7 +20,7 @@ import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import type Database from 'better-sqlite3';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Decimal } from 'decimal.js';
@@ -69,6 +70,9 @@ import type {
 } from '@gate-crossex/shared-types';
 import type { BackendConfig } from './config.js';
 import { CredentialOperationBusyError, CredentialOperationGate } from './credential-operation-gate.js';
+import { registerDeploymentFenceRoutes } from './deployment-fence-routes.js';
+import { DeploymentFenceStore } from './deployment-fence-store.js';
+import { trackRuntimeMutation, unresolvedRuntimeMutations, reconcileRuntimeMutations } from './runtime-mutation-ledger.js';
 import {
   CredentialVaultUnavailableError,
   DEFAULT_CREDENTIAL_PROFILE,
@@ -99,7 +103,6 @@ import { TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
 import { CrossExPrivateStream } from './private-stream.js';
 import { LivePortfolioStore, type LivePortfolioSnapshot } from './live-portfolio.js';
 import { readDatabaseStatus } from './database.js';
-import { runDatabaseMaintenance } from './database-maintenance.js';
 import {
   addAuditEvent,
   deleteCredentialMetadata,
@@ -624,13 +627,17 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   });
   marketHub.setFundingObserver((symbol, rate, sourceAt) => nativeMarkets.acceptCrossExFunding(symbol, rate, sourceAt));
   const tradingSession = options.tradingSession ?? new TradingSession();
-  const credentialOperationGate = new CredentialOperationGate();
+  const credentialOperationGate = new CredentialOperationGate(new DeploymentFenceStore(join(config.dataDir, 'deployment-maintenance.json')));
+  tradingSession.attachMaintenance(() => credentialOperationGate.deploymentActive, () => credentialOperationGate.admittedWrite);
   const runAuthenticatedWrite = async <T>(work: () => Promise<T>): Promise<T> => {
     try {
       return await credentialOperationGate.runAuthenticatedWrite(work);
     } catch (error) {
       if (error instanceof CredentialOperationBusyError) {
-        throw new TradingRuntimeError('credential_mutation_in_progress', 409);
+        const code = error.message === 'deployment_fence_active'
+          ? 'deployment_fence_active'
+          : 'credential_mutation_in_progress';
+        throw new TradingRuntimeError(code, 409);
       }
       throw error;
     }
@@ -860,7 +867,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
   });
 
-  const quiesceForCredentialMutation = async (): Promise<void> => {
+  const quiesceForCredentialMutation = async (): Promise<void> => credentialOperationGate.runCredentialMutationWork(async () => {
     const previous = tradingSession.current;
     if (previous === 'live' || previous === 'protect_only') {
       tradingSession.set('readonly');
@@ -882,7 +889,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         unresolved.map(({ order }) => order.id).join(','),
       );
     }
-  };
+  });
 
   let credentialGeneration = 0;
   const financialContextInstance = randomUUID();
@@ -923,13 +930,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           },
   });
 
-  const maintenanceResult = runDatabaseMaintenance(database);
-  if (Object.values(maintenanceResult).some((deleted) => deleted > 0)) {
-    app.log.info(maintenanceResult, 'pruned expired local database records');
-  }
-
   await app.register(helmet, { contentSecurityPolicy: false });
-  await app.register(rateLimit, { max: options.rateLimitMax ?? 120, timeWindow: '1 minute' });
+  const readRequest = (method: string) => method === 'GET' || method === 'HEAD';
+  await app.register(rateLimit, {
+    keyGenerator: request => `${request.ip}:${readRequest(request.method) ? 'read' : 'write'}`,
+    max: request => options.rateLimitMax ?? (readRequest(request.method) ? 300 : 120),
+    timeWindow: '1 minute',
+  });
   await app.register(cors, { origin: [...config.allowedOrigins], credentials: false });
   app.addHook('onSend', compressPublicMarketResponse);
   await app.register(formbody, { bodyLimit: 16 * 1024 });
@@ -1001,7 +1008,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, {
     context: () => `${activeCredentialProfileId ?? ''}:${credentialGeneration}`,
     activeAccount: () => activeCredentialProfileId,
-    account: (signal) => runAuthenticatedWrite(async () => {
+    account: (signal) => credentialOperationGate.runAuthenticatedRead(async () => {
       const accountId = activeCredentialProfileId;
       const financialGeneration = credentialGeneration;
       const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
@@ -1045,6 +1052,61 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   marginMonitor.subscribe((snapshot) => telegramNotifications.observe(snapshot));
   registerMarginRiskRoutes(app, marginMonitor);
   registerContinuousProtectionRoutes(app, positionManager.protection, marginMonitor, runAuthenticatedWrite);
+  const deploymentUnresolved = () => tradingRuntime.listOpenOrders().length + unresolvedRuntimeMutations(database);
+  const deploymentControlStamp = async () => {
+    const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+    const credentialIdentity = credentials ? createHash('sha256').update(JSON.stringify(credentials)).digest('hex') : null;
+    return createHash('sha256').update(JSON.stringify({
+    credentialIdentity,
+    profile: activeCredentialProfileId,
+    protection: positionManager!.protection.authority.grant(),
+    risk: managedRiskBlock(database),
+    policy: marginMonitor.snapshot().policy.revision,
+    modeChange: database.prepare("SELECT id FROM audit_events WHERE type='trading_mode_changed' ORDER BY created_at DESC,id DESC LIMIT 1").get(),
+    })).digest('hex');
+  };
+  registerDeploymentFenceRoutes(app, credentialOperationGate, deploymentUnresolved, {
+    revision: () => {
+      const file = join(config.migrationsDir, '..', 'release-revision.txt');
+      return existsSync(file) ? readFileSync(file, 'utf8').trim() : 'development';
+    },
+    mode: () => tradingSession.current, controlStamp: deploymentControlStamp,
+    localControlStamp: () => JSON.stringify([tradingSession.current, tradingSession.controlRevision,
+      activeCredentialProfileId, credentialGeneration, positionManager!.protection.authority.grant(),
+      marginMonitor.snapshot().policy.revision, managedRiskBlock(database)]),
+    settle: async (signal) => {
+      await Promise.all([strategyEngine.settleMaintenanceTurns(), positionManager!.settleMaintenanceTurns()]);
+      signal.throwIfAborted();
+      const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+      if (!credentials) {
+        if (tradingSession.current === 'live' || deploymentUnresolved() || hasManagedClaims(database)) throw new Error('deployment_credentials_unavailable');
+        return;
+      }
+      if (unresolvedRuntimeMutations(database)) {
+        await reconcileRuntimeMutations(database, crossExGateway, credentials, signal);
+        if (unresolvedRuntimeMutations(database)) throw new Error('deployment_writes_unresolved');
+      }
+      const remote = crossExGateway.queryManagedState
+        ? await crossExGateway.queryManagedState(credentials, AbortSignal.any([signal, AbortSignal.timeout(5000)]))
+        : await crossExGateway.queryPortfolio(credentials, AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+      if (remote.openOrders.length) throw new Error('deployment_orders_active');
+      await positionManager!.validateForActivation('deployment');
+      if (deploymentUnresolved()) throw new Error('deployment_writes_unresolved');
+    },
+    activate: async (mode, guard) => {
+      if (mode === 'live') {
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials) throw new Error('deployment_credentials_unavailable');
+        await crossExGateway.queryAccount(credentials);
+        await strategyEngine.prepareForLiveActivation();
+      }
+      await guard.verify();
+      guard.commit();
+      if (mode === 'live' || mode === 'readonly') tradingSession.set(mode);
+      else if (mode === 'protect_only') tradingSession.armProtection();
+      if (mode === 'live') strategyEngine.activatePersistedStrategies(activeCredentialProfileId);
+    },
+  });
   registerTelegramNotificationRoutes(app, telegramNotifications);
 
   let portfolioRefreshInFlight: { generation: number; promise: Promise<LivePortfolioSnapshot>; controller: AbortController } | null = null;
@@ -1168,7 +1230,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const unsubscribeFinancialTasks = tradingRuntime.subscribe(event => { if (event.type === 'strategy.update') requestFinancialRefresh(); });
 
   let portfolioReconcileTimer: ReturnType<typeof setTimeout> | null = null;
-  let databaseMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
   const schedulePortfolioReconciliation = () => {
     if (!options.startMarketStream) return;
     const interval = Math.round(5 * 60_000 * (0.9 + Math.random() * 0.2));
@@ -1191,17 +1252,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     managedRiskAlerts.start();
     marginMonitor.start();
     fundingHistoryService.startBackground();
-    databaseMaintenanceTimer = setInterval(() => {
-      try {
-        const result = runDatabaseMaintenance(database);
-        if (Object.values(result).some((deleted) => deleted > 0)) {
-          app.log.info(result, 'pruned expired local database records');
-        }
-      } catch (error) {
-        app.log.warn({ err: error }, 'database retention maintenance failed');
-      }
-    }, 24 * 60 * 60_000);
-    databaseMaintenanceTimer.unref?.();
     schedulePortfolioReconciliation();
     // Bootstrap once per backend process. Concurrent UI tabs and a private-stream ready event
     // join the same single-flight request instead of multiplying five authenticated REST reads.
@@ -1224,7 +1274,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     await managedRiskAlerts.stop();
     await strategyEngine.stop();
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
-    if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
     livePortfolio.stop();
     marketHub.stop();
     privateStream.stop();
@@ -1669,12 +1718,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         if (block) throw new TradingRuntimeError(block, 409);
         if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
         tradingRuntime.assertPairedCapitalMutation();
-        const result = await tradingGateway.setLeverage!(credentials, params.data.symbol, body.data.leverage, () => {
+        const result = await trackRuntimeMutation(database, { kind: 'leverage', symbol: params.data.symbol, leverage: body.data.leverage }, () => tradingGateway.setLeverage!(credentials, params.data.symbol, body.data.leverage, () => {
           if (!tradingSession.liveTradingEnabled) throw new TradingRuntimeError('live_trading_locked', 403);
           const block = managedOrderBlock(database, params.data.symbol);
           if (block) throw new TradingRuntimeError(block, 409);
           tradingRuntime.assertPairedCapitalMutation();
-        });
+        }), credentials);
         tradingRuntime.invalidatePairedEntries();
         addAuditEvent(database, 'leverage_changed', { symbol: result.symbol, leverage: result.leverage });
         request.log.info({ symbol: result.symbol, leverage: result.leverage }, 'leverage changed');
@@ -1768,11 +1817,35 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     catch (error) {
       if (error instanceof z.ZodError) return reply.code(400).send({ error: 'invalid_strategy', issues: error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })) });
       if (error instanceof TradingRuntimeError) {
-        if (error.label) request.log.warn({ code: error.code, label: error.label }, 'strategy start rejected');
+        if (error.label || error.code.startsWith('managed_launch_')) request.log.warn({ code: error.code,
+          ...(error.label ? { label: error.label } : {}), stage: 'strategy_start', requestId: request.id }, 'strategy start rejected');
         return reply.code(error.statusCode).send({ error: error.code, ...(error.label ? { label: error.label } : {}) });
       }
-      request.log.error({ error }, 'strategy start failed');
+      request.log.error({ err: error, stage: 'strategy_start', requestId: request.id }, 'strategy start failed');
       return reply.code(500).send({ error: 'strategy_start_failed' });
+    }
+  });
+
+  app.post('/api/strategies/:id/replace-flat-owner', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: async (request, reply) => {
+      if (request.headers['x-gct-trading-intent'] !== 'replace-flat-owner') return reply.code(403).send({ error: 'missing_trading_intent' });
+    },
+  }, async (request, reply) => {
+    const params = z.object({id:z.string().regex(STRATEGY_ID)}).safeParse(request.params);
+    const body = ReplacementRequest.safeParse(request.body);
+    if (!params.success || !body.success) return reply.code(400).send({error:'invalid_replacement_scope'});
+    try {
+      return await runAuthenticatedWrite(() => positionManager!.replaceFlatOwner(params.data.id, body.data, async () => {
+        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+        if (!credentials || activeCredentialProfileId !== body.data.profileId) throw new TradingRuntimeError('managed_account_changed', 409);
+        return crossExGateway.queryPortfolio(credentials, AbortSignal.timeout(30000));
+      }));
+    } catch (error) {
+      if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({error:error.code});
+      if (error instanceof GateApiError) return reply.code(502).send({error:'managed_replacement_portfolio_unavailable'});
+      request.log.warn({id:params.data.id, requestId:request.id}, 'monitor-only handoff needs reconciliation');
+      return reply.code(409).send({error:'managed_replacement_unverified'});
     }
   });
 
@@ -1783,13 +1856,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }, async (request, reply) => {
     const parsed = z.object({ id: z.string().regex(STRATEGY_ID) }).safeParse(request.params);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_strategy_id' });
-    const body = z.object({ closePositions: z.boolean().default(false), expectedCloseScope: ManagedCloseScopeSchema.optional() })
-      .strict().refine(value => !value.expectedCloseScope || value.closePositions).safeParse(request.body ?? {});
+    const body = z.object({ closePositions: z.boolean().default(false), marketFallback: z.boolean().default(false),
+      expectedCloseScope: ManagedCloseScopeSchema.optional() })
+      .strict().refine(value => (!value.expectedCloseScope && !value.marketFallback) || value.closePositions).safeParse(request.body ?? {});
     if (!body.success) return reply.code(400).send({ error: 'invalid_stop_options' });
     try { return await runAuthenticatedWrite(() => {
       if (body.data.expectedCloseScope) assertManagedCloseTarget(database, tradingRuntime.listStrategies(),
         activeCredentialProfileId, parsed.data.id, body.data.expectedCloseScope);
-      return strategyEngine.stopStrategy(parsed.data.id, body.data.closePositions);
+      return strategyEngine.stopStrategy(parsed.data.id, body.data.closePositions, body.data.marketFallback);
     }); }
     catch (error) {
       if (error instanceof TradingRuntimeError) return reply.code(error.statusCode).send({ error: error.code });
@@ -2606,7 +2680,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           if (canonicalTransfer.from !== 'SPOT') tradingRuntime.assertPairedCapitalMutation();
         };
         authorizeTransfer();
-        const transfer = await operationsGateway.createTransfer!(stableCredentials, canonicalTransfer, authorizeTransfer);
+        const identifiedTransfer = { ...canonicalTransfer, text: canonicalTransfer.text ?? `gct-${randomUUID()}` };
+        const transfer = await trackRuntimeMutation(database, { ...identifiedTransfer, kind: 'transfer',
+          generatedCorrelation: canonicalTransfer.text === undefined },
+          () => operationsGateway.createTransfer!(stableCredentials, identifiedTransfer, authorizeTransfer), stableCredentials);
         addAuditEvent(database, 'fund_transfer_submitted', {
           transactionId: transfer.tx_id,
           coin: canonicalTransfer.coin,

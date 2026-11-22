@@ -156,7 +156,8 @@ test('workflow keeps required names, complete gates and bounded public publishin
   const ci = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const release = readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8');
   for (const job of ['quality', 'platform', 'e2e', 'dependencies']) assert.match(ci, new RegExp(`  ${job}:`));
-  assert.match(ci, /branches: \[main\]/);
+  assert.match(ci, /push:\s*\n\s+branches: \[main\]/);
+  assert.match(ci, /pull_request:\s*\n\s+branches: \[main\]/);
   assert.match(ci, /merge_group:/);
   assert.match(ci, /CI_SCOPE_RESULT/);
   assert.match(ci, /npm audit --audit-level=high/);
@@ -164,4 +165,10 @@ test('workflow keeps required names, complete gates and bounded public publishin
   assert.equal((release.match(/node scripts\/ci\/release-guard.mjs/g) ?? []).length, 2);
   assert.match(release, /cancel-in-progress: false/);
   assert.match(release, /--title "PIXIU ARB/);
+  assert.match(release, /if: github\.event_name == 'push' && startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(release, /source:\s*\n\s+needs: verify/);
+  assert.match(release, /git archive --format=tar\.gz.*"\$GITHUB_SHA"/);
+  assert.match(release, /sha256sum "pixiu-arb-\$\{SOURCE_TAG\}\.tar\.gz" > SHA256SUMS/);
+  assert.match(release, /CHANGELOG\.md > RELEASE_NOTES\.md/);
+  assert.match(release, /gh release create "\$SOURCE_TAG" "pixiu-arb-\$\{SOURCE_TAG\}\.tar\.gz" SHA256SUMS --verify-tag/);
 });

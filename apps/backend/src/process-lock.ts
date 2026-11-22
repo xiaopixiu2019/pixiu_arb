@@ -50,7 +50,7 @@ function readLock(path: string): LockRecord | null {
  */
 export function acquireBackendProcessLock(
   dataDirectory: string,
-  options: { pid?: number; isProcessAlive?: (pid: number) => boolean } = {},
+  options: { pid?: number; isProcessAlive?: (pid: number) => boolean; rejectExisting?: boolean } = {},
 ): BackendProcessLock {
   mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
   chmodSync(dataDirectory, 0o700);
@@ -88,6 +88,10 @@ export function acquireBackendProcessLock(
       if (descriptor !== null) closeSync(descriptor);
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw error;
+      // Offline tools may run in a different Docker PID namespace. They must never infer that an
+      // existing lock is stale from process.kill(); only the release executor can retire it after
+      // proving that no container or host process owns the data volume.
+      if (options.rejectExisting) throw new Error(`backend_lock_exists:${path}`, { cause: error });
       const existing = readLock(path);
       // An unreadable lock is treated as live: deleting ambiguous ownership could enable two
       // trading processes. The user can inspect/remove it after verifying no backend is running.

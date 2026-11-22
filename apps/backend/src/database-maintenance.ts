@@ -24,10 +24,10 @@ export function runDatabaseMaintenance(
   const auditCutoff = new Date(now - AUDIT_RETENTION_MS).toISOString();
   const executionCutoff = new Date(now - EXECUTION_RETENTION_MS).toISOString();
   return database.transaction(() => {
-    const expiredAudit = database.prepare('DELETE FROM audit_events WHERE created_at < ?').run(auditCutoff).changes;
+    const expiredAudit = database.prepare("DELETE FROM audit_events WHERE created_at < ? AND type != 'runtime_mutation_pending'").run(auditCutoff).changes;
     const excessAudit = database.prepare(`
       DELETE FROM audit_events WHERE id IN (
-        SELECT id FROM audit_events ORDER BY created_at DESC LIMIT -1 OFFSET ?
+        SELECT id FROM audit_events WHERE type != 'runtime_mutation_pending' ORDER BY created_at DESC LIMIT -1 OFFSET ?
       )
     `).run(MAX_AUDIT_EVENTS).changes;
     const strategyLogsDeleted = database.prepare(`

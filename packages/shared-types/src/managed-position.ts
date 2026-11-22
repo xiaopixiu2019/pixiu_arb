@@ -4,6 +4,7 @@ const signed = z.string().max(32).regex(/^-?\d+(?:\.\d+)?$/).refine((v) => Numbe
 const positive = signed.refine((v) => Number(v) > 0);
 export const PositionManagementConfigSchema = z.object({
   adoptExisting: z.boolean().optional(),
+  monitorOnly: z.literal(true).optional(),
   spreadBps: signed.default('-20'),
   fundingAprPct: signed.default('-100'),
   condition: z.enum(['AND', 'OR']).default('AND'),

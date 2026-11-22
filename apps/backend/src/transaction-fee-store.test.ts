@@ -24,6 +24,19 @@ function fill(id: string, venue = 'BYBIT'): GateCrossExTrade {
   return { transaction_id: `fill-${id}`, order_id: id, text: `client-${id}`, symbol: `${venue}_FUTURE_HYPE_USDT`, exchange_type: venue, business_type: 'FUTURE', side: 'BUY', qty: '1', price: '100', fee: '12.2', fee_coin: 'USDT', fee_rate: '0.001', match_role: 'MAKER', rpnl: '0', position_mode: 'SINGLE', position_side: 'LONG', create_time: '150000' };
 }
 describe('fee attribution and retained evidence', () => {
+  it('coalesces unchanged rates for one minute while retaining changes and a bounded heartbeat', () => {
+    const f = fixture(), stable = { USDC: '0.998', USDT: '1' };
+    f.store.rates('a', 150001, stable);
+    f.store.rates('a', 209999, stable);
+    expect(f.db.prepare('SELECT at FROM fee_rates ORDER BY at').all()).toEqual([{ at: 150000 }]);
+
+    f.store.rates('a', 210000, stable);
+    f.store.rates('a', 210001, { ...stable, USDC: '0.997' });
+
+    expect(f.db.prepare('SELECT at FROM fee_rates ORDER BY at').all())
+      .toEqual([{ at: 150000 }, { at: 210000 }, { at: 210001 }]);
+    expect(f.store.rateAt('a', 'USDC', 210001)).toBe('0.997');
+  });
   it('preserves the old binding table write contract for rollback images', () => {
     const f = fixture();
     expect(() => f.db.prepare('INSERT INTO fee_order_bindings VALUES (?,?,?,?,?,?,?,?)')

@@ -28,6 +28,12 @@ describe('account-bound financial display cache',()=>{
     const merged=retainTradingResults(next,old);expect(merged.tasks[0].trading).toMatchObject({amount:'2',checkedAt:100,stale:true,status:'partial'});
     expect(old.tasks[0].trading?.stale).toBe(false);
   });
+  it('never carries an open-position value into a completed task awaiting final evidence',()=>{
+    const old=result(),next=result();next.tasks[0]={...next.tasks[0],status:'pending',
+      trading:{...next.tasks[0].trading!,amount:null,confirmed:null,unrealized:null,checkedAt:200,reasons:['invalid_or_unpriced_evidence']}};
+    const merged=retainTradingResults(next,old);expect(merged.tasks[0].trading).toEqual(next.tasks[0].trading);
+    expect(merged.tasks[0].trading?.amount).toBeNull();expect(merged.tasks[0].trading?.reasons).not.toContain('last_confirmed_value');
+  });
   it('never carries an amount across accounts or an ownership transfer',()=>{
     const old=result(),next=result();next.profileId='other';next.tasks[0].trading!.amount=null;
     expect(retainTradingResults(next,old).tasks[0].trading!.amount).toBeNull();next.profileId='p';next.tasks[0].trading!.status='transferred';

@@ -13,7 +13,7 @@ import { TradingRuntimeError, type TradingRuntime } from './trading-runtime.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { MarginRiskStore } from './margin-risk-store.js';
 import { freshManagedQuote, pairedQuantities } from './managed-position-model.js';
-import { readCrossMarginEvidence } from './cross-margin-admission.js';
+import { admissionReadFailure, readCrossMarginEvidence } from './cross-margin-admission.js';
 import { MarginReductionEvidence } from './margin-reduction-evidence.js';
 import { commonQuantityStep, marginGroupPlanDetailed, reportedMarketCaps } from './margin-group-plan.js';
 import { marginExecutionCapacity } from './margin-projection-plan.js';
@@ -44,15 +44,19 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
   const failures = new Map<string, string>();
   let positions: GateCrossExPosition[] = [], positionsAt = 0, accountMode = '', accountContext = '';
   let positionContext = '';
+  let positionSource: 'manager' | 'monitor' | null = null;
+  let positionRevision = 0;
   let positionRead: Promise<void> | null = null;
   let remoteOpenOrders = -1;
   const refreshPositions = (credentials: GateCredentials, context: string): void => {
-    if (positionRead) return;
+    if (positionRead || positionSource === 'manager' && positionContext === context && Date.now() - positionsAt < 5000) return;
+    const revision = positionRevision;
     const request = o.gateway.queryManagedState
       ? o.gateway.queryManagedState(credentials, AbortSignal.timeout(4000)) : o.gateway.queryPortfolio(credentials, AbortSignal.timeout(4000));
     positionRead = request.then((result) => {
-      if (context === o.context()) { positions = result.positions; remoteOpenOrders = result.openOrders.length; positionsAt = Date.now(); positionContext = context; }
-    }).catch(() => { if (context === o.context()) positionsAt = 0; }).finally(() => { positionRead = null; });
+      if (context === o.context() && revision === positionRevision) { positions = result.positions; remoteOpenOrders = result.openOrders.length;
+        positionsAt = Date.now(); positionContext = context; positionSource = 'monitor'; positionRevision++; }
+    }).catch(() => { if (context === o.context() && revision === positionRevision) positionsAt = 0; }).finally(() => { positionRead = null; });
   };
   const store = new MarginRiskStore(o.db);
   const groups = (): MarginSnapshot['groups'] => o.runtime.listStrategies().filter((s) => s.config.management && s.accountProfileId === o.profile()?.id)
@@ -92,11 +96,19 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
         ? marginParametersId(p) : null;
     },
     modes: async (symbols) => {
-      const context = o.context(), credentials = await o.credentials();
-      if (!credentials) throw new Error('margin_account_not_configured');
-      const items = await readCrossMarginEvidence(o.gateway, credentials, symbols, AbortSignal.timeout(4000));
-      if (context !== o.context()) throw new Error('margin_account_changed');
-      return { profileId: o.profile()?.id ?? null, items };
+      const context = o.context(), profile = o.profile(), credentials = await o.credentials();
+      if (!credentials || !profile) throw new Error('margin_account_not_configured');
+      try {
+        const items = await readCrossMarginEvidence(o.gateway, credentials, symbols, AbortSignal.timeout(4000));
+        if (context !== o.context()) throw new Error('margin_account_changed');
+        return { profileId: profile.id, items };
+      } catch (error) {
+        if (context !== o.context()) throw new Error('margin_account_changed', { cause: error });
+        const failure = admissionReadFailure(error, 'margin_modes');
+        if (failure.kind === 'authentication') throw error;
+        return { profileId: profile.id, items: symbols.map(symbol => ({ symbol, supportCross: null, mode: null,
+          checkedAt: Date.now(), reason: 'cross_margin_capability_unknown', failure })) };
+      }
     },
     settlementReady: (quantities, proof) => {
       if (positionContext !== o.context() || Date.now() - positionsAt > 5000 || !currentAccount) return false;
@@ -166,6 +178,7 @@ export function createMarginRiskService(o: MarginServiceOptions): MarginRiskMoni
   if (paired) o.runtime.setPairedEntry(paired);
   o.manager.setMarginFacts((facts) => {
     positions = facts.positions; remoteOpenOrders = facts.openOrders.length; positionsAt = Date.now(); positionContext = o.context();
+    positionSource = 'manager'; positionRevision++;
     paired?.observe(facts.positions, facts.openOrders);
   });
   const admission = createMarginAdmission(o, monitor, paired);

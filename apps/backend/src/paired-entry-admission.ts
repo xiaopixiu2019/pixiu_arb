@@ -7,10 +7,10 @@ import { admissionReadFailure, readCrossMarginEvidence } from './cross-margin-ad
 import { isPreparationTimeout } from './entry-preparation-recovery.js';
 import { freshManagedQuote, pairedQuantities } from './managed-position-model.js';
 import { managedLegs } from './managed-position-manager.js';
-import { managedRiskReason, readManagedState } from './managed-position-store.js';
+import { MANAGED_ACCOUNT_RECHECKING, managedRiskReason, readManagedState } from './managed-position-store.js';
 import { TradingRuntimeError, type CreateStrategyInput, type PlaceOrderMetadata } from './trading-runtime.js';
 import { coverEntryBudget, entryConfigHash, entryCosts, entryLegUsage, entryOrders, readEntryBudget, saveEntryBudget,
-  type PairedEntryBudget } from './paired-entry-ledger.js';
+  retiredMakerQuantity, type PairedEntryBudget } from './paired-entry-ledger.js';
 import { PairedEntryPool, type PairedPoolCost } from './paired-entry-pool.js';
 
 export interface PairedOrderInput { symbol: string; side: 'BUY' | 'SELL'; quantity: string; price?: string;
@@ -31,6 +31,13 @@ const eligible = (c: CreateStrategyInput) => c.kind === 'position' && c.executio
 const fail = (reason: string, detail?: Record<string, unknown>): never => {
   throw new TradingRuntimeError(reason, 409, detail ? JSON.stringify(detail) : undefined);
 };
+const transientKinds = new Set(['timeout', 'cancelled', 'rate_limit', 'service_unavailable', 'network']);
+function retainCertificateAfterRefreshFailure(error: unknown): boolean {
+  if (!(error instanceof TradingRuntimeError)) return false;
+  if (!['paired_entry_preparation_unavailable', 'paired_entry_read_failed',
+    'paired_entry_margin_mode_unverified'].includes(error.code)) return false;
+  try { return transientKinds.has(JSON.parse(error.label ?? 'null')?.kind); } catch { return false; }
+}
 async function entryRead<T>(stage: string, read: Promise<T>, signal?: AbortSignal): Promise<T> {
   try { return await read; }
   catch (error) { return fail('paired_entry_read_failed', { ...admissionReadFailure(error, stage, undefined, signal) }); }
@@ -97,9 +104,10 @@ export class PairedEntryAdmission implements PairedEntryController {
         || !readEntryBudget(this.o.db, record.id) || this.pending.has(record.id)) continue;
       if (Date.now() - (this.certificates.get(record.id)?.at ?? 0) < 4000) continue;
       const certificate = this.certificates.get(record.id);
-      void this.prepare(record.id, record.config, record.accountProfileId).catch(() => {
+      void this.prepare(record.id, record.config, record.accountProfileId).catch(error => {
         // Preserve the existing background invalidation without erasing a newer proof.
-        if (this.certificates.get(record.id) === certificate) this.certificates.delete(record.id);
+        if (this.certificates.get(record.id) === certificate
+          && (!retainCertificateAfterRefreshFailure(error) || !this.certificateReady(record.id))) this.certificates.delete(record.id);
       });
     }
     this.reconcile();
@@ -138,7 +146,8 @@ export class PairedEntryAdmission implements PairedEntryController {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        const error = new TradingRuntimeError('paired_entry_preparation_unavailable', 409);
+        const error = new TradingRuntimeError('paired_entry_preparation_unavailable', 409,
+          JSON.stringify({ kind: 'timeout', stage: 'preparation' }));
         controller.abort(error); reject(error);
       }, 10000);
     });
@@ -154,12 +163,14 @@ export class PairedEntryAdmission implements PairedEntryController {
     signal.throwIfAborted();
     const credentials = await this.o.credentials(), gateway = this.o.gateway as TradingCrossExGateway;
     signal.throwIfAborted();
-    if (Date.now() - preparedAt >= 10000) fail('paired_entry_preparation_unavailable');
+    if (Date.now() - preparedAt >= 10000) fail('paired_entry_preparation_unavailable', { kind: 'timeout', stage: 'preparation' });
     if (!credentials) fail('paired_entry_account_changed');
     const proofEnabled = this.pools.enabled && !!this.monitor.snapshot().metrics?.assets.length;
     const factsSignal = proofEnabled && gateway.queryManagedState ? AbortSignal.any([signal, AbortSignal.timeout(4000)]) : undefined;
-    const factsRead: Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] | null }> = proofEnabled && gateway.queryManagedState
-      ? gateway.queryManagedState(credentials!, factsSignal!)
+    const published = this.facts?.context === context && Date.now() - this.facts.at < 5000 ? this.facts : null;
+    const factsRead: Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] | null }> = published
+      ? Promise.resolve({ positions: published.positions, openOrders: published.openOrders })
+      : proofEnabled && gateway.queryManagedState ? gateway.queryManagedState(credentials!, factsSignal!)
       : gateway.queryPositions(credentials!).then(positions => ({ positions, openOrders: null }));
     const reads = [
       entryRead('catalog', readCrossMarginEvidence(gateway, credentials!, legs.map(l => l.symbol), signal, { deadline: preparedAt + 10000, track })),
@@ -171,7 +182,7 @@ export class PairedEntryAdmission implements PairedEntryController {
     track(reads.map(read => Promise.resolve(read)));
     const [cross, limits, leverages, facts, rates] = await Promise.all(reads).catch(error => {
       if (Date.now() - preparedAt >= 10000 && error instanceof TradingRuntimeError && isPreparationTimeout(error.code, error.label))
-        fail('paired_entry_preparation_unavailable');
+        fail('paired_entry_preparation_unavailable', { kind: 'timeout', stage: 'preparation' });
       throw error;
     });
     signal.throwIfAborted();
@@ -201,7 +212,7 @@ export class PairedEntryAdmission implements PairedEntryController {
         initialBudget: entryCosts(config.totalAmount!, price, leverage, rate, true).initial.toString(), baseline: baseline[index], covered: {} };
     });
     const budget: PairedEntryBudget = { accountUser: snapshot.accountId!, released: false, legs: [prepared[0], prepared[1]] };
-    if (Date.now() - preparedAt >= 10_000) fail('paired_entry_preparation_unavailable');
+    if (Date.now() - preparedAt >= 10_000) fail('paired_entry_preparation_unavailable', { kind: 'timeout', stage: 'preparation' });
     const poolFacts = facts.openOrders ? { positions: facts.positions, openOrders: facts.openOrders } : null;
     this.pools.prepare(id, budget, snapshot, poolFacts, rates, preparedAt, generation, this.ordinary(), false);
     if (!this.o.live() || context !== this.o.context()) fail('paired_entry_authority_changed');
@@ -236,9 +247,16 @@ export class PairedEntryAdmission implements PairedEntryController {
     const id = record.id, state = readManagedState(this.o.db, id), budget = readEntryBudget(this.o.db, id);
     if (!budget || budget.released || !this.readyFromSnapshot(id, check.snapshot)) fail('paired_entry_preparation_unavailable');
     if (!this.o.live() || record.status !== 'RUNNING' || record.accountProfileId !== this.o.profile()?.id
-      || state?.phase !== 'OPENING' || state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident
-      || managedRiskReason(this.o.db)) fail('paired_entry_authority_changed');
+      || state?.phase !== 'OPENING' || state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident)
+      fail('paired_entry_authority_changed');
     this.assertIdentity(id, record.config, check.snapshot.accountId!);
+    const claims = this.o.db.prepare('SELECT symbol,account_id FROM managed_position_claims WHERE strategy_id=?')
+      .all(id) as Array<{ symbol: string; account_id: string }>;
+    if (claims.length !== 2 || !budget!.legs.every(leg => claims.some(claim =>
+      claim.account_id === record.accountProfileId && claim.symbol === leg.symbol))) fail('paired_entry_authority_changed');
+    const risk = managedRiskReason(this.o.db);
+    if (risk === MANAGED_ACCOUNT_RECHECKING) throw new TradingRuntimeError(risk, 409, undefined, true, id);
+    if (risk) fail('paired_entry_authority_changed');
     const index = budget!.legs.findIndex(l => l.symbol === input.symbol && l.side === input.side);
     if (index < 0 || metadata.strategyLeg !== (index === 0 ? 'left' : 'right')) fail('paired_entry_order_changed');
     const rows = entryOrders(this.o.db, id).filter(o => o.id !== excludeOrder);
@@ -246,9 +264,10 @@ export class PairedEntryAdmission implements PairedEntryController {
     if (quantity.plus(usages[index].filled).plus(usages[index].pending).gt(budget!.legs[index].target)) fail('paired_entry_quantity_exceeded');
     const maker = record.config.makerLeg === (index === 0 ? 'left' : 'right');
     if (maker && this.o.manager.entryProgressPending?.(id)) fail('managed_account_rechecking');
+    const makerTrim = maker ? 0 : retiredMakerQuantity(budget!.legs[1 - index], 1 - index, rows);
     if (maker ? input.type !== 'LIMIT' || input.timeInForce !== 'POC'
       : input.type !== 'MARKET' || input.timeInForce !== 'IOC'
-        || quantity.gt(usages[1 - index].filled.minus(usages[index].filled).minus(usages[index].pending))) fail('paired_entry_unconfirmed_hedge');
+        || quantity.gt(usages[1 - index].filled.minus(makerTrim).minus(usages[index].filled).minus(usages[index].pending))) fail('paired_entry_unconfirmed_hedge');
     if (maker) this.assertFundsWithCheck(check, budget!, id);
     else this.assertHedgeFunds(check, id, index, input.quantity, excludeOrder);
     if (!this.readyFromSnapshot(id, check.snapshot)) fail('paired_entry_preparation_unavailable');

@@ -52,3 +52,20 @@ describe('risk account reads under concurrent derived-result publication', () =>
     expect(db.prepare('SELECT COUNT(*) n FROM margin_risk_accounts').get()).toEqual({ n: 1 });
   });
 });
+
+describe('bounded risk telemetry retention', () => {
+  it('keeps a two-hour raw recovery window and thirty days of minute evidence', () => {
+    const { db, store } = fixture(), now = Date.parse('2026-11-17T00:00:00Z');
+    const raw = db.prepare('INSERT INTO margin_risk_samples VALUES (?,?,NULL)');
+    const minute = db.prepare("INSERT INTO margin_risk_minutes VALUES (?,?, '{}')");
+    for (const age of [3 * 3_600_000, 2 * 3_600_000, 3_600_000]) raw.run('account', now - age);
+    for (const age of [31 * 86_400_000, 30 * 86_400_000, 29 * 86_400_000]) minute.run('account', now - age);
+
+    store.prune(now);
+
+    expect(db.prepare('SELECT sampled_at FROM margin_risk_samples ORDER BY sampled_at').all())
+      .toEqual([{ sampled_at: now - 2 * 3_600_000 }, { sampled_at: now - 3_600_000 }]);
+    expect(db.prepare('SELECT minute_at FROM margin_risk_minutes ORDER BY minute_at').all())
+      .toEqual([{ minute_at: now - 30 * 86_400_000 }, { minute_at: now - 29 * 86_400_000 }]);
+  });
+});

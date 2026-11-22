@@ -34,18 +34,55 @@ async function harness() {
   createOrder } as unknown as TradingCrossExGateway;
   gateway.createRiskControlReader=()=>({ ...gateway,
     queryAccount: (...args: Parameters<TradingCrossExGateway['queryAccount']>) => { controlReads+=1; return gateway.queryAccount(...args); } });
+  let publishFacts: (facts: { positions: GateCrossExPosition[]; openOrders: [] }) => void = () => undefined;
   const runtime = new TradingRuntime(db, session, vault, gateway);
-  const monitor = createMarginRiskService({ db, gateway, runtime, manager: { setMarginMonitor: vi.fn(), setMarginFacts: vi.fn(), failAll: vi.fn() } as unknown as ManagedPositionManager,
+  const monitor = createMarginRiskService({ db, gateway, runtime, manager: { setMarginMonitor: vi.fn(),
+    setMarginFacts: (listener: typeof publishFacts) => { publishFacts = listener; }, failAll: vi.fn() } as unknown as ManagedPositionManager,
     engine: { haltForMarginRisk: vi.fn() } as unknown as StrategyEngine, enforce: true, context: () => 'account:1',
     profile: () => ({ id: 'account', label: 'Synthetic' }), live: () => true, credentials: () => vault.get(DEFAULT_CREDENTIAL_PROFILE),
     markets: { market: (symbol) => ({ symbol, source: 'gate_crossex_websocket', bidPrice: '10', askPrice: '10', updatedAt: new Date().toISOString(), receivedAt: new Date().toISOString() } as LiveMarket) } });
   resources.push({ db, monitor });
   return { db, gateway, monitor, runtime, createOrder, base, controlReads:()=>controlReads,
+    publishFacts,
     reject: (value: boolean) => { reject = value; }, split: () => { split = true; },
     venueAccount: (venue: string, values: Partial<GateCrossExAccount>) => { venueAccounts[venue] = values; } };
 }
 const order = { symbol: 'GATE_FUTURE_BTC_USDT', side: 'BUY', type: 'MARKET', quantity: '5', price: '10' };
 describe('account admission at the real order boundary', () => {
+  it('returns fail-closed mode evidence for transient reads but preserves authentication failures', async () => {
+    const h = await harness(), symbol = 'GATE_FUTURE_BTC_USDT';
+    h.gateway.querySymbols = async () => { throw new GateApiError(503, 'SERVICE_UNAVAILABLE'); };
+    await expect(h.monitor.sources.modes?.([symbol])).resolves.toMatchObject({ profileId: 'account', items: [{ symbol,
+      supportCross: null, mode: null, reason: 'cross_margin_capability_unknown', failure: { kind: 'service_unavailable' } }] });
+    h.gateway.querySymbols = async () => { throw new GateApiError(403, 'FORBIDDEN'); };
+    await expect(h.monitor.sources.modes?.([symbol])).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('does not let an older monitor read overwrite newer manager facts', async () => {
+    const h = await harness();
+    let release!: (value: { positions: GateCrossExPosition[]; openOrders: [] }) => void;
+    h.gateway.queryManagedState = async () => new Promise(resolve => { release = resolve; });
+    await h.monitor.refresh();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    h.publishFacts({ positions: [{ symbol: 'GATE_FUTURE_NEW_USDT', position_side: 'LONG', position_qty: '1' }] as GateCrossExPosition[], openOrders: [] });
+    release({ positions: [{ symbol: 'GATE_FUTURE_OLD_USDT', position_side: 'LONG', position_qty: '1' }] as GateCrossExPosition[], openOrders: [] });
+    await vi.waitFor(() => expect(h.monitor.sources.uncovered()).toEqual(['GATE_FUTURE_NEW_USDT']));
+  });
+
+  it('does not let an older monitor failure invalidate newer manager facts', async () => {
+    const h = await harness();
+    let reject!: (error: Error) => void;
+    h.gateway.queryManagedState = async () => new Promise((_, fail) => { reject = fail; });
+    await h.monitor.refresh();
+    await vi.waitFor(() => expect(reject).toBeTypeOf('function'));
+    h.publishFacts({ positions: [], openOrders: [] });
+    expect(h.monitor.sources.reviewReady?.()).toBe(true);
+    reject(new Error('older monitor read failed'));
+
+    await new Promise(resolve => setImmediate(resolve));
+    expect(h.monitor.sources.reviewReady?.()).toBe(true);
+  });
+
   it('does not publish rejected raw accounts to reduction evidence consumers',async()=>{
     const h=await harness(), observed=vi.spyOn(MarginReductionEvidence.prototype,'refresh');
     try {

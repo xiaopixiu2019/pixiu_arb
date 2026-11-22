@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 
 $Script:TempDirectory = $null
 $Script:StageDirectory = $null
+$Script:PreserveTemp = $false
 
 function Get-Setting([string]$Name, [string]$Default) {
     $Value = [Environment]::GetEnvironmentVariable($Name)
@@ -25,6 +26,35 @@ function Get-ExtendedPath([string]$Path) {
     if ($FullPath.StartsWith('\\?\')) { return $FullPath }
     if ($FullPath.StartsWith('\\')) { return '\\?\UNC\' + $FullPath.Substring(2) }
     return '\\?\' + $FullPath
+}
+
+function Remove-TreeWithRetry([string]$Path) {
+    $Target = Get-ExtendedPath $Path
+    for ($Attempt = 0; $Attempt -lt 50; $Attempt++) {
+        try {
+            Remove-Item -LiteralPath $Target -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $Retryable = $_.Exception -is [UnauthorizedAccessException] -or $_.Exception -is [IO.IOException]
+            if (-not $Retryable -or $Attempt -eq 49) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
+function Move-TreeWithRetry([string]$Source, [string]$Destination) {
+    for ($Attempt = 0; $Attempt -lt 50; $Attempt++) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -ErrorAction Stop
+            return
+        }
+        catch {
+            $Retryable = $_.Exception -is [UnauthorizedAccessException] -or $_.Exception -is [IO.IOException]
+            if (-not $Retryable -or $Attempt -eq 49 -or (Test-Path -LiteralPath $Destination)) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
 }
 
 function Get-Sha256([string]$Path) {
@@ -146,8 +176,30 @@ function Get-OwnedBackendProcessId([string]$InstallRoot) {
     return $null
 }
 
+function Assert-OwnedTask([string]$InstallRoot, [string]$InstalledTaskName) {
+    $Tasks = @(Get-ScheduledTask -TaskName $InstalledTaskName -ErrorAction SilentlyContinue)
+    if ($Tasks.Count -eq 0) { return }
+    $ExpectedRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+    $ExpectedPowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $ExpectedArguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + (Join-Path $ExpectedRoot 'bin\service.ps1') + '"'
+    $Owned = $false
+    try {
+        $Task = $Tasks[0]
+        $Owner = [string]$Task.Principal.UserId
+        $Sid = if ($Owner.StartsWith('S-1-')) { $Owner } else { ([Security.Principal.NTAccount]$Owner).Translate([Security.Principal.SecurityIdentifier]).Value }
+        $Actions = @($Task.Actions)
+        $Owned = $Tasks.Count -eq 1 -and $Task.TaskPath -eq '\' -and $Actions.Count -eq 1 -and
+            $Sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -and
+            [IO.Path]::GetFullPath([string]$Actions[0].Execute) -ieq $ExpectedPowerShell -and
+            [IO.Path]::GetFullPath([string]$Actions[0].WorkingDirectory).TrimEnd('\') -ieq $ExpectedRoot -and
+            [string]$Actions[0].Arguments -ceq $ExpectedArguments
+    } catch { $Owned = $false }
+    if (-not $Owned) { throw "Scheduled task $InstalledTaskName belongs to another installation or user; nothing was changed." }
+}
+
 function Stop-InstalledService([string]$InstallRoot, [string]$InstalledTaskName, [bool]$Skip) {
     if ($Skip) { return }
+    Assert-OwnedTask $InstallRoot $InstalledTaskName
     if ($null -ne (Get-ScheduledTask -TaskName $InstalledTaskName -ErrorAction SilentlyContinue)) {
         Write-Step 'Stopping the installed backend safely...'
         Stop-ScheduledTask -TaskName $InstalledTaskName -ErrorAction SilentlyContinue
@@ -200,6 +252,7 @@ function Set-CurrentRelease([string]$InstallRoot, [string]$ReleaseDirectory) {
 }
 
 function Register-GctTask([string]$InstallRoot, [string]$InstalledTaskName) {
+    Assert-OwnedTask $InstallRoot $InstalledTaskName
     $PowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
     $ServiceScript = Join-Path $InstallRoot 'bin\service.ps1'
     $Action = New-ScheduledTaskAction -Execute $PowerShell `
@@ -212,6 +265,34 @@ function Register-GctTask([string]$InstallRoot, [string]$InstalledTaskName) {
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     Register-ScheduledTask -TaskName $InstalledTaskName -Action $Action -Trigger $Trigger `
         -Principal $Principal -Settings $Settings -Force | Out-Null
+}
+
+function Save-ActivationFiles([string]$InstallRoot, [string]$InstalledShortcut) {
+    $Directory = Join-Path $Script:TempDirectory 'previous-activation'
+    New-Item -ItemType Directory -Path $Directory | Out-Null
+    $Paths = @('uninstall.ps1', 'bin\service.ps1', 'bin\gate-crossex.ps1', 'config\install.json') |
+        ForEach-Object { Join-Path $InstallRoot $_ }
+    $Paths += $InstalledShortcut
+    $Index = 0
+    foreach ($Path in $Paths) {
+        if (Test-Path -LiteralPath $Path -PathType Container) { throw 'Activation file path is a directory.' }
+        $Backup = Join-Path $Directory ([string]$Index++)
+        $Existed = Test-Path -LiteralPath $Path -PathType Leaf
+        if ($Existed) { Copy-Item -LiteralPath $Path -Destination $Backup }
+        [pscustomobject]@{ Path = $Path; Backup = $Backup; Existed = $Existed }
+    }
+}
+
+function Restore-ActivationFiles([object[]]$Files) {
+    foreach ($File in $Files) {
+        if ($File.Existed) {
+            Copy-Item -LiteralPath $File.Backup -Destination $File.Path -Force
+        }
+        elseif (Test-Path -LiteralPath $File.Path) {
+            if (-not (Test-Path -LiteralPath $File.Path -PathType Leaf)) { throw 'Rollback file path changed type.' }
+            Remove-Item -LiteralPath $File.Path -Force
+        }
+    }
 }
 
 function Write-Shortcut([string]$InstallRoot, [string]$InstalledShortcut) {
@@ -300,6 +381,8 @@ function Install-GateCrossEx {
             throw 'The configured shortcut is outside the current user Start Menu.'
         }
     }
+
+    if (-not $SkipService) { Assert-OwnedTask $Root $TaskName }
 
     $Script:TempDirectory = Join-Path ([IO.Path]::GetTempPath()) ("gate-crossex-install-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $Script:TempDirectory | Out-Null
@@ -395,14 +478,10 @@ function Install-GateCrossEx {
     }
     else {
         Set-Content -LiteralPath (Join-Path $Bundle '.archive-sha256') -Value $ActualHash -Encoding ASCII
-        Move-Item -LiteralPath $Bundle -Destination $ReleaseDirectory
+        Move-TreeWithRetry $Bundle $ReleaseDirectory
     }
-    Remove-Item -LiteralPath (Get-ExtendedPath $Script:StageDirectory) -Recurse -Force
+    Remove-TreeWithRetry $Script:StageDirectory
     $Script:StageDirectory = $null
-
-    Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\uninstall.ps1') -Destination (Join-Path $Root 'uninstall.ps1') -Force
-    Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\packaging\windows\service.ps1') -Destination (Join-Path $Root 'bin\service.ps1') -Force
-    Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\packaging\windows\gate-crossex.ps1') -Destination (Join-Path $Root 'bin\gate-crossex.ps1') -Force
 
     $CurrentPath = Join-Path $Root 'current-release.txt'
     $OldRelease = if (Test-Path -LiteralPath $CurrentPath -PathType Leaf) {
@@ -415,6 +494,13 @@ function Install-GateCrossEx {
             throw 'The active release pointer is outside the installation versions directory.'
         }
     }
+    $PreviousFiles = @(Save-ActivationFiles $Root $ShortcutPath)
+    $PreviousTaskXml = $null
+    if (-not $SkipService -and $null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        Assert-OwnedTask $Root $TaskName
+        $PreviousTaskXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        $PreviousTaskXml | Set-Content -LiteralPath (Join-Path $Script:TempDirectory 'previous-activation\task.xml') -Encoding UTF8
+    }
     Stop-InstalledService $Root $TaskName $SkipService
     try {
         Backup-Database $Root $OldRelease $ReleaseDirectory $ReleaseId
@@ -425,11 +511,13 @@ function Install-GateCrossEx {
         }
         throw
     }
-    if (-not $SkipService -and -not (Test-PortAvailable $Port)) {
-        throw "Port $Port is in use by another application. Set GCT_PORT to a free port on the first install and retry."
-    }
-
     try {
+        if (-not $SkipService -and -not (Test-PortAvailable $Port)) {
+            throw "Port $Port is in use by another application; it was not stopped or replaced."
+        }
+        Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\uninstall.ps1') -Destination (Join-Path $Root 'uninstall.ps1') -Force
+        Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\packaging\windows\service.ps1') -Destination (Join-Path $Root 'bin\service.ps1') -Force
+        Copy-Item -LiteralPath (Join-Path $ReleaseDirectory 'app\packaging\windows\gate-crossex.ps1') -Destination (Join-Path $Root 'bin\gate-crossex.ps1') -Force
         Set-CurrentRelease $Root $ReleaseDirectory
         Write-InstallConfig $Root $Port $TaskName $ShortcutPath
         if (-not $SkipService) {
@@ -447,6 +535,7 @@ function Install-GateCrossEx {
         $Restored = $false
         try {
             if (-not $SkipService) {
+                Assert-OwnedTask $Root $TaskName
                 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
                 for ($Attempt = 0; $Attempt -lt 140; $Attempt++) {
                     if ($null -eq (Get-OwnedBackendProcessId $Root)) { break }
@@ -457,6 +546,7 @@ function Install-GateCrossEx {
                 }
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             }
+            Restore-ActivationFiles $PreviousFiles
             if (-not [string]::IsNullOrWhiteSpace($OldRelease) -and (Test-Path -LiteralPath $OldRelease -PathType Container)) {
                 Write-Step 'The new release failed to activate; rolling back.'
                 Set-CurrentRelease $Root $OldRelease
@@ -464,8 +554,8 @@ function Install-GateCrossEx {
                     $Restored = $true
                 }
                 else {
-                    Register-GctTask $Root $TaskName
-                    Write-Shortcut $Root $ShortcutPath
+                    if ([string]::IsNullOrWhiteSpace($PreviousTaskXml)) { throw 'Previous service definition is unavailable.' }
+                    Register-ScheduledTask -TaskName $TaskName -Xml $PreviousTaskXml -Force | Out-Null
                     $Restored = Start-AndWait $TaskName $Port
                 }
             }
@@ -480,8 +570,10 @@ function Install-GateCrossEx {
             throw "Installation failed ($ActivationFailure); the previous release was restored and restarted."
         }
         if ($null -ne $RollbackFailure) {
-            throw "Installation failed ($ActivationFailure) and rollback failed ($RollbackFailure). Inspect $Root\logs\backend.err.log"
+            $Script:PreserveTemp = $true
+            throw "Installation failed ($ActivationFailure) and rollback failed ($RollbackFailure). Recovery files remain at $Script:TempDirectory; inspect $Root\logs\backend.err.log"
         }
+        if (-not [string]::IsNullOrWhiteSpace($OldRelease)) { $Script:PreserveTemp = $true }
         throw "Installation failed ($ActivationFailure) and Gate CrossEx could not be restarted. Inspect $Root\logs\backend.err.log"
     }
 
@@ -508,7 +600,7 @@ finally {
     if ($null -ne $Script:StageDirectory -and (Test-Path -LiteralPath $Script:StageDirectory)) {
         Remove-Item -LiteralPath (Get-ExtendedPath $Script:StageDirectory) -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($null -ne $Script:TempDirectory -and (Test-Path -LiteralPath $Script:TempDirectory)) {
+    if (-not $Script:PreserveTemp -and $null -ne $Script:TempDirectory -and (Test-Path -LiteralPath $Script:TempDirectory)) {
         Remove-Item -LiteralPath (Get-ExtendedPath $Script:TempDirectory) -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

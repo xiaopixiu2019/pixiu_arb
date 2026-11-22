@@ -56,6 +56,12 @@ describe('submitted close receipt is display evidence, not new close authority',
     expect(reconcileReceipt(receipt, [strategy]).state).toBe('review');
     expect(receiptForRows(rows, [receipt], 'account', [])?.state).toBe('review');
   });
+  it('keeps a protect-only EXIT receipt active while reduce-only execution continues', () => {
+    const receipt = transitionReceipt(closeReceipt(target), 'accepted');
+    const protectedExit = { ...strategy, status: 'PAUSED', management: { ...strategy.management!, phase: 'EXITING',
+      stopIntent: 'EXIT', exitRequested: true, resumeAction: 'EXITING' } } as StrategyRecord;
+    expect(reconcileReceipt(receipt, [protectedExit]).state).toBe('accepted');
+  });
   it.each(['TRANSFERRED', 'STOPPED', 'RISK_PAUSED', 'KEEP'])('does not claim exit continues after authoritative %s', phase => {
     const receipt = transitionReceipt(closeReceipt(target), 'accepted');
     const record = { ...strategy, management: { ...strategy.management!, ...(phase === 'KEEP' ? { stopIntent: 'KEEP' } : { phase }) } } as StrategyRecord;

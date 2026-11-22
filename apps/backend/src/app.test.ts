@@ -19,6 +19,7 @@ import { TradingSession } from './trading-session.js';
 import { ContinuousProtection } from './continuous-protection.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { MarginSnapshotSchema } from '@gate-crossex/shared-types';
+import { ManagedAdoption } from './managed-position-adoption.js';
 
 const accountFixture: GateCrossExAccount = {
   available_margin: '1200',
@@ -510,6 +511,57 @@ afterEach(async () => {
 });
 
 describe('local backend', () => {
+  it('loads a persisted deployment fence before protection can activate after restart', async () => {
+    const before = await createTestApp({ liveTradingEnabled: true });
+    vi.spyOn(before.gateway, 'queryPortfolio').mockResolvedValue({ ...portfolioFixture, openOrders: [], positions: [] });
+    const fenced = await before.app.inject({ method: 'POST', url: '/api/ops/deployment/fence',
+      headers: { host: '127.0.0.1', 'x-gct-deployment-intent': 'manage-deployment-fence' },
+      payload: { operationId: 'restart-integration', acknowledge: true } });
+    expect(fenced.statusCode, fenced.body).toBe(200);
+    const receipt = fenced.json();
+    await before.app.close(); before.database.close();
+    const after = await createTestApp({ directory: before.directory });
+    after.tradingSession.attachProtection(() => true, () => { throw new Error('maintenance must not revoke'); });
+    after.tradingSession.protect();
+    expect(after.tradingSession.current).toBe('unset');
+    const cancel = await after.app.inject({ method: 'POST', url: '/api/ops/deployment/unfence',
+      headers: { host: '127.0.0.1', 'x-gct-deployment-intent': 'manage-deployment-fence' },
+      payload: { operationId: receipt.operationId, leaseToken: receipt.leaseToken } });
+    expect(cancel.statusCode).toBe(409);
+    expect(cancel.json().error).toBe('deployment_source_changed');
+    expect(after.tradingSession.maintenancePending).toBe(true);
+    const state = await after.app.inject({ method: 'GET',
+      url: '/api/ops/deployment/fence/restart-integration', headers: { host: '127.0.0.1' } });
+    expect(state.statusCode).toBe(200);
+    expect(state.json()).toMatchObject({ operationId: receipt.operationId, newWritesBlocked: true });
+    const resume = await after.app.inject({ method: 'POST', url: '/api/trading-mode',
+      headers: { host: '127.0.0.1', 'x-gct-trading-intent': 'set-trading-mode' },
+      payload: { mode: 'live', acceptDisclaimer: true } });
+    expect(resume.statusCode).toBe(409);
+    expect(after.tradingSession.current).toBe('unset');
+    await after.vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'test-key', apiSecret: 'test-secret' });
+    vi.spyOn(after.gateway, 'queryPortfolio').mockResolvedValue({ ...portfolioFixture, openOrders: [], positions: [] });
+    const takeover = await after.app.inject({ method: 'POST', url: '/api/ops/deployment/takeover',
+      headers: { host: '127.0.0.1', 'x-gct-deployment-intent': 'manage-deployment-fence' },
+      payload: { operationId: receipt.operationId, leaseToken: receipt.leaseToken } });
+    expect(takeover.statusCode, takeover.body).toBe(200);
+    expect(after.tradingSession.current).toBe('live');
+    expect(after.tradingSession.maintenancePending).toBe(false);
+  });
+
+  it.each([false, true])('rejects remote active orders during handoff even with no local request (hard pause: %s)', async hardPaused => {
+    const context = await createTestApp({ liveTradingEnabled: true });
+    if (hardPaused) context.database.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)')
+      .run('managed_external_reduction', new Date().toISOString());
+    const result = await context.app.inject({ method: 'POST', url: '/api/ops/deployment/fence',
+      headers: { host: '127.0.0.1', 'x-gct-deployment-intent': 'manage-deployment-fence' },
+      payload: { operationId: 'remote-order-active', acknowledge: true } });
+    expect(result.statusCode).toBe(409);
+    expect(result.json()).toMatchObject({ error: 'deployment_orders_active' });
+    const state = await context.app.inject({ url: '/api/ops/deployment/fence/remote-order-active',
+      headers: { host: '127.0.0.1' } });
+    expect(state.json()).toMatchObject({ restartSafe: false });
+  });
   it('sends protection completion through the real stream and releases disconnected subscribers', async () => {
     const callbacks = new Set<() => void>();
     const subscription = vi.spyOn(ContinuousProtection.prototype, 'subscribeCompletion').mockImplementation(listener => {
@@ -612,6 +664,55 @@ describe('local backend', () => {
     expect((await app.inject({ method: 'GET', url: '/api/strategies/close-targets', headers })).json()).toEqual({ targets: [] });
     expect(gateway.createdOrders).toHaveLength(0);
     expect(gateway.cancelledOrders).toHaveLength(0);
+  });
+  it('continues only an authorized EXIT in protect-only and retains the global hard lock', async () => {
+    const { app, database, gateway, tradingSession } = await createTestApp({ liveTradingEnabled: true });
+    const id = 'PAIR-ABCDEF12', symbols = ['BINANCE_FUTURE_TEST_USDT', 'OKX_FUTURE_TEST_USDT'];
+    const config = { kind: 'position', asset: 'TEST', entryBps: '0', leftVenue: 'BINANCE', rightVenue: 'OKX',
+      leftSide: 'BUY', rightSide: 'SELL', totalAmount: '10', perOrderQuantity: '10', reduceOnly: false,
+      executionMethod: 'TAKER_TAKER', management: { perOrderQuantity: '10', durationSeconds: 2, intervalSeconds: 0, makerWaitSeconds: 5 } };
+    const now = new Date().toISOString();
+    database.prepare(`INSERT INTO execution_strategies (id,kind,environment,status,config_json,progress,filled_quantity,
+      filled_left,filled_right,open_position,credential_profile_id,created_at,updated_at)
+      VALUES (?,'position','live','PAUSED',?,100,'10','10','10','10',?,?,?)`)
+      .run(id, JSON.stringify(config), DEFAULT_CREDENTIAL_PROFILE, now, now);
+    database.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run(id, DEFAULT_CREDENTIAL_PROFILE, JSON.stringify({
+      phase: 'RISK_PAUSED', groupId: id, adoptedLeft: '0', adoptedRight: '0', adoptedAt: now,
+      stopIntent: 'EXIT', exitRequested: true, verified: true, leftQuantity: '10', rightQuantity: '10',
+      maxLeft: '10', maxRight: '10', observedReductions: ['0', '0'], pendingOrderIds: [], reason: 'synthetic_review',
+      spreadBps: null, fundingAprPct: null, fundingCheckedAt: null, checkedAt: now, conditionSince: null,
+      nextBatchAt: 0, fallback: false, openingQuantity: '10', after: Date.now(),
+    }), now);
+    for (const symbol of symbols) database.prepare('INSERT INTO managed_position_claims VALUES (?,?,?)')
+      .run(DEFAULT_CREDENTIAL_PROFILE, symbol, id);
+    database.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)').run('synthetic_review', now);
+    vi.spyOn(gateway, 'queryPortfolio').mockResolvedValue({ ...portfolioFixture, openOrders: [], positions: [
+      { ...portfolioFixture.positions[0], symbol: symbols[0], position_side: 'LONG', position_qty: '10' },
+      { ...portfolioFixture.positions[0], position_id: 'position-2', symbol: symbols[1], position_side: 'SHORT', position_qty: '10' },
+    ] });
+    tradingSession.attachProtection(() => true, () => undefined); tradingSession.protect();
+    const headers = { host: '127.0.0.1:17840', 'x-gct-trading-intent': 'resume-strategy' };
+    const resume = (expectedAction: string) => app.inject({ method: 'POST', url: `/api/strategies/${id}/resume`, headers,
+      payload: { expectedAction } });
+
+    expect(tradingSession.current).toBe('protect_only');
+    expect((await resume('EXITING')).json()).toMatchObject({ error: 'live_trading_locked' });
+    database.prepare('INSERT INTO continuous_protection_authority VALUES (?,?,?,?,?,?)')
+      .run(DEFAULT_CREDENTIAL_PROFILE, 'risk-account', 1, 1, JSON.stringify([id]), now);
+    const protection = await app.inject({ method: 'GET', url: '/api/risk/protection', headers: { host: '127.0.0.1:17840' } });
+    expect(protection.json().authorization).toMatchObject({ profileId: DEFAULT_CREDENTIAL_PROFILE, enabled: true, groupIds: [id] });
+    expect(protection.json().protection.coverage).toEqual([expect.objectContaining({ strategyId: id, enrolled: true })]);
+    const strategies = await app.inject({ method: 'GET', url: '/api/strategies', headers: { host: '127.0.0.1:17840' } });
+    expect(strategies.json().strategies.find((strategy: { id: string }) => strategy.id === id)).toMatchObject({ status: 'PAUSED', management: {
+      phase: 'RISK_PAUSED', stopIntent: 'EXIT', exitRequested: true,
+    } });
+    expect((await resume('MONITORING')).json()).toMatchObject({ error: 'live_trading_locked' });
+    expect(tradingSession.current).toBe('protect_only');
+    const response = await resume('EXITING');
+    expect(response.statusCode, response.body).toBe(200);
+    expect(response.json()).toMatchObject({ status: 'PAUSED', management: { phase: 'EXITING', stopIntent: 'EXIT', exitRequested: true } });
+    expect(tradingSession.current).toBe('protect_only');
+    expect(database.prepare('SELECT reason FROM managed_risk_lock').get()).toEqual({ reason: 'synthetic_review' });
   });
   it('reports live-only mode, migration state, and script-free credential handling', async () => {
     const { app } = await createTestApp();
@@ -889,6 +990,26 @@ describe('local backend', () => {
     expect(start.json()).toEqual({ error: 'live_trading_locked' });
     const strategies = await app.inject({ method: 'GET', url: '/api/strategies', headers: { host: '127.0.0.1:17840' } });
     expect(strategies.json()).toEqual({ strategies: [] });
+  });
+
+  it('returns an explicit retryable error when managed launch reservation storage stays busy', async () => {
+    const reserve = vi.spyOn(ManagedAdoption.prototype, 'reserve').mockImplementation(() => {
+      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY_SNAPSHOT' });
+    });
+    try {
+      const { app } = await createTestApp({ liveTradingEnabled: true });
+      const start = await app.inject({ method: 'POST', url: '/api/strategies', headers: {
+        host: '127.0.0.1:17840', 'x-gct-trading-intent': 'start-strategy',
+      }, payload: {
+        kind: 'position', asset: 'BTC', leftVenue: 'BINANCE', rightVenue: 'OKX', leftSide: 'SELL', rightSide: 'BUY',
+        entryBps: '100', totalAmount: '1', perOrderQuantity: '0.1', leftLeverage: '5', rightLeverage: '5', reduceOnly: false,
+        executionMethod: 'MAKER_TAKER', makerLeg: 'left', management: { perOrderQuantity: '0.1' },
+      } });
+      expect(start.statusCode).toBe(503);
+      expect(start.json()).toEqual({ error: 'managed_launch_storage_busy' });
+      expect((await app.inject({ method: 'GET', url: '/api/strategies', headers: { host: '127.0.0.1:17840' } })).json())
+        .toEqual({ strategies: [] });
+    } finally { reserve.mockRestore(); }
   });
 
   it('persists a paired strategy with a negative opening cost, lists it, and stops it', async () => {
@@ -1618,6 +1739,19 @@ describe('local backend', () => {
     }
     expect((await app.inject({ method: 'GET', url: '/api/markets/reference-quotes?symbols=GATE_FUTURE_UNKNOWN_USDT', headers })).statusCode).toBe(429);
     expect((await app.inject({ method: 'GET', url: '/api/trading/snapshot', headers })).statusCode).toBe(200);
+  });
+
+  it('keeps normal terminal read bursts below the global quota without relaxing scoped writes', async () => {
+    const { app } = await createTestApp();
+    const headers = { host: '127.0.0.1:17840' };
+    for (let count = 0; count < 180; count += 1) {
+      expect((await app.inject({ method: 'GET', url: '/api/strategies', headers })).statusCode).toBe(200);
+    }
+    expect((await app.inject({ method: 'POST', url: '/secure/credentials', headers, payload: {} })).statusCode).not.toBe(429);
+    for (let count = 0; count < 10; count += 1) {
+      expect((await app.inject({ method: 'POST', url: '/api/onboarding/accounts/missing/activate', headers })).statusCode).toBe(403);
+    }
+    expect((await app.inject({ method: 'POST', url: '/api/onboarding/accounts/missing/activate', headers })).statusCode).toBe(429);
   });
 
   it('validates scoped reference reads without trading writes or unknown-contract upstream queries', async () => {

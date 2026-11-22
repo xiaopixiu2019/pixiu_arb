@@ -24,13 +24,28 @@ SKIP_SERVICE="${GCT_SKIP_SERVICE:-0}"
 OPEN_BROWSER="${GCT_OPEN_BROWSER:-1}"
 TMP=""
 STAGE=""
+ACTIVATION_ACTIVE=0
+ACTIVATION_BACKUP=""
+PREVIOUS_RELEASE=""
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$ACTIVATION_ACTIVE" = "1" ]; then
+    if rollback_activation; then
+      echo "Installation failed; the previous activation state was restored." >&2
+    else
+      echo "Rollback could not finish; recovery files remain at $TMP. Inspect the backend logs before retrying." >&2
+      TMP=""
+    fi
+    status=1
+  fi
   [ -n "$STAGE" ] && rm -rf "$STAGE" || true
   [ -n "$TMP" ] && rm -rf "$TMP" || true
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -171,8 +186,56 @@ stage_bundle() {
   fi
   rm -rf "$STAGE"
   STAGE=""
-  cp "$RELEASE_DIR/app/uninstall.sh" "$ROOT/uninstall.sh"
-  chmod 700 "$ROOT/uninstall.sh"
+}
+
+save_activation() {
+  ACTIVATION_BACKUP="$TMP/activation-backup"
+  mkdir -p "$ACTIVATION_BACKUP"
+  local path name
+  for name in plist legacy cli uninstaller launcher; do
+    case "$name" in
+      plist) path="$PLIST" ;; legacy) path="$LEGACY_PLIST" ;;
+      cli) path="$ROOT/bin/gate-crossex" ;; uninstaller) path="$ROOT/uninstall.sh" ;;
+      launcher) path="$LAUNCHER_APP" ;;
+    esac
+    if [ -e "$path" ] || [ -L "$path" ]; then cp -RP "$path" "$ACTIVATION_BACKUP/$name"; fi
+  done
+}
+
+restore_activation_files() {
+  local path name
+  for name in plist legacy cli uninstaller launcher; do
+    case "$name" in
+      plist) path="$PLIST" ;; legacy) path="$LEGACY_PLIST" ;;
+      cli) path="$ROOT/bin/gate-crossex" ;; uninstaller) path="$ROOT/uninstall.sh" ;;
+      launcher) path="$LAUNCHER_APP" ;;
+    esac
+    rm -rf "$path" || return 1
+    if [ -e "$ACTIVATION_BACKUP/$name" ] || [ -L "$ACTIVATION_BACKUP/$name" ]; then
+      mkdir -p "$(dirname "$path")" || return 1
+      cp -RP "$ACTIVATION_BACKUP/$name" "$path" || return 1
+    fi
+  done
+}
+
+rollback_activation() {
+  local loaded i
+  if [ "$SKIP_SERVICE" != "1" ] && service_loaded; then
+    loaded="$(launchctl print "gui/$(id -u)/$LABEL")" || return 1
+    [ "$(printf '%s\n' "$loaded" | sed -n 's/^[[:space:]]*program = //p')" = "$ROOT/current/runtime/bin/node" ] || return 1
+    launchctl bootout "gui/$(id -u)/$LABEL" || return 1
+  fi
+  for i in $(seq 1 140); do
+    [ -z "$(owned_backend_pid)" ] && break
+    sleep 0.25
+  done
+  [ -z "$(owned_backend_pid)" ] || return 1
+  rm -f "$ROOT/current" || return 1
+  if [ -n "$PREVIOUS_RELEASE" ]; then ln -s "$PREVIOUS_RELEASE" "$ROOT/current" || return 1; fi
+  restore_activation_files || return 1
+  if [ "$SKIP_SERVICE" != "1" ] && [ -n "$PREVIOUS_RELEASE" ]; then
+    restart_previous_service && wait_for_health || return 1
+  fi
 }
 
 service_loaded() {
@@ -361,7 +424,7 @@ port_available() {
 }
 
 start_service() {
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || return 1
   launchctl kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 }
 
@@ -378,8 +441,10 @@ wait_for_health() {
 }
 
 activate_release() {
-  local old_current="" rollback_ok=0
+  local old_current=""
   if [ -L "$ROOT/current" ]; then old_current="$(readlink "$ROOT/current")"; fi
+  PREVIOUS_RELEASE="$old_current"
+  save_activation
   stop_service
   if ! backup_database "$old_current"; then
     if [ "$SKIP_SERVICE" != "1" ] && [ -n "$old_current" ] && [ -d "$old_current" ]; then
@@ -392,28 +457,19 @@ activate_release() {
     fail "port $PORT is in use by another application; set GCT_PORT to a free port and retry."
   fi
 
+  ACTIVATION_ACTIVE=1
   rm -f "$ROOT/current"
   ln -s "$RELEASE_DIR" "$ROOT/current"
-  if [ "$SKIP_SERVICE" = "1" ]; then return 0; fi
+  cp "$RELEASE_DIR/app/uninstall.sh" "$ROOT/uninstall.sh"
+  chmod 700 "$ROOT/uninstall.sh"
+  if [ "$SKIP_SERVICE" = "1" ]; then ACTIVATION_ACTIVE=0; return 0; fi
   write_plist
   write_cli
   make_launcher
   retire_legacy_plist
   say "Starting Gate CrossEx $RELEASE_ID..."
-  if start_service && wait_for_health; then return 0; fi
-
-  launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-  if [ -n "$old_current" ] && [ -d "$old_current" ]; then
-    say "The new release failed its health check; rolling back."
-    rm -f "$ROOT/current"
-    ln -s "$old_current" "$ROOT/current"
-    write_plist
-    if start_service && wait_for_health; then rollback_ok=1; fi
-  else
-    rm -f "$ROOT/current" "$PLIST"
-  fi
-  [ "$rollback_ok" -eq 1 ] && fail "installation failed; the previous release was restored and restarted."
-  fail "installation failed and Gate CrossEx could not be restarted; inspect $ROOT/logs/backend.err.log."
+  if start_service && wait_for_health; then ACTIVATION_ACTIVE=0; return 0; fi
+  fail "the new release failed activation; restoring the previous activation state."
 }
 
 main() {

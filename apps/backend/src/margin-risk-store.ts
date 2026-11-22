@@ -22,6 +22,7 @@ export interface CostReservation { batchId: string; amount: string; quantity: st
 type Row = { policy_json: string; incident_json: string | null; entry_latched: number };
 type Point = MarginHistory['points'][number];
 const DAY = 86_400_000;
+const RAW_SAMPLE_RETENTION = 2 * 3_600_000;
 export class MarginRiskStore {
   constructor(private readonly db: Database.Database) {}
   /** Detect writes within a synchronous assessment; never a persisted authorization. */
@@ -115,7 +116,7 @@ export class MarginRiskStore {
     return { points: stepMs <= 60000 ? rows : aggregatePoints(rows, stepMs), startedAt: earliest.at, stepMs };
   }
   prune(now = Date.now()): void {
-    this.db.prepare('DELETE FROM margin_risk_samples WHERE sampled_at < ?').run(now - DAY);
+    this.db.prepare('DELETE FROM margin_risk_samples WHERE sampled_at < ?').run(now - RAW_SAMPLE_RETENTION);
     this.db.prepare('DELETE FROM margin_risk_minutes WHERE minute_at < ?').run(now - 30 * DAY);
   }
 }

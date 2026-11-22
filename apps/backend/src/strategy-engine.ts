@@ -1,4 +1,5 @@
 import { freshManagedQuote } from './managed-position-model.js';
+import { expiredEntryIoc } from './entry-ioc.js';
 import { consumeRouterOutcome, routerEntryBlock, ROUTER_REVIEW, ROUTER_WAIT } from './router-entry-retry.js';
 import { clearPreparationRecovery, failedPreparation, isPreparationTimeout, preparationIdentity, preparationEntryBlock, PREPARATION_REVIEW, PREPARATION_WAIT } from './entry-preparation-recovery.js';
 import { randomUUID } from 'node:crypto';
@@ -72,6 +73,15 @@ interface MakerQuote {
   cancellation?: { startedAt: number; checking: boolean; nextCheckAt: number; failure: string | null };
 }
 
+interface DesiredMakerPrice {
+  price: Decimal;
+  boundary: Decimal;
+  makerBid: Decimal;
+  makerAsk: Decimal;
+  makerLeg: LegDefinition;
+  takerLeg: LegDefinition;
+}
+
 interface StrategyActor {
   id: string;
   config: CreateStrategyInput;
@@ -81,6 +91,7 @@ interface StrategyActor {
   queue: Promise<void>;
   quotes: Map<QuoteIntent, MakerQuote>;
   repairAttempts: number;
+  hedgeAttemptIds: string[];
   lastRepairAt: number;
   failureCount: number;
   cooldownUntil: number;
@@ -260,7 +271,7 @@ export class StrategyEngine {
       cancel: id => {
         const actor = this.actors.get(id);
         if (!actor || actor.suspended || actor.status !== 'RUNNING') throw new Error('managed_entry_controller_unavailable');
-        for (const [intent, quote] of actor.quotes) this.beginMakerCancellation(actor, intent, quote);
+        for (const [intent, quote] of actor.quotes) this.beginMakerCancellation(actor, intent, quote, 'account_recheck');
       },
       evidence: (id, orderId) => {
         const actor = this.actors.get(id);
@@ -270,7 +281,7 @@ export class StrategyEngine {
       },
     });
   }
-  private readonly managedStops = new Map<string, { closePositions: boolean; promise: Promise<StrategyRecord> }>();
+  private readonly managedStops = new Map<string, { closePositions: boolean; marketFallback: boolean; promise: Promise<StrategyRecord> }>();
   private async haltManagedEntry(id: string): Promise<void> {
     const actor = this.actors.get(id);
     if (actor) { actor.suspended = true; await actor.queue; }
@@ -481,6 +492,7 @@ export class StrategyEngine {
   ): Promise<StrategyRecord> {
     const run = this.startQueue.then(async () => {
       const config = CreateStrategyInputSchema.parse(raw);
+      if (config.management?.monitorOnly) throw new StrategyEngineError('managed_monitor_only_requires_handoff', 409);
       if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
       const id = `PAIR-${randomUUID().replaceAll('-', '').slice(0, 8).toUpperCase()}`;
       if (config.management) {
@@ -648,24 +660,30 @@ export class StrategyEngine {
     return record;
   }
 
-  async stopStrategy(id: string, closePositions = false): Promise<StrategyRecord> {
+  async stopStrategy(id: string, closePositions = false, marketFallback = false): Promise<StrategyRecord> {
     const existing = this.managedStops.get(id);
     if (existing) {
-      if (existing.closePositions !== closePositions) throw new StrategyEngineError('managed_stop_in_progress', 409);
+      if (existing.closePositions !== closePositions || existing.marketFallback !== marketFallback) throw new StrategyEngineError('managed_stop_in_progress', 409);
       return existing.promise;
     }
-    const pending = this.stopStrategyOnce(id, closePositions).finally(() => this.managedStops.delete(id));
-    this.managedStops.set(id, { closePositions, promise: pending });
+    const pending = this.stopStrategyOnce(id, closePositions, marketFallback).finally(() => this.managedStops.delete(id));
+    this.managedStops.set(id, { closePositions, marketFallback, promise: pending });
     return pending;
   }
-  private async stopStrategyOnce(id: string, closePositions: boolean): Promise<StrategyRecord> {
+  private async stopStrategyOnce(id: string, closePositions: boolean, marketFallback: boolean): Promise<StrategyRecord> {
     const record = this.runtime.getStrategy(id);
     if (record.config.management && record.status !== 'COMPLETED') {
-      if (closePositions && (!this.session.liveTradingEnabled || record.status === 'PAUSED' || managedRiskReason(this.database))) {
+      if (closePositions && (!this.session.liveTradingEnabled
+        || record.status !== 'PAUSED' && managedRiskReason(this.database))) {
         throw new StrategyEngineError('managed_review_required', 409);
       }
       if (!this.positionManager) throw new StrategyEngineError('managed_monitor_unavailable', 409);
-      this.positionManager.beginStop(id, closePositions);
+      if (closePositions && record.status === 'PAUSED') {
+        if (!record.accountProfileId) throw new StrategyEngineError('strategy_account_not_active', 409);
+        await this.haltManagedEntry(id);
+        return this.positionManager.resume(id, record.accountProfileId, 'EXITING', true, marketFallback);
+      }
+      this.positionManager.beginStop(id, closePositions, marketFallback);
       await this.positionManager.waitForIdle();
       await this.haltManagedEntry(id);
       await this.positionManager.finishStop(id);
@@ -692,8 +710,10 @@ export class StrategyEngine {
   }
 
   async resumeStrategy(id: string, credentialProfileId: string, expectedAction?: ManagedResumeAction): Promise<StrategyRecord> {
-    if (!this.session.liveTradingEnabled) throw new StrategyEngineError('live_trading_locked', 403);
     const record = this.runtime.getStrategy(id);
+    const protectedExit = expectedAction === 'EXITING' && this.session.current === 'protect_only'
+      && record.management?.stopIntent === 'EXIT' && record.management.exitRequested;
+    if (!this.session.liveTradingEnabled && !protectedExit) throw new StrategyEngineError('live_trading_locked', 403);
     if (this.managedStops.has(id)) throw new StrategyEngineError('managed_stop_in_progress', 409);
     if (record.config.management) {
       if (!this.positionManager) throw new StrategyEngineError('managed_monitor_unavailable', 409);
@@ -824,8 +844,17 @@ export class StrategyEngine {
   }
 
   /** Evaluate every active strategy once. Exposed for deterministic tests. */
+  async settleMaintenanceTurns(): Promise<void> {
+    await this.tickRun;
+    await Promise.all([...this.actors.values()].map(actor => actor.queue));
+  }
+
   async tick(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || this.session.maintenancePending) return;
+    return this.runtime.runApplicationTurn(() => this.tickAdmitted());
+  }
+
+  private async tickAdmitted(): Promise<void> {
     // Check cancellation deadlines before the shared tick/actor queues: a slow hedge in any
     // strategy must not extend another maker's confirmation budget.
     await Promise.all([...this.actors.values()].filter(actor => actor.status === 'RUNNING' && !actor.suspended)
@@ -860,10 +889,11 @@ export class StrategyEngine {
   }
 
   private attach(record: StrategyRecord, suspended = false): StrategyActor {
+    if (record.config.management?.monitorOnly) throw new StrategyEngineError('managed_reentry_forbidden', 409);
     this.invalidateLedger(record.id);
     const actor: StrategyActor = {
       id: record.id, config: record.config, kind: record.kind, status: record.status,
-      busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0,
+      busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0, hedgeAttemptIds: [],
       lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
       suspended, quiesceTarget: null, quiesceReason: null, createdAt: Date.parse(record.createdAt),
       lastCloseAt: Date.parse(record.updatedAt),
@@ -936,7 +966,10 @@ export class StrategyEngine {
   }
 
   private enqueue(actor: StrategyActor, work: () => Promise<void>): void {
-    actor.queue = actor.queue.then(work).catch((error: unknown) => {
+    const previous = actor.queue;
+    actor.queue = this.runtime.runApplicationTurn(async () => { await previous; await work(); }).catch((error: unknown) => {
+      // Stream ingestion already persisted the event. The next admitted tick reconciles it.
+      if (error instanceof TradingRuntimeError && error.code === 'deployment_fence_active') return;
       if (actor.config.management && error instanceof TradingRuntimeError
         && ['managed_task_stopped', 'managed_reentry_forbidden'].includes(error.code)) return;
       this.runtime.addStrategyLog(actor.id, 'error', 'Strategy engine error', '—', '—',
@@ -966,9 +999,11 @@ export class StrategyEngine {
     if (!this.freshMarketPair(legs.left.symbol, legs.right.symbol)) throw new StrategyEngineError('strategy_market_data_unavailable', 409);
   }
   private validateMakerSubmission(actor: StrategyActor, intent: QuoteIntent, price: Decimal): void {
+    if (intent === 'entry' && actor.config.management && this.mustFinishEntryHedge(actor, this.legExposures(actor.id, actor.config)))
+      throw new TradingRuntimeError('managed_entry_hedge_pending', 409, undefined, true, actor.id);
     this.validateSubmissionQuotes(actor, intent);
     const desired = this.desiredMakerPrice(actor, intent);
-    if (!desired || (desired.makerLeg.side === 'SELL' ? price.lt(desired.price) : price.gt(desired.price))) {
+    if (!desired || this.makerQuoteInvalidReason(price, desired)) {
       throw new TradingRuntimeError('strategy_quote_changed', 409);
     }
   }
@@ -1478,6 +1513,11 @@ export class StrategyEngine {
       .get(actor.id, leg.symbol, leg.side) as { state: string; executed_quantity: string; failure_reason: string | null } | undefined;
     if (rejected?.state !== 'FAIL' || !new Decimal(rejected.executed_quantity).isZero()
       || !isHyperliquidOpenInterestCapFailure(rejected.failure_reason ?? '')) return false;
+    await this.isolateEntryResidual(actor, reason);
+    return true;
+  }
+
+  private async isolateEntryResidual(actor: StrategyActor, reason: string): Promise<void> {
     actor.suspended = true;
     try {
       const settled = await this.runtime.quiesceOpenOrders({ strategyId: actor.id, timeoutMs: this.options.orderTimeoutMs });
@@ -1487,7 +1527,6 @@ export class StrategyEngine {
     } catch (error) {
       this.positionManager?.failAll(error instanceof Error ? error.message : 'capacity_protection_unverified');
     }
-    return true;
   }
 
   private async pause(actor: StrategyActor, reason: string): Promise<void> {
@@ -1909,7 +1948,7 @@ export class StrategyEngine {
     await this.afterExecutionChange(actor);
   }
 
-  private desiredMakerPrice(actor: StrategyActor, intent: QuoteIntent): { price: Decimal; makerLeg: LegDefinition; takerLeg: LegDefinition } | null {
+  private desiredMakerPrice(actor: StrategyActor, intent: QuoteIntent): DesiredMakerPrice | null {
     const makerLegKey = actor.config.makerLeg ?? 'left';
     const legs = this.legsForIntent(actor, intent);
     const makerLeg = makerLegKey === 'left' ? legs.left : legs.right;
@@ -1942,7 +1981,21 @@ export class StrategyEngine {
     if (!price.gt(0)) return null;
     const finalPrice = isHyperliquidFuture(makerLeg.symbol)
       ? new Decimal(hyperliquidLimitPrice(price.toFixed(), tick, makerLeg.side)) : price;
-    return { price: finalPrice, makerLeg, takerLeg };
+    return { price: finalPrice, boundary, makerBid: new Decimal(makerMarket.bidPrice),
+      makerAsk: new Decimal(makerMarket.askPrice), makerLeg, takerLeg };
+  }
+
+  private makerQuoteInvalidReason(price: Decimal, desired: DesiredMakerPrice): string | null {
+    const economic = desired.makerLeg.side === 'SELL' ? price.gte(desired.boundary) : price.lte(desired.boundary);
+    if (!economic) return 'economic_boundary_invalid';
+    const postOnly = desired.makerLeg.side === 'SELL' ? price.gt(desired.makerBid) : price.lt(desired.makerAsk);
+    return postOnly ? null : 'post_only_price_crossed';
+  }
+
+  private competitivelyImproves(existing: MakerQuote, desired: DesiredMakerPrice, tolerance: Decimal): boolean {
+    const improvement = desired.makerLeg.side === 'SELL'
+      ? existing.price.minus(desired.price) : desired.price.minus(existing.price);
+    return improvement.gte(tolerance);
   }
 
   private async evaluateMakerQuotes(actor: StrategyActor): Promise<void> {
@@ -1951,7 +2004,7 @@ export class StrategyEngine {
     const perOrder = new Decimal(actor.config.perOrderQuantity);
     const intents: Array<{ intent: QuoteIntent; quantity: Decimal }> = [];
     const entryCapacity = this.remainingEntryCapacity(actor, exposure);
-    if (entryCapacity.gt(QUANTITY_EPSILON)) {
+    if (entryCapacity.gt(QUANTITY_EPSILON) && (actor.quotes.has('entry') || !this.mustFinishEntryHedge(actor, exposure))) {
       const entryQuantity = this.carryAdjustedMakerQuantity(actor, exposure, Decimal.min(perOrder, entryCapacity));
       if (entryQuantity.gt(QUANTITY_EPSILON)) intents.push({ intent: 'entry', quantity: entryQuantity });
     }
@@ -1962,7 +2015,7 @@ export class StrategyEngine {
       if (!intents.some((candidate) => candidate.intent === intent)) {
         const quote = actor.quotes.get(intent);
         if (quote && !quote.cancelling) {
-          this.beginMakerCancellation(actor, intent, quote);
+          this.beginMakerCancellation(actor, intent, quote, 'intent_inactive');
         }
       }
     }
@@ -1971,31 +2024,51 @@ export class StrategyEngine {
     }
   }
 
+  private mustFinishEntryHedge(actor: StrategyActor, exposure: { left: Decimal; right: Decimal }): boolean {
+    if (!actor.config.management || actor.config.kind !== 'position' || actor.config.reduceOnly) return false;
+    const difference = exposure.left.plus(exposure.right).abs();
+    if (difference.lte(QUANTITY_EPSILON)) return false;
+    const lagging = exposure.left.abs().lt(exposure.right.abs()) ? 'left' : 'right';
+    const leg = legsOf(actor.config)[lagging];
+    const quantity = roundToStep(difference, this.constraintsFor(leg.symbol).lotSize, 'down');
+    if (!quantity.gt(QUANTITY_EPSILON)) return false;
+    const issue = this.marketOrderSizeError(leg.symbol, leg.side, quantity);
+    return issue?.code !== 'strategy_order_below_minimum_notional' && issue?.code !== 'strategy_order_below_minimum_size';
+  }
+
   private async maintainQuote(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal): Promise<void> {
     if (actor.status !== 'RUNNING') return;
     if (intent === 'entry' && preparationEntryBlock(this.database, this.runtime.getStrategy(actor.id), this.options.now())) return;
     if (intent === 'entry' && routerEntryBlock(this.database, this.runtime.getStrategy(actor.id), this.options.now())) return;
+    const existing = actor.quotes.get(intent);
     let desired: ReturnType<StrategyEngine['desiredMakerPrice']>;
     try { desired = this.desiredMakerPrice(actor, intent); }
     catch (error) {
       if (!(error instanceof HyperliquidPriceError)) throw error;
       await this.pause(actor, error.code); return;
     }
-    if (!desired) return;
-    if (intent === 'entry' && actor.config.management && this.runtime.pairedEntryReady(actor.id) && !this.runtime.pairedMakerReady(actor.id)) return;
-    const existing = actor.quotes.get(intent);
+    if (!desired) {
+      if (existing && !existing.cancelling) this.beginMakerCancellation(actor, intent, existing, 'required_market_data_unavailable');
+      return;
+    }
+    if (intent === 'entry' && actor.config.management && this.runtime.pairedEntryReady(actor.id) && !this.runtime.pairedMakerReady(actor.id)) {
+      if (existing && !existing.cancelling) this.beginMakerCancellation(actor, intent, existing, 'entry_progress_rechecking');
+      return;
+    }
     const now = this.options.now();
     if (existing) {
       if (existing.cancelling) return;
       if (actor.config.management && intent === 'entry' && this.runtime.pairedEntryReady(actor.id) === false
         && this.database.prepare('SELECT 1 FROM paired_entry_reservations WHERE strategy_id=?').get(actor.id)) {
-        this.beginMakerCancellation(actor, intent, existing); return;
+        this.beginMakerCancellation(actor, intent, existing, 'entry_preparation_unavailable'); return;
       }
+      const invalid = this.makerQuoteInvalidReason(existing.price, desired);
+      if (invalid) { this.beginMakerCancellation(actor, intent, existing, invalid); return; }
       const tick = this.constraintsFor(desired.makerLeg.symbol).tickSize;
       const tolerance = tick ? new Decimal(tick) : existing.price.mul('0.0001');
-      const drifted = desired.price.minus(existing.price).abs().gte(tolerance);
-      if (!drifted || now - existing.quotedAt < this.options.requoteIntervalMs) return;
-      this.beginMakerCancellation(actor, intent, existing);
+      if (!this.competitivelyImproves(existing, desired, tolerance)
+        || now - existing.quotedAt < this.options.requoteIntervalMs) return;
+      this.beginMakerCancellation(actor, intent, existing, 'competitive_requote');
       return;
     }
     if (now - actor.lastQuoteAt < this.options.requoteIntervalMs / 2) return;
@@ -2038,15 +2111,17 @@ export class StrategyEngine {
       }, { feePhase: reduceOnly ? 'exit' : 'entry', strategyId: actor.id, strategyLeg: desired.makerLeg.leg,
         beforeSubmit: () => this.validateMakerSubmission(actor, intent, desired.price),
         beforeDispatch: () => this.validateMakerSubmission(actor, intent, desired.price) });
-      if (!isTerminalOrderState(order.state)) actor.quotes.set(intent, { orderId: order.id, price: desired.price, quantity: roundedQuantity, quotedAt: now, cancelling: false });
-      actor.lastQuoteAt = now;
+      const acceptedAt = this.options.now();
+      if (!isTerminalOrderState(order.state)) actor.quotes.set(intent, { orderId: order.id, price: desired.price, quantity: roundedQuantity, quotedAt: acceptedAt, cancelling: false });
+      actor.lastQuoteAt = acceptedAt;
       consumeRouterOutcome(this.database, this.runtime.getStrategy(actor.id), order);
       if (order.state !== 'FAIL') actor.failureCount = 0;
       this.runtime.addStrategyLog(actor.id, order.state === 'FAIL' ? 'warning' : 'info', order.state === 'FAIL' ? 'Maker terminal rejection' : intent === 'entry' ? 'Maker quote placed' : 'Maker exit quote placed',
         `Post-only at ${desired.price.toString()}`, `${roundedQuantity.toString()} ${actor.config.asset}`,
         `${desired.makerLeg.side} ${desired.makerLeg.symbol}${order.state === 'FAIL' ? ` · ${failureSummary(order.failureReason) ?? 'unverified rejection'}` : ''}`);
     } catch (error) {
-      if (isAccountRecheckDeferral(error)) return;
+      if (isAccountRecheckDeferral(error) || error instanceof TradingRuntimeError && error.notDispatched
+        && error.code === 'managed_entry_hedge_pending') return;
       if (preparing && actor.config.management && error instanceof TradingRuntimeError && isPreparationTimeout(error.code, error.label)) {
         if (!this.session.liveTradingEnabled || actor.suspended || actor.status !== 'RUNNING' || !this.actors.has(actor.id)) return;
         const review = failedPreparation(this.database, this.runtime.getStrategy(actor.id), preparationAttempt, this.options.now(), preparationScope);
@@ -2062,7 +2137,7 @@ export class StrategyEngine {
       actor.cooldownUntil = this.options.now() + Math.min(60_000, 2_000 * 2 ** Math.min(4, actor.failureCount));
       const detail = preparing ? error instanceof TradingRuntimeError
         ? `${error.code} ${/^paired_entry_(read_failed|margin_mode_unverified|leverage_unavailable|leverage_mismatch|risk_tier_changed)$/.test(error.code) ? error.label ?? '' : ''}`.trim()
-        : 'paired_entry_preparation_failed'
+        : error instanceof Error && /^(paired_entry_|margin_)/.test(error.message) ? error.message : 'paired_entry_preparation_failed'
         : error instanceof Error ? error.message.slice(0, 120) : 'submit error';
       this.runtime.addStrategyLog(actor.id, 'warning', preparing ? 'Maker entry preparation failed' : 'Maker quote rejected',
         `Post-only at ${desired.price.toString()}`, roundedQuantity.toString(), detail.slice(0, 600));
@@ -2074,9 +2149,15 @@ export class StrategyEngine {
     }
   }
 
-  private beginMakerCancellation(actor: StrategyActor, intent: QuoteIntent, quote: MakerQuote): void {
+  private beginMakerCancellation(actor: StrategyActor, intent: QuoteIntent, quote: MakerQuote, reason = 'unspecified'): void {
+    const starting = !quote.cancellation;
     quote.cancelling = true;
     quote.cancellation ??= { startedAt: this.options.now(), checking: false, nextCheckAt: 0, failure: null };
+    if (starting) {
+      const order = this.runtime.getOrder(quote.orderId);
+      this.runtime.addStrategyLog(actor.id, 'info', 'Maker cancellation started', reason,
+        `${order.executedQuantity}/${order.quantity} ${actor.config.asset}`, `${intent} · ${order.side} ${order.symbol}`);
+    }
     this.probeMakerCancellation(actor, intent, quote);
   }
 
@@ -2398,6 +2479,7 @@ export class StrategyEngine {
     })();
     if (!target) {
       actor.repairAttempts = 0;
+      actor.hedgeAttemptIds = [];
       return;
     }
     const quoteOrderIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
@@ -2405,6 +2487,19 @@ export class StrategyEngine {
     const now = this.options.now();
     if (now - actor.lastRepairAt < this.options.repairCooldownMs) return;
     if (actor.repairAttempts >= 3) {
+      if (actor.hedgeAttemptIds.length === actor.repairAttempts && actor.config.management && actor.config.kind === 'position' && !actor.config.reduceOnly
+        && actor.config.executionMethod === 'MAKER_TAKER' && target.lagging !== (actor.config.makerLeg ?? 'left')) {
+        if (managedRiskReason(this.database)) return;
+        const leg = legsOf(actor.config)[target.lagging];
+        if (actor.hedgeAttemptIds.every(id => {
+          const order = this.runtime.getOrder(id);
+          return order.strategyId === actor.id && order.strategyLeg === leg.leg && order.symbol === leg.symbol
+            && order.side === leg.side && expiredEntryIoc(order);
+        })) {
+          await this.isolateEntryResidual(actor, 'managed_entry_hedge_exhausted');
+          return;
+        }
+      }
       await this.pause(actor, `Unable to hedge residual exposure of ${target.residual.toString()} ${actor.config.asset} after 3 attempts; manual review required`);
       return;
     }
@@ -2485,6 +2580,7 @@ export class StrategyEngine {
     actor.busy = true;
     const previousRepairAt = actor.lastRepairAt;
     actor.lastRepairAt = now;
+    if (actor.repairAttempts === 0) actor.hedgeAttemptIds = [];
     actor.repairAttempts += 1;
     let submitted = false;
     try {
@@ -2504,6 +2600,7 @@ export class StrategyEngine {
           beforeSubmit: () => this.validateRepairQuote(repairLeg.symbol), beforeDispatch: () => this.validateRepairQuote(repairLeg.symbol),
           ...(target.clip ? { strategyClip: target.clip } : {}) });
         submitted = true;
+        actor.hedgeAttemptIds.push(order.id);
         const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
         if (!trimExcess && await this.pauseHyperliquidCapacityTask(actor, repairLeg, settled.failureReason ?? '')) return;
         if (settled.state === 'FILLED') actor.repairAttempts = 0;
@@ -2517,6 +2614,10 @@ export class StrategyEngine {
       if (!trimExcess && await this.pauseHyperliquidCapacityTask(actor, repairLeg,
         error instanceof GateApiError ? error.label : error instanceof Error ? error.message : '')) return;
       if (!topUpRequired && !submitted && isAccountRecheckDeferral(error)) {
+        actor.repairAttempts -= 1; actor.lastRepairAt = previousRepairAt; return;
+      }
+      if (!topUpRequired && !submitted && error instanceof TradingRuntimeError
+        && error.code === 'paired_entry_preparation_unavailable') {
         actor.repairAttempts -= 1; actor.lastRepairAt = previousRepairAt; return;
       }
       this.runtime.addStrategyLog(actor.id, 'warning', 'Hedge order failed', `Residual ${target.residual.toString()}`,

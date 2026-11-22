@@ -4,6 +4,7 @@ import type { ManagedState } from './managed-position-store.js';
 import { TradingRuntimeError, type StrategyRecord } from './trading-runtime.js';
 import type { ManagedLeg } from './managed-position-model.js';
 import { managedLegs } from './managed-legs.js';
+import { expiredEntryIoc } from './entry-ioc.js';
 
 export type ManagedResumeAction = 'OPENING' | 'MONITORING' | 'EXITING';
 
@@ -11,7 +12,7 @@ export type ManagedResumeAction = 'OPENING' | 'MONITORING' | 'EXITING';
 export function managedResumeAction(record: StrategyRecord, state: ManagedState): ManagedResumeAction {
   if (state.stopIntent === 'KEEP') return 'MONITORING';
   if (state.exitRequested || state.stopIntent === 'EXIT') return 'EXITING';
-  if (state.entryIntent === 'MONITORING' || state.protectionIncident || state.marginBatch || state.pauseAfterProtection) return 'MONITORING';
+  if (record.config.management?.monitorOnly || state.entryIntent === 'MONITORING' || state.protectionIncident || state.marginBatch || state.pauseAfterProtection) return 'MONITORING';
   if (state.verified && state.entryIntent !== 'OPENING') return 'MONITORING';
   const filled = Decimal.min(record.filledLeft, record.filledRight);
   return filled.gte(record.config.totalAmount ?? '0') ? 'MONITORING' : 'OPENING';
@@ -44,23 +45,31 @@ export function verifyResumableEntry(db: Database.Database, record: StrategyReco
   const adopted = [new Decimal(state.adoptedLeft!), new Decimal(state.adoptedRight!)];
   if (!target.isPositive() || !adopted[0].eq(adopted[1]) || adopted.some(q => q.isNegative())) reject();
   const history = db.prepare(`SELECT strategy_leg, symbol, side, quantity, executed_quantity,
-    reduce_only, remote_order_id, state, failure_reason FROM execution_orders WHERE strategy_id = ?`).all(record.id) as Array<{
+    order_type, time_in_force, reduce_only, remote_order_id, state, failure_reason FROM execution_orders WHERE strategy_id = ?`).all(record.id) as Array<{
+      order_type: string; time_in_force: string;
       strategy_leg: string; symbol: string; side: string; quantity: string; executed_quantity: string;
       reduce_only: number; remote_order_id: string | null; state: string; failure_reason: string | null;
     }>;
-  const filled = [new Decimal(0), new Decimal(0)];
+  const gross = [new Decimal(0), new Decimal(0)], reductions = [new Decimal(0), new Decimal(0)];
   for (const row of history) {
     const index = row.strategy_leg === 'left' ? 0 : row.strategy_leg === 'right' ? 1 : -1;
-    if (index < 0 || !row.remote_order_id || row.failure_reason || row.reduce_only
+    const expiredHedge = record.config.executionMethod === 'MAKER_TAKER'
+      && row.strategy_leg !== (record.config.makerLeg ?? 'left') && expiredEntryIoc({ state: row.state,
+        type: row.order_type, timeInForce: row.time_in_force, reduceOnly: Boolean(row.reduce_only),
+        remoteOrderId: row.remote_order_id, failureReason: row.failure_reason, quantity: row.quantity, executedQuantity: row.executed_quantity });
+    if (index < 0 || !row.remote_order_id || row.failure_reason && !expiredHedge
       || !['FILLED', 'CANCELLED'].includes(row.state)) reject();
     const leg = legs[index as 0 | 1];
-    const quantity = new Decimal(row.executed_quantity);
-    if (row.symbol !== leg.symbol || row.side !== leg.side || !quantity.isFinite()
+    const quantity = new Decimal(row.executed_quantity), expectedSide = row.reduce_only ? leg.side === 'BUY' ? 'SELL' : 'BUY' : leg.side;
+    if (row.symbol !== leg.symbol || row.side !== expectedSide || !quantity.isFinite()
       || quantity.isNegative() || quantity.gt(row.quantity) || row.state === 'FILLED' && !quantity.eq(row.quantity)) reject();
-    filled[index] = filled[index].plus(quantity);
+    if (row.reduce_only) reductions[index] = reductions[index].plus(quantity);
+    else gross[index] = gross[index].plus(quantity);
   }
-  if (!filled[0].eq(filled[1]) || filled[0].gt(target)
-    || !filled[0].eq(record.filledLeft) || !filled[1].eq(record.filledRight) || !filled[0].eq(record.filledQuantity)
-    || filled.some((q, i) => !q.plus(adopted[i]).eq(quantities[i]))
-    || state.openingQuantity !== '0' && filled[0].lt(target)) reject();
+  const paired = new Decimal(record.filledQuantity), net = gross.map((quantity, index) => quantity.minus(reductions[index]));
+  if (!paired.isFinite() || paired.isNegative() || paired.gt(target) || !paired.eq(Decimal.min(...gross))
+    || !gross[0].eq(record.filledLeft) || !gross[1].eq(record.filledRight)
+    || net.some((quantity, index) => quantity.isNegative() || !quantity.eq(paired)
+      || !quantity.plus(adopted[index]).eq(quantities[index]))
+    || state.openingQuantity !== '0' && paired.lt(target)) reject();
 }

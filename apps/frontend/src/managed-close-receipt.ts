@@ -34,7 +34,8 @@ export function reconcileReceipt(receipt: CloseReceipt, records: readonly Strate
   if (!record || receipt.state === 'completed') return receipt;
   if (identity(record) !== receipt.identity) return transitionReceipt(receipt, 'review');
   const m = record.management;
-  if (record.status === 'PAUSED' || record.status === 'STOPPED' || m?.phase === 'RISK_PAUSED'
+  const protectedExit = record.status === 'PAUSED' && m?.phase === 'EXITING' && m.stopIntent === 'EXIT' && m.exitRequested;
+  if ((!protectedExit && (record.status === 'PAUSED' || record.status === 'STOPPED' || m?.phase === 'RISK_PAUSED'))
     || m?.phase === 'TRANSFERRED' || m?.phase === 'STOPPED' || m?.stopIntent === 'KEEP') return transitionReceipt(receipt, 'review');
   const zero = (value: string | null) => typeof value === 'string' && /^[-+]?\d+(?:\.\d+)?$/.test(value) && Number(value) === 0;
   if (record.status === 'COMPLETED' && m?.phase === 'COMPLETED' && m.exitRequested

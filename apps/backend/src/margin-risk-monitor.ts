@@ -1,6 +1,7 @@
 import { marginReadFault } from './margin-read-fault.js';
 import { mergeMarginVersions, MarginVersionRegression, type MarginVersionEvidence } from './margin-version.js';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { marginAccountKey } from './margin-account-key.js';
 import { Decimal } from 'decimal.js';
 import { DEFAULT_MARGIN_POLICY, MarginPolicySchema, type MarginMetrics, type MarginSnapshot } from '@gate-crossex/shared-types';
 import { GateApiError, type GateCrossExAccount, type GateCrossExPosition } from './crossex-client.js';
@@ -100,7 +101,7 @@ export class MarginRiskMonitor {
       if (context !== this.sources.context() || controller.signal.aborted || epoch !== this.readEpoch) return;
       if (!result.userId || !result.profileId) throw new Error('margin_account_identity_unavailable');
       if (this.latest?.context === context && (result.userId !== this.latest.userId || result.account.account_mode !== this.latest.metrics.accountMode)) throw new Error('margin_account_identity_changed');
-      const key = createHash('sha256').update(`${result.profileId}:${result.userId}:${result.account.account_mode}:${result.account.account_mode === 'CROSS_EXCHANGE' ? 'CROSSEX' : 'all'}`).digest('hex');
+      const key = marginAccountKey(result.profileId, result.userId, result.account.account_mode);
       const policy = this.store.incident(key)?.policy ?? this.store.policy(key);
       const units = (result.units ?? [result.account]).map((a) => ({ exchangeType: a.exchange_type, metrics: marginMetrics(a, policy) }));
       const retained = this.acceptedVersionEvidence(), persisted = this.sources.versionFloor?.() ?? null;

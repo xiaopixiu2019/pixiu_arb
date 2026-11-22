@@ -3,6 +3,7 @@ import type { TaskPnlComponent } from '@gate-crossex/shared-types';
 import { pnlComponent, type PnlEntry } from './task-performance-model.js';
 import type { PnlBook } from './task-performance-store.js';
 import type { TransactionFeeStore } from './transaction-fee-store.js';
+import { krakenConversionRateResolver } from './task-performance-conversion-rate.js';
 import { decimal, type TradingGroup } from './task-trading-groups.js';
 const types = new Map<string, PnlEntry['kind']>([['TRANSACTION', 'price'], ['TRADING_FEE', 'fees'], ['FUNDING_FEE', 'funding'], ['LIQUIDATION_FEE', 'other'], ['BANKRUPT_COMPENSATION', 'other'], ['INTEREST_ISOLATED', 'other']]);
 export function venueMatches(row: PnlBook, group: TradingGroup): boolean {
@@ -31,8 +32,10 @@ export interface TradingLedger {
 }
 export function tradingLedger(rows: PnlBook[], groups: TradingGroup[], fees: TransactionFeeStore, key: string): TradingLedger {
   const feeBooks = new Map(fees.book(key).map(r => [r.id, r]));
+  const conversionRate = krakenConversionRateResolver(rows);
   const value = (r: PnlBook): PnlEntry => ({ id: r.id, kind: types.get(r.statement_type) ?? 'other', coin: r.coin, change: r.change,
-    rate: (r.statement_type === 'TRADING_FEE' ? feeBooks.get(r.id)?.rate : null) ?? fees.rateAt(key, r.coin, Number(r.create_time)), conflict: r.conflict || !!feeBooks.get(r.id)?.conflict });
+    rate: (r.statement_type === 'TRADING_FEE' ? feeBooks.get(r.id)?.rate : null) ?? fees.rateAt(key, r.coin, Number(r.create_time)) ?? conversionRate(r),
+    conflict: r.conflict || !!feeBooks.get(r.id)?.conflict });
   const shared = sharedIds(rows), assigned = new Map<string, PnlBook[]>(), late = new Map<string, PnlBook[]>(), unassigned: PnlBook[] = [];
   const links = new Map<string, Set<string>>();
   for (const r of rows.filter(r => r.statement_type === 'FUNDING_FEE')) {
@@ -89,7 +92,7 @@ export function tradingCash(g: TradingGroup, ledger: TradingLedger, fees: Transa
   const calculated = expectedEntries(g, fees, key, rows, ledger.value), issues = [...calculated.issues];
   if (rows.some(r => !types.has(r.statement_type))) issues.push('unclassified_ledger');
   if (ledger.unassigned.some(r => g.executionOnly ? r.statement_type !== 'FUNDING_FEE' && g.bindings.some(b => b.order_id === r.business_id && b.symbol === r.symbol)
-    : Number(r.create_time) >= g.from && Number(r.create_time) <= g.to + 60000 && (!r.symbol || g.symbols.includes(r.symbol)))) issues.push('unallocated_trade_evidence');
+    : Number(r.create_time) >= g.from && Number(r.create_time) <= g.to + 60000 && !!r.symbol && g.symbols.includes(r.symbol))) issues.push('unallocated_trade_evidence');
   const subtotal = pnlComponent(calculated.entries), confirmed = pnlComponent(rows.map(ledger.value)), adjustment = pnlComponent(late.map(ledger.value));
   if (subtotal.amount === null || adjustment.amount === null) issues.push('invalid_or_unpriced_evidence');
   const error = late.reduce((sum, r) => { const e = ledger.value(r); return sum.plus(e.rate === null ? NaN : new Decimal(e.change).mul(e.rate).abs()); }, new Decimal('0.005'));

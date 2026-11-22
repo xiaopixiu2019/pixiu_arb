@@ -392,8 +392,16 @@ async function readBoundedResponseText(response: Response, maxBytes: number, sig
   }
 }
 
+type ManagedStateRead = { work: Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] }>;
+  controller: AbortController; waiters: number };
+type SharedAccountRead = { work: Promise<GateCrossExAccount>; controller: AbortController; waiters: number };
+
 export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperationsCrossExGateway {
   private readonly readLane = Symbol('account-reader');
+  private readonly managedPositionsLane = Symbol('managed-positions-reader');
+  private readonly managedOrdersLane = Symbol('managed-orders-reader');
+  private readonly managedStateReads = new Map<string, ManagedStateRead>();
+  private readonly statisticsAccountReads = new Map<string, SharedAccountRead>();
   private portfolioReader?: GateCrossExClient;
   constructor(
     private readonly fetchImplementation: typeof fetch = fetch,
@@ -403,10 +411,12 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     private readonly onAuthenticatedTiming?: (timing: AuthenticatedRequestTiming) => void,
     private readonly pacing = { nextAt: 0, cooldownUntil: 0 },
     private readonly riskControlReads = false,
+    private readonly accountReadGroup: Map<string, SharedAccountRead> | null = null,
   ) {}
 
   createStatisticsReader(): ReadOnlyCrossExGateway {
-    return new GateCrossExClient(this.fetchImplementation, this.now, this.baseUrl, this.authenticatedRequestSpacingMs, this.onAuthenticatedTiming, this.pacing);
+    return new GateCrossExClient(this.fetchImplementation, this.now, this.baseUrl, this.authenticatedRequestSpacingMs,
+      this.onAuthenticatedTiming, this.pacing, false, this.statisticsAccountReads);
   }
 
   createRiskControlReader(): ReadOnlyCrossExGateway {
@@ -422,7 +432,22 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     const queryString = parsedExchange?.success
       ? new URLSearchParams({ exchange_type: parsedExchange.data }).toString()
       : '';
-    return this.signedRequest('GET', ACCOUNT_ENDPOINT, queryString, '', credentials, GateAccountSchema, 'INVALID_ACCOUNT_RESPONSE', false, 'high', 4000, signal);
+    const read = (owner?: AbortSignal) => this.signedRequest('GET', ACCOUNT_ENDPOINT, queryString, '', credentials,
+      GateAccountSchema, 'INVALID_ACCOUNT_RESPONSE', false, 'high', 4000, owner);
+    if (!this.accountReadGroup) return read(signal);
+    const key = createHash('sha256').update(credentials.apiKey).update('\0').update(credentials.apiSecret)
+      .update('\0').update(queryString).digest('hex');
+    let current = this.accountReadGroup.get(key);
+    if (current?.controller.signal.aborted) { this.accountReadGroup.delete(key); current = undefined; }
+    if (!current) {
+      const controller = new AbortController();
+      const work = read(controller.signal).finally(() => {
+        if (this.accountReadGroup?.get(key)?.controller === controller) this.accountReadGroup.delete(key);
+      });
+      current = { work, controller, waiters: 0 }; this.accountReadGroup.set(key, current);
+    }
+    current.waiters++;
+    return this.waitForSharedRead(current, signal, ACCOUNT_ENDPOINT);
   }
 
   async querySpotAccounts(credentials: GateCredentials): Promise<GateSpotAccount[]> {
@@ -437,16 +462,61 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   }
 
   async queryManagedState(credentials: GateCredentials, signal: AbortSignal): Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] }> {
+    if (signal.aborted) throw new GateApiError(0, 'REQUEST_ABORTED', undefined, { endpoint: POSITIONS_ENDPOINT, phase: 'queue' });
+    const credentialKey = createHash('sha256').update(credentials.apiKey).update('\0').update(credentials.apiSecret).digest('hex');
+    let current = this.managedStateReads.get(credentialKey);
+    if (current?.controller.signal.aborted) {
+      this.managedStateReads.delete(credentialKey);
+      current = undefined;
+    }
+    if (!current) {
+      const controller = new AbortController();
+      const work = this.readManagedState(credentials, controller.signal).finally(() => {
+        if (this.managedStateReads.get(credentialKey)?.controller === controller) this.managedStateReads.delete(credentialKey);
+      });
+      current = { work, controller, waiters: 0 };
+      this.managedStateReads.set(credentialKey, current);
+    }
+    current.waiters++;
+    return this.waitForSharedRead(current, signal);
+  }
+
+  private async readManagedState(credentials: GateCredentials, owner: AbortSignal): Promise<{ positions: GateCrossExPosition[]; openOrders: GateCrossExOrder[] }> {
     const batch = new AbortController();
-    const combined = AbortSignal.any([signal, batch.signal]);
+    const combined = AbortSignal.any([owner, batch.signal]);
     try {
-    const [positions, openOrders] = await Promise.all([
-      this.signedRequest('GET', POSITIONS_ENDPOINT, '', '', credentials, z.array(GatePositionSchema), 'INVALID_POSITIONS_RESPONSE', false, 'high', 4000, combined),
-      this.signedRequest('GET', OPEN_ORDERS_ENDPOINT, '', '', credentials, z.array(GateOrderSchema), 'INVALID_OPEN_ORDERS_RESPONSE', false, 'high', 4000, combined),
-    ]);
-    signal.throwIfAborted();
-    return { positions, openOrders };
+      const [positions, openOrders] = await Promise.all([
+        this.signedRequest('GET', POSITIONS_ENDPOINT, '', '', credentials, z.array(GatePositionSchema), 'INVALID_POSITIONS_RESPONSE', false,
+          'high', 4000, combined, undefined, undefined, this.managedPositionsLane),
+        this.signedRequest('GET', OPEN_ORDERS_ENDPOINT, '', '', credentials, z.array(GateOrderSchema), 'INVALID_OPEN_ORDERS_RESPONSE', false,
+          'high', 4000, combined, undefined, undefined, this.managedOrdersLane),
+      ]);
+      return { positions, openOrders };
     } catch (error) { batch.abort(error); throw error; }
+  }
+
+  private waitForSharedRead<T>(read: { work: Promise<T>; controller: AbortController; waiters: number }, signal?: AbortSignal,
+    endpoint = POSITIONS_ENDPOINT): Promise<T> {
+    if (signal?.aborted) {
+      read.waiters--; if (read.waiters === 0) read.controller.abort();
+      return Promise.reject(new GateApiError(0, 'REQUEST_ABORTED', undefined, { endpoint, phase: 'queue' }));
+    }
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const release = () => {
+        if (settled) return;
+        settled = true;
+        read.waiters--;
+        if (read.waiters === 0) read.controller.abort();
+      };
+      const abort = () => {
+        release();
+        reject(new GateApiError(0, 'REQUEST_ABORTED', undefined, { endpoint, phase: 'queue' }));
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      void read.work.then(value => { release(); resolve(value); }, error => { release(); reject(error); })
+        .finally(() => signal?.removeEventListener('abort', abort));
+    });
   }
 
   async queryAdlRanks(credentials: GateCredentials, symbols: string[], signal?: AbortSignal): Promise<GateCrossExAdlRank[]> {
@@ -640,6 +710,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
     signal?: AbortSignal,
     beforeDispatch?: () => void,
     clientOrderId?: string,
+    readLane = this.readLane,
   ): Promise<T> {
     const requestPath = `/api/v4${endpoint}`, requestId = randomUUID();
     let statusCode: number | null = null;
@@ -727,7 +798,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
       throw new GateApiError(response.status, invalidSchemaLabel, undefined, { endpoint, phase: 'decode' });
     }
     return parsed.data;
-    }, priority, endpoint, method !== 'GET', signal, requestId, () => statusCode, clientOrderId,
+    }, priority, endpoint, method !== 'GET', signal, requestId, () => statusCode, clientOrderId, readLane,
       () => ({ dispatchedAt, dispatchedMonotonicMs }));
   }
 
@@ -735,6 +806,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
   private scheduleAuthenticatedRequest<T>(
     work: () => Promise<T>, priority: AuthenticatedRequestPriority, endpoint: string, write: boolean,
     signal?: AbortSignal, requestId?: string, status = (): number | null => null, clientOrderId?: string,
+    readLane = this.readLane,
     dispatch: () => Pick<AuthenticatedRequestTiming, 'dispatchedAt' | 'dispatchedMonotonicMs'> = () => ({}),
   ): Promise<T> {
     const queuedAt = Date.now();
@@ -748,7 +820,7 @@ export class GateCrossExClient implements TradingCrossExGateway, PortfolioOperat
           queueMs: startedAt - queuedAt, requestMs: Date.now() - startedAt,
           phase: 'request', requestId }); } catch { /* diagnostics cannot change execution */ }
       }
-    }, write, AUTHENTICATED_REQUEST_PRIORITY[priority], signal, this.readLane, this.riskControlReads).catch((error: unknown) => {
+    }, write, AUTHENTICATED_REQUEST_PRIORITY[priority], signal, readLane, this.riskControlReads).catch((error: unknown) => {
       if (error instanceof RequestNotDispatchedError && signal?.aborted) {
         throw new GateApiError(0, 'REQUEST_ABORTED', undefined, { endpoint, phase: 'queue' });
       }
