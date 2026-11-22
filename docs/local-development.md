@@ -15,3 +15,5 @@ Linux浏览器测试可能还需要 npx playwright install --with-deps chromium�
 平台验收必须对应实际候选提交；历史 Windows/Linux 结果不能代替本次验证，其他平台不能只凭矩阵或脚本宣称安装验收。源代码变更后重新验证实际候选，保留许可证和第三方声明。
 
 Windows archive regression tests cover deep extracted paths, original download-zone metadata, rejected special ZIP entries, failed extraction, safe cleanup and preserved installations. The health response reads the installed backend package version rather than a launcher environment variable.
+
+The standalone database maintenance command is `npm run maintenance:database`. It requires the backend to be stopped so it can acquire exclusive application ownership before changing stored data.

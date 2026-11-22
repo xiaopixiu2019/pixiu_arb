@@ -128,12 +128,18 @@ test('Windows scripts hash files without PowerShell utility module auto-loading'
     'bootstrap.ps1',
     'install.ps1',
     'run.ps1',
-    'scripts/test-windows-release-install.ps1',
   ]) {
     const contents = readFileSync(join(root, relativePath), 'utf8');
     assert.doesNotMatch(contents, /\bGet-FileHash\b/, relativePath);
     assert.match(contents, /\[Security\.Cryptography\.SHA256\]::Create\(\)/, relativePath);
   }
+});
+
+test('Windows native acceptance wrapper delegates archive hashing to the Node verifier', () => {
+  const contents = readFileSync(join(root, 'scripts/test-windows-release-install.ps1'), 'utf8');
+  assert.match(contents, /scripts\\test-desktop-release\.mjs/);
+  assert.doesNotMatch(contents, /\bGet-FileHash\b/);
+  assert.match(readFileSync(join(root, 'scripts/test-desktop-release.mjs'), 'utf8'), /createHash\('sha256'\)/);
 });
 
 test('Windows source launcher resolves relative hash paths through PowerShell', () => {

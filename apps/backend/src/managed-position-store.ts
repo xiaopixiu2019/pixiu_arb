@@ -2,6 +2,9 @@ import type Database from 'better-sqlite3';
 import type { ManagedPositionView } from '@gate-crossex/shared-types';
 import type { MarginVersionEvidence } from './margin-version.js';
 
+// Bump only when a release changes the persisted ManagedState shape or its rollback interpretation.
+export const MANAGED_POSITION_STATE_VERSION = 3;
+
 export interface ManagedMarginBatch {
   before: string; quantity: string; incidentId: string;
   version?: 2; id?: string; accountKey?: string; firstLeg?: 0 | 1; startedAt?: number;
@@ -12,9 +15,12 @@ export interface ManagedState extends ManagedPositionView {
   entryIntent?: 'OPENING' | 'MONITORING';
   preparationRecovery?: { scope: string; attempt: string; failures: number; nextAt: number; review: boolean };
   marginReadPending?: boolean;
+  quoteRecovery?: { scope: string; deadline: number };
   marginVersionFloor?: MarginVersionEvidence;
   marginBatch?: ManagedMarginBatch | null;
   protectionIncident?: { reason: string; before: [string, string]; at: number } | null;
+  protectionReview?: { reason: string; before: [string, string]; after: [string, string];
+    observedReductions: [string, string]; detectedAt: number; protectedAt: number };
   observedReductions?: [string, string];
   positionSettlementSince?: number;
   makerOrderId: string | null;
@@ -62,16 +68,20 @@ export function managedHardRiskReason(db: Database.Database): string | null {
 }
 export function managedRiskBlock(db: Database.Database): string | null {
   const reason = managedRiskReason(db);
-  return reason === MANAGED_ACCOUNT_RECHECKING ? reason : reason ? 'managed_global_risk_paused' : null;
+  if (reason) return reason === MANAGED_ACCOUNT_RECHECKING ? reason : 'managed_global_risk_paused';
+  return db.prepare("SELECT 1 FROM managed_positions WHERE json_extract(state_json, '$.protectionIncident') IS NOT NULL LIMIT 1").get()
+    ? 'managed_external_reduction_pending' : null;
 }
-export function managedOrderBlock(db: Database.Database, symbol: string, strategyId?: string, reduceOnly = false, confirmedPairing = false): string | null {
-  const riskBlock = managedRiskBlock(db);
-  if (riskBlock) return riskBlock;
-  if (!confirmedPairing && db.prepare("SELECT 1 FROM managed_positions WHERE json_extract(state_json, '$.positionSettlementSince') IS NOT NULL LIMIT 1").get())
-    return 'managed_positions_settlement_pending';
+export function managedOrderBlock(db: Database.Database, symbol: string, strategyId?: string, reduceOnly = false, confirmedPairing = false, recoveryAuthorized = false): string | null {
+  const riskReason = managedRiskReason(db);
+  const recoveryPairing = riskReason === MANAGED_ACCOUNT_RECHECKING && reduceOnly && recoveryAuthorized;
+  const riskBlock = recoveryPairing ? null : managedRiskBlock(db);
+  if (riskBlock && riskBlock !== 'managed_external_reduction_pending') return riskBlock;
   const incident = db.prepare("SELECT strategy_id FROM managed_positions WHERE json_extract(state_json, '$.protectionIncident') IS NOT NULL LIMIT 1")
     .get() as { strategy_id: string } | undefined;
   if (incident && (!reduceOnly || incident.strategy_id !== strategyId)) return 'managed_external_reduction_pending';
+  if (!confirmedPairing && db.prepare("SELECT 1 FROM managed_positions WHERE json_extract(state_json, '$.positionSettlementSince') IS NOT NULL LIMIT 1").get())
+    return 'managed_positions_settlement_pending';
   const reservation = db.prepare('SELECT strategy_id FROM managed_position_reservations WHERE symbol = ?').get(symbol) as { strategy_id: string } | undefined;
   if (reservation) return reservation.strategy_id === strategyId ? null : 'managed_position_owned';
   const owner = db.prepare('SELECT strategy_id FROM managed_position_claims WHERE symbol = ?').all(symbol) as Array<{ strategy_id: string }>;

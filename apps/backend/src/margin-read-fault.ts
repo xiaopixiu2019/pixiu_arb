@@ -2,6 +2,9 @@ import { GateApiError } from './crossex-client.js';
 
 /** Unknown/identity/contract failures require review, not ordinary automatic read recovery. */
 export function marginReadFault(error: unknown): { reason: string; fatal: boolean } {
+  const aborted = typeof error === 'object' && error !== null
+    && ((error as { name?: unknown }).name === 'AbortError' || (error as { code?: unknown }).code === 'ABORT_ERR');
+  if (aborted) return { reason: 'margin_read_timeout', fatal: false };
   if (error instanceof GateApiError) {
     const transient = error.statusCode === 429 || error.statusCode >= 500
       || ![401, 403].includes(error.statusCode) && ['NETWORK_ERROR', 'REQUEST_TIMEOUT', 'REQUEST_ABORTED'].includes(error.label);

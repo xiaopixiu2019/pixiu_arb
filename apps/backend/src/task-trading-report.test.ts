@@ -92,8 +92,10 @@ describe('dynamic trading results', () => {
     h.store.save('a', [h.books.find(r => r.id === 'p-KRAKEN-exit')!], 100000, 310000);
     expect(h.report().results.s).toMatchObject({ amount: '2.2', status: 'confirmed' });
   });
-  it('keeps unknown or conflicting evidence unavailable rather than exempting it as shared costs', () => {
-    const h = fixture(); h.store.save('a', [{ ...h.books[0], id: 'unknown', symbol: '', statement_type: 'UNKNOWN', change: '-0.001' }], 100000, 310000);
+  it('discloses symbolless unknown cashflows at account level while same-contract unknown evidence blocks the task', () => {
+    const h = fixture(); h.store.save('a', [{ ...h.books[0], id: 'account-unknown', symbol: '', statement_type: 'UNKNOWN', change: '-0.001' }], 100000, 310000);
+    const account = h.report(); expect(account.results.s.amount).toBe('2.2');expect(account.unresolvedCashflows).toMatchObject({ amount:'-0.0012', count:1 });
+    h.store.save('a', [{ ...h.books[0], id: 'contract-unknown', statement_type: 'UNKNOWN', change: '-0.001' }], 100000, 310000);
     expect(h.report().results.s.amount).toBeNull();
   });
   it('supports tasks without managed state and does not infer closure from execution completion', () => {

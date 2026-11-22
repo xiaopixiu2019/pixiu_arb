@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Decimal } from 'decimal.js';
+import type { ManagedLeg } from './managed-position-model.js';
+import type { GateCrossExPortfolio } from './crossex-client.js';
 import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,7 +11,7 @@ import { MemoryCredentialVault, DEFAULT_CREDENTIAL_PROFILE } from './credential-
 import { TradingSession } from './trading-session.js';
 import { CreateStrategyInputSchema, TradingRuntime, isTerminalOrderState } from './trading-runtime.js';
 import { ManagedPositionManager, managedLegs, type ManagedAccountFacts } from './managed-position-manager.js';
-import { readManagedState, managedRiskReason, hasManagedClaims } from './managed-position-store.js';
+import { readManagedState, writeManagedState, managedOrderBlock, managedRiskBlock, managedRiskReason, hasManagedClaims } from './managed-position-store.js';
 import type { CrossExOrderRequest, GateCrossExOrder, GateCrossExPosition, TradingCrossExGateway } from './crossex-client.js';
 import { GateApiError, GateCrossExClient } from './crossex-client.js';
 import { RequestNotDispatchedError } from './authenticated-scheduler.js';
@@ -20,6 +22,8 @@ import { createMarginRiskService } from './margin-risk-service.js';
 import { ownedQuoteSymbols } from './owned-market-demand.js';
 import { consumeRouterOutcome, routerRetry, ROUTER_REVIEW, ROUTER_WAIT } from './router-entry-retry.js';
 import { knownMarginOrder, knownMarginPosition } from './managed-margin-batch.js';
+import { ManagedAdoption } from './managed-position-adoption.js';
+import { marginReadFault } from './margin-read-fault.js';
 
 const directories: string[] = [];
 const managers: ManagedPositionManager[] = [];
@@ -77,9 +81,10 @@ async function harness(asset = 'BTC', leftVenue = 'BINANCE', book?: { bid: strin
     account: async () => { if (unavailable) throw new Error('synthetic account read failed'); return read ? read() : facts(); },
     funding: (symbol: string) => missingFunding ? null : ({ rate8h: symbol === legs[0].symbol ? '0.002' : '0', fetchedAt: Date.now() }),
     refreshFunding: async () => undefined, riskPause: vi.fn() };
-  const manager = new ManagedPositionManager(db, session, runtime, { market: (symbol) => missingQuotes.has(symbol) ? null : ({
+  const markets = { market: (symbol: string) => missingQuotes.has(symbol) ? null : ({
     symbol, source: 'gate_crossex_websocket', bidPrice: book?.bid ?? (symbol === legs[0].symbol ? '100' : '99'), askPrice: book?.ask ?? (symbol === legs[0].symbol ? '101' : '100'),
-    updatedAt: new Date().toISOString(), receivedAt: new Date().toISOString() } as LiveMarket) }, sources);
+    updatedAt: new Date().toISOString(), receivedAt: new Date().toISOString() } as LiveMarket) };
+  const manager = new ManagedPositionManager(db, session, runtime, markets, sources);
   managers.push(manager);
   async function task(id = 'PAIR-TEST', full = true, executionMethod = config.executionMethod) {
     const taskConfig = CreateStrategyInputSchema.parse({ ...config, executionMethod,
@@ -98,7 +103,7 @@ async function harness(asset = 'BTC', leftVenue = 'BINANCE', book?: { bid: strin
     remote.set(id, { ...remote.get(id)!, state, executed_qty: filled, update_time: String(Date.now()) });
     runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: id, state, executed_qty: filled, executed_avg_price: '100', update_time: String(Date.now()) } });
   }
-  return { db, session, vault, gateway, runtime, manager, sources, config, legs, created, cancelled, remote, task, ack, facts,
+  return { db, session, vault, gateway, runtime, manager, markets, sources, config, legs, created, cancelled, remote, task, ack, facts,
     quantities: (a: string, b: string) => { quantities = [a, b]; },
     unavailable: (value = true) => { unavailable = value; }, missingFunding: (value: boolean) => { missingFunding = value; },
     setRead: (value: typeof read) => { read = value; }, changeAccount: () => { account = 'account-2'; },
@@ -392,6 +397,163 @@ describe('generic adopted position groups and explicit stop intent', () => {
     h.setRead(async () => ({ ...h.facts(), positions: h.facts().positions.map(p => ({ ...p, margin_mode: 'CROSS' })) }));
     return { monitor, low: () => { balance = '149'; }, recovered: () => { balance = '240'; } };
   }
+  it('moves a verified flat group to reverse monitoring once, with zero entry and the original hard lock intact', async () => {
+    const h = await harness(), id = await h.task();
+    await h.manager.tick();
+    await continuous(h, id);
+    const at = Date.now() - 1000, old = readManagedState(h.db,id)!;
+    writeManagedState(h.db,id,{...old, phase:'RISK_PAUSED',reason:'managed_external_reduction',verified:true,
+      leftQuantity:'0',rightQuantity:'0',maxLeft:'0',maxRight:'0',pauseAfterProtection:true,
+      protectionReview:{reason:'managed_external_reduction',before:['150','150'],after:['0','0'],observedReductions:['0','0'],detectedAt:at-100,protectedAt:at}});
+    h.db.prepare('INSERT INTO audit_events(id,created_at,type,correlation_id,payload_json) VALUES (?,?,?,?,?)').run('proof',new Date(at).toISOString(),
+      'managed_external_reduction_protected',id,JSON.stringify({strategyId:id,before:['150','150'],after:['0','0'],observedReductions:['0','0']}));
+    h.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id=?").run(id);
+    h.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)').run('paired_entry_authority_changed',new Date().toISOString());
+    h.session.protect();
+    const legs = [{symbol:h.legs[0].symbol,side:'SELL' as const},{symbol:h.legs[1].symbol,side:'BUY' as const}] as [ManagedLeg,ManagedLeg];
+    const req = {profileId:'account-1',groupId:id,quantity:'1000',legs,closingOrderIds:['a','b'] as [string,string],
+      spreadBps:'-400', fundingAprPct:'-400', condition:'OR' as const, durationSeconds:3000};
+    const positions = h.facts().positions.map((p,i) => ({...p,position_id:String(i+1),entry_price:'99',create_time:String(at+100),position_side:'NONE',position_qty:i===0?'-1000':'1000',margin_mode:'CROSS'}));
+    const trades = legs.flatMap((l,i) => [0,1].map(n => ({symbol:l.symbol,side:l.side,position_mode:'SINGLE',position_side:'NONE',
+      qty:n?'1000':'150',create_time:String(n?at+100:at-10),transaction_id:`t${i}-${n}`,order_id:n?`new${i}`:req.closingOrderIds[i]})));
+    const portfolio: GateCrossExPortfolio = {positions, openOrders:[],marginPositions:[],account:{
+      user_id:'synthetic',account_mode:'CROSS_EXCHANGE',position_mode:'SINGLE',exchange_type:'CROSSEX',assets:[],update_time:String(at),
+      available_margin:'100',margin_balance:'100',initial_margin:'10',maintenance_margin:'5',initial_margin_rate:'10',maintenance_margin_rate:'20'},
+      recentTrades:trades.map(t => ({...t,text:'',exchange_type:'CROSSEX',business_type:'FUTURE',price:'99',fee:'0',fee_coin:'USD',
+        fee_rate:'0',match_role:'TAKER',rpnl:'0'}))};
+    h.setRead(async () => ({positions,openOrders:[]}));
+    await expect(h.manager.replaceFlatOwner(id,{...req,quantity:'1100'},async()=>portfolio)).rejects.toThrow();
+    expect(h.manager.protection.owns(id)).toBe(true);
+    h.setRead(async () => ({positions:positions.map(p => ({...p,position_id:'changed'})),openOrders:[]}));
+    await expect(h.manager.replaceFlatOwner(id,req,async()=>portfolio)).rejects.toThrow('managed_replacement_holdings_changed');
+    h.setRead(async () => ({positions,openOrders:[]}));
+    const both = await Promise.allSettled([h.manager.replaceFlatOwner(id,req,async()=>portfolio),h.manager.replaceFlatOwner(id,req,async()=>portfolio)]);
+    expect(both.filter(r => r.status === 'rejected')).toHaveLength(1);
+    const winner = both.find(r => r.status === 'fulfilled')!;
+    const next = winner.value;
+    expect(next).toMatchObject({status:'PAUSED',config:{totalAmount:'0',management:{monitorOnly:true}},filledLeft:'0',filledRight:'0',
+      management:{groupId:id,resumeAction:'MONITORING',adoptedLeft:'1000',adoptedRight:'1000'}});
+    expect(h.runtime.getStrategy(id).management).toMatchObject({phase:'TRANSFERRED',transferredTo:next.id});
+    expect(h.manager.protection.owns(id)).toBe(false);
+    expect(h.manager.protection.owns(next.id)).toBe(true);
+    expect(managedRiskReason(h.db)).toBe('paired_entry_authority_changed');
+    await expect(h.manager.replaceFlatOwner(id,req,async()=>portfolio)).rejects.toThrow();
+    h.session.set('live');
+    await expect(h.manager.resume(next.id,'account-1','OPENING')).rejects.toThrow();
+    expect((await h.manager.resume(next.id,'account-1','MONITORING')).management?.phase).toBe('MONITORING');
+    expect(h.created).toHaveLength(0);
+  });
+  it('executes only the persisted EXIT clip while the account remains protect-only', async () => {
+    const h = await harness(); h.config.management!.perOrderQuantity = '100';
+    const id = await h.task(); await h.manager.tick();
+    const { monitor } = await continuous(h, id);
+    h.manager.beginStop(id, true); await h.manager.finishStop(id);
+    h.manager.failAll('synthetic_review');
+    await h.manager.resume(id, 'account-1', 'EXITING');
+
+    await h.manager.protection.run();
+    vi.setSystemTime(Date.now() + 1100);
+    await h.manager.protection.run();
+    expect(h.session.current).toBe('protect_only');
+    expect(managedRiskReason(h.db)).toBe('synthetic_review');
+    expect(h.created).toEqual([expect.objectContaining({ type: 'MARKET', qty: '100', reduce_only: 'true' })]);
+
+    h.ack(1, 'FILLED', '100'); h.quantities('0', '100');
+    for (let attempt = 0; attempt < 5 && h.created.length < 2; attempt += 1) {
+      vi.setSystemTime(Date.now() + 1100); await h.manager.protection.run();
+    }
+    expect(h.created[1]).toMatchObject({ type: 'MARKET', qty: '100', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '100'); h.quantities('0', '0');
+    for (let attempt = 0; attempt < 5 && h.runtime.getStrategy(id).status !== 'COMPLETED'; attempt += 1) {
+      vi.setSystemTime(Date.now() + 1100); await h.manager.protection.run();
+    }
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'COMPLETED', management: {
+      phase: 'COMPLETED', leftQuantity: '0', rightQuantity: '0', pendingOrderIds: [],
+    } });
+    expect(h.session.current).toBe('protect_only');
+    expect(managedRiskReason(h.db)).toBe('synthetic_review');
+    await monitor.stop();
+  });
+  it('uses a common two-leg lot size for protect-only EXIT clips', async () => {
+    const h = await harness(); h.config.management!.perOrderQuantity = '1';
+    h.db.prepare("UPDATE crossex_instruments SET lot_size='0.1',min_size='0.1' WHERE symbol=?").run(h.legs[0].symbol);
+    h.db.prepare("UPDATE crossex_instruments SET lot_size='0.25',min_size='0.25' WHERE symbol=?").run(h.legs[1].symbol);
+    const id = await h.task(); await h.manager.tick();
+    h.db.prepare("UPDATE execution_strategies SET config_json=json_set(config_json,'$.management.perOrderQuantity','0.6') WHERE id=?").run(id);
+    const { monitor } = await continuous(h, id);
+    h.manager.beginStop(id, true); await h.manager.finishStop(id); h.manager.failAll('synthetic_review');
+    await h.manager.resume(id, 'account-1', 'EXITING');
+    await h.manager.protection.run(); vi.setSystemTime(Date.now() + 1100); await h.manager.protection.run();
+    expect(h.created).toEqual([expect.objectContaining({ type: 'MARKET', qty: '0.5', reduce_only: 'true' })]);
+    await monitor.stop();
+  });
+  it('restarts a partially filled STOPPING EXIT and protects it through verified flat completion', async () => {
+    const h = await harness(); const id = await h.task('PAIR-RESTART-EXIT', false, 'MAKER_TAKER');
+    await h.runtime.createOrder({ symbol: h.legs[0].symbol, side: 'BUY', type: 'LIMIT', timeInForce: 'POC', quantity: '10', price: '100' },
+      { strategyId: id, strategyLeg: 'left', feePhase: 'entry' });
+    h.manager.beginStop(id, true); h.ack(1, 'CANCELLED', '3'); h.quantities('0', '0');
+    await h.manager.stop();
+
+    const session = new TradingSession(), runtime = new TradingRuntime(h.db, session, h.vault, h.gateway);
+    const manager = new ManagedPositionManager(h.db, session, runtime, h.markets, h.sources); managers.push(manager);
+    h.session = session; h.runtime = runtime; h.manager = manager;
+    h.db.prepare("UPDATE execution_strategies SET status='RUNNING' WHERE id=?").run(id);
+    const { monitor } = await continuous(h, id, false);
+    h.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id=?").run(id);
+    manager.protection.authority.configure(monitor.snapshot().accountId!, [id], 0, true); session.armProtection();
+    for (let attempt = 0; attempt < 2; attempt += 1) { vi.setSystemTime(Date.now() + 1100); await manager.protection.run(); }
+    expect(h.created).toHaveLength(1);
+    expect(readManagedState(h.db, id)).toMatchObject({ reason: 'managed_positions_settlement_pending', leftQuantity: '0', maxLeft: '3' });
+    h.quantities('1', '0');
+    for (let attempt = 0; attempt < 2; attempt += 1) { vi.setSystemTime(Date.now() + 1100); await manager.protection.run(); }
+    expect(h.created).toHaveLength(1);
+
+    h.quantities('3', '0');
+    for (let attempt = 0; attempt < 5 && h.created.length < 2; attempt += 1) {
+      vi.setSystemTime(Date.now() + 1100); await manager.protection.run();
+    }
+    expect(h.created[1], JSON.stringify(manager.protection.view())).toMatchObject({
+      symbol: h.legs[0].symbol, side: 'SELL', qty: '3', reduce_only: 'true',
+    });
+
+    const reduction = h.remote.get('remote-2')!;
+    h.remote.set('remote-2', { ...reduction, state: 'FILLED', executed_qty: '3', update_time: String(Date.now()) });
+    runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: 'remote-2', state: 'FILLED', executed_qty: '3',
+      executed_avg_price: '99', update_time: String(Date.now()) } });
+    h.quantities('0', '0');
+    for (let attempt = 0; attempt < 5 && runtime.getStrategy(id).status !== 'COMPLETED'; attempt += 1) {
+      vi.setSystemTime(Date.now() + 1100); await manager.protection.run();
+    }
+    expect(runtime.getStrategy(id)).toMatchObject({ status: 'COMPLETED', management: {
+      phase: 'COMPLETED', leftQuantity: '0', rightQuantity: '0', pendingOrderIds: [],
+    } });
+    expect(session.current).toBe('protect_only');
+    await monitor.stop();
+  });
+it.each(['first','second'])('recovers a definitely unsent margin %s leg without losing its batch budget', async stage=>{
+    const h=await harness(),id=await h.task(); await h.manager.tick(); h.missingFunding(true);
+    const m=await continuous(h,id); m.low(); await m.monitor.refresh();
+    if(stage==='second') {await h.manager.tick(); h.ack(1,'FILLED','10');h.quantities('90','100');await h.manager.tick();}
+    h.setSubmitWait(async()=>{h.missingQuote(h.legs[0].symbol);h.missingQuote(h.legs[1].symbol);});
+    for(let i=0;i<4&&!managedRiskReason(h.db);i++){vi.setSystemTime(Date.now()+100);await m.monitor.refresh();await h.manager.tick();}
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    const batch=readManagedState(h.db,id)!.marginBatch!.id;
+    h.setSubmitWait(null);h.missingQuote(h.legs[0].symbol,false);h.missingQuote(h.legs[1].symbol,false);
+    for(let i=0;i<8&&h.created.length<(stage==='first'?1:2);i++){vi.setSystemTime(Date.now()+1000);await m.monitor.refresh();await h.manager.tick();}
+    expect(readManagedState(h.db,id)!.marginBatch!.id).toBe(batch);
+    expect(h.created).toHaveLength(stage==='first'?1:2);
+    expect(h.created.at(-1)).toMatchObject({qty:'10',reduce_only:'true'});
+    if(stage==='first') {
+      h.ack(1,'FILLED','10');h.quantities('90','100');
+      for(let i=0;i<6&&h.created.length<2;i++){vi.setSystemTime(Date.now()+1000);await m.monitor.refresh();await h.manager.tick();}
+      expect(h.created).toHaveLength(2);
+    }
+    h.ack(2,'FILLED','10');h.quantities('90','90');m.recovered();
+    for(let i=0;i<6&&managedRiskReason(h.db);i++){vi.setSystemTime(Date.now()+1000);await m.monitor.refresh();await h.manager.tick();}
+    expect(managedRiskReason(h.db)).toBeNull();expect(readManagedState(h.db,id)?.marginBatch).toBeNull();
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING');expect(h.session.current).toBe('live');
+    await m.monitor.stop();
+  });
   async function protectTicks(h: Awaited<ReturnType<typeof harness>>, count = 4) {
     for (let i = 0; i < count; i++) { await vi.advanceTimersByTimeAsync(1100); await h.manager.tick(); }
   }
@@ -605,16 +767,55 @@ describe('generic adopted position groups and explicit stop intent', () => {
     ] });
     expect(h.created).toHaveLength(0); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
   });
-  it('continues a second external reduction without resuming the paused ordinary strategy', async () => {
+  it('confirms and protects repeated external reductions without globally pausing other work', async () => {
     const h = await harness(), id = await h.task(); await h.manager.tick(); h.missingFunding(true);
     await continuous(h, id); h.quantities('100', '90'); await h.manager.tick();
-    expect(h.created).toHaveLength(1); h.ack(1, 'FILLED', '10'); h.quantities('90', '90'); await protectTicks(h);
-    expect(h.session.current).toBe('protect_only'); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking'); expect(h.created).toHaveLength(0);
+    await h.manager.tick(); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    await protectTicks(h); expect(h.created).toHaveLength(1);
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '90'); await protectTicks(h);
+    expect(h.session.current).toBe('live'); expect(managedRiskReason(h.db)).toBeNull();
     h.quantities('90', '80'); await protectTicks(h);
     expect(h.created).toHaveLength(2); expect(h.created[1]).toMatchObject({ side: 'SELL', qty: '10', reduce_only: 'true' });
     h.ack(2, 'FILLED', '10'); h.quantities('80', '80'); await protectTicks(h);
-    expect(h.created).toHaveLength(2); expect(managedRiskReason(h.db)).toBe('managed_external_reduction');
+    expect(h.created).toHaveLength(2); expect(managedRiskReason(h.db)).toBeNull();
     expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('confirms and isolates an enrolled external reduction before protecting only that task', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick(); h.missingFunding(true);
+    await continuous(h, id);
+    h.unavailable(); await h.manager.tick(); h.unavailable(false); h.quantities('0', '100');
+    vi.setSystemTime(Date.now() + 2000); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING'); expect(h.created).toHaveLength(0);
+    await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    expect(readManagedState(h.db, id)).toMatchObject({ phase: 'RISK_PAUSED', reason: 'managed_external_reduction',
+      pauseAfterProtection: true, protectionIncident: { reason: 'managed_external_reduction', before: ['100', '100'] } });
+    expect(managedRiskBlock(h.db)).toBe('managed_external_reduction_pending');
+    expect(managedOrderBlock(h.db, 'UNOWNED_FUTURE_TEST_USDT')).toBe('managed_external_reduction_pending');
+    await protectTicks(h, 4);
+    expect(h.created).toHaveLength(1); expect(h.created[0]).toMatchObject({ symbol: h.legs[1].symbol,
+      side: 'BUY', qty: '100', reduce_only: 'true' });
+    h.ack(1, 'FILLED', '100'); h.quantities('0', '0'); await protectTicks(h, 4);
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    expect(readManagedState(h.db, id)).toMatchObject({ phase: 'RISK_PAUSED', reason: 'managed_external_reduction',
+      pauseAfterProtection: true, protectionIncident: null,
+      protectionReview: { reason: 'managed_external_reduction', before: ['100', '100'], after: ['0', '0'] } });
+    expect(managedOrderBlock(h.db, 'UNOWNED_FUTURE_TEST_USDT')).toBeNull();
+  });
+  it('escalates scoped external protection when the fixed recovery window expires', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick(); h.missingFunding(true);
+    await continuous(h, id);
+    h.unavailable(); await h.manager.tick(); h.unavailable(false); h.quantities('0', '100');
+    vi.setSystemTime(Date.now() + 2000); await h.manager.tick(); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull(); expect(managedRiskBlock(h.db)).toBe('managed_external_reduction_pending');
+    h.missingQuote(h.legs[1].symbol); vi.setSystemTime(Date.now() + 25_001); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_external_reduction_protection_expired');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED'); expect(h.created).toHaveLength(0);
   });
   it('automatically completes two live margin cycles including a fill during the account read', async () => {
     const h = await harness(), id = await h.task(); await h.manager.tick(); const m = await continuous(h, id);
@@ -898,6 +1099,38 @@ describe('generic adopted position groups and explicit stop intent', () => {
       management: { phase: 'OPENING', exitRequested: false, verified: false } });
     expect(h.created).toHaveLength(2); expect(managedRiskReason(h.db)).toBeNull();
   });
+  it('resumes after an owned protective reduction exactly removes unmatched maker excess', async () => {
+    const h = await harness(); const id = await h.task('PAIR-PROTECTED-PARTIAL', false, 'MAKER_TAKER');
+    for (const [index, leg] of h.legs.entries()) {
+      await h.runtime.createOrder({ symbol: leg.symbol, side: leg.side, type: index ? 'MARKET' : 'LIMIT',
+        timeInForce: index ? 'IOC' : 'POC', quantity: index ? '55' : '50', ...(index ? {} : { price: '100' }) },
+      { strategyId: id, strategyLeg: index ? 'right' : 'left', feePhase: 'entry' });
+      h.ack(index + 1, index ? 'CANCELLED' : 'FILLED', '50');
+      if (index) h.db.prepare("UPDATE execution_orders SET failure_reason=? WHERE remote_order_id='remote-2'")
+        .run('ioc_order_failed_because_it_would_not_be_executed');
+    }
+    const leg = h.legs[0];
+    await h.runtime.createOrder({ symbol: leg.symbol, side: leg.side, type: 'LIMIT', timeInForce: 'POC',
+      quantity: '5', price: '100' }, { strategyId: id, strategyLeg: 'left', feePhase: 'entry' });
+    h.ack(3, 'FILLED', '5'); h.quantities('55', '50');
+    await h.runtime.createOrder({ symbol: leg.symbol, side: leg.side === 'BUY' ? 'SELL' : 'BUY', type: 'MARKET',
+      timeInForce: 'IOC', quantity: '5', reduceOnly: true }, { strategyId: id, strategyLeg: 'left', feePhase: 'entry' });
+    h.ack(4, 'FILLED', '5'); h.quantities('50', '50');
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='50',filled_left='55',filled_right='50',progress=50 WHERE id=?").run(id);
+    h.manager.failAll('paired_entry_authority_changed'); h.session.set('live');
+    const resumed = await h.manager.resume(id, 'account-1', 'OPENING');
+    expect(resumed).toMatchObject({ status: 'RUNNING', filledLeft: '55', filledRight: '50', progress: 50,
+      management: { phase: 'OPENING', leftQuantity: '50', rightQuantity: '50', exitRequested: false, verified: false } });
+    expect(managedRiskReason(h.db)).toBeNull();
+  });
+  it('reviews a paused partial entry directly into exit without reopening entry', async () => {
+    const { h, id } = await partialEntry();
+    const resumed = await h.manager.resume(id, 'account-1', 'EXITING', true, true);
+    expect(resumed).toMatchObject({ status: 'RUNNING', filledQuantity: '50',
+      management: { phase: 'EXITING', entryIntent: 'MONITORING', stopIntent: 'EXIT', exitRequested: true,
+        leftQuantity: '50', rightQuantity: '50', verified: true, fallback: true } });
+    expect(h.created).toHaveLength(2); expect(managedRiskReason(h.db)).toBeNull();
+  });
   it.each(['unexplained reduction', 'unequal', 'unknown history', 'reduction history', 'ledger mismatch'])('keeps partial entry locked on %s', async scenario => {
     const { h, id } = await partialEntry();
     if (scenario === 'unexplained reduction') h.quantities('40', '40');
@@ -1112,6 +1345,35 @@ describe('generic adopted position groups and explicit stop intent', () => {
         symbol: h.legs[0].symbol, exchange_type: 'BINANCE', side: 'BUY', qty: '10', price: '100', fee: '0', create_time: String(Date.now()) } });
       expect(managedRiskReason(h.db)).toBeNull(); expect(h.created).toHaveLength(2);
     } finally { h.setRead(null); release(h.facts()); await reading; }
+  });
+  it('settles a known entry handoff without misclassifying expected position growth as an external reduction', async () => {
+    const h = await harness('XMR'); const id = await h.task('PAIR-HANDOFF', false);
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='2', filled_left='2', filled_right='2' WHERE id=?").run(id);
+    const state = readManagedState(h.db, id)!;
+    writeManagedState(h.db, id, { ...state, entryIntent: 'MONITORING', phase: 'VERIFYING', openingQuantity: '2',
+      leftQuantity: '1', rightQuantity: '1', maxLeft: '2', maxRight: '2', observedReductions: ['0', '0'], verified: false });
+    h.quantities('2', '2'); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull(); expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'RUNNING', management: {
+      phase: 'MONITORING', leftQuantity: '2', rightQuantity: '2', reason: null } });
+    expect(readManagedState(h.db, id)?.protectionIncident).toBeUndefined();
+  });
+  it('waits only within the fixed window for balanced entry settlement and still rejects excess exposure', async () => {
+    const h = await harness('XMR'); const id = await h.task('PAIR-HANDOFF-BOUND', false);
+    h.db.prepare("UPDATE execution_strategies SET filled_quantity='2', filled_left='2', filled_right='2' WHERE id=?").run(id);
+    const state = readManagedState(h.db, id)!;
+    writeManagedState(h.db, id, { ...state, entryIntent: 'MONITORING', phase: 'VERIFYING', openingQuantity: '2',
+      leftQuantity: '1', rightQuantity: '1', maxLeft: '2', maxRight: '2', observedReductions: ['0', '0'], verified: false });
+    h.quantities('1.5', '1.5'); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull();
+    expect(readManagedState(h.db, id)).toMatchObject({ phase: 'VERIFYING', reason: 'managed_positions_settlement_pending' });
+    h.quantities('3', '3'); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_entry_exposure_changed');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('keeps an aborted credential-file read on the transient margin recovery path', () => {
+    const aborted = Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' });
+    expect(marginReadFault(aborted)).toEqual({ reason: 'margin_read_timeout', fatal: false });
   });
   it('never enlarges a below-minimum partial exit into a full opposite-leg reduction', async () => {
     const h = await harness(), id = await h.task(); await h.manager.tick();
@@ -1359,6 +1621,57 @@ describe('generic adopted position groups and explicit stop intent', () => {
     expect(h.db.prepare('SELECT DISTINCT strategy_id FROM managed_position_claims').all()).toEqual([{ strategy_id: original }]);
     expect(readManagedState(h.db, original)?.phase).toBe('MONITORING');
   });
+  it('retries a transient local reservation lock before any remote launch work', async () => {
+    const h = await harness();
+    const original = ManagedAdoption.prototype.reserve;
+    let attempts = 0;
+    const reserve = vi.spyOn(ManagedAdoption.prototype, 'reserve').mockImplementation(function(this: ManagedAdoption, ...args) {
+      attempts++;
+      if (attempts === 1) throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY_SNAPSHOT' });
+      return original.call(this, ...args);
+    });
+    try {
+      const launch = h.manager.reserve('PAIR-BUSY', h.config, 'account-1');
+      const accepted = expect(launch).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(250);
+      await accepted;
+      expect(attempts).toBe(2);
+      expect(h.db.prepare('SELECT count(*) n FROM managed_position_reservations WHERE strategy_id=?').get('PAIR-BUSY')).toEqual({ n: 2 });
+      expect(managedRiskReason(h.db)).toBeNull();
+      h.manager.abortReservation('PAIR-BUSY');
+    } finally { reserve.mockRestore(); }
+  });
+  it('returns an explicit retryable launch error when local reservation storage stays busy', async () => {
+    const h = await harness();
+    const reserve = vi.spyOn(ManagedAdoption.prototype, 'reserve').mockImplementation(() => {
+      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
+    });
+    try {
+      const launch = h.manager.reserve('PAIR-BUSY', h.config, 'account-1');
+      const rejected = expect(launch).rejects.toMatchObject({ code: 'managed_launch_storage_busy', statusCode: 503 });
+      await vi.advanceTimersByTimeAsync(500);
+      await rejected;
+      expect(h.db.prepare('SELECT count(*) n FROM managed_position_reservations WHERE strategy_id=?').get('PAIR-BUSY')).toEqual({ n: 0 });
+      expect(managedRiskReason(h.db)).toBeNull();
+    } finally { reserve.mockRestore(); }
+  });
+  it('reports unresolved local reservation cleanup separately from a safe retry', async () => {
+    const h = await harness();
+    const abort = vi.spyOn(ManagedAdoption.prototype, 'abort').mockImplementation(() => {
+      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_LOCKED' });
+    });
+    try {
+      const launch = h.manager.reserve('PAIR-CLEANUP', h.config, 'account-1', async () => { throw new Error('quote failure'); });
+      const rejected = expect(launch).rejects.toMatchObject({ code: 'managed_launch_cleanup_busy', statusCode: 503 });
+      await vi.advanceTimersByTimeAsync(500);
+      await rejected;
+      expect(h.db.prepare('SELECT count(*) n FROM managed_position_reservations WHERE strategy_id=?').get('PAIR-CLEANUP')).toEqual({ n: 2 });
+      expect(managedRiskReason(h.db)).toBeNull();
+    } finally {
+      abort.mockRestore();
+      h.manager.abortReservation('PAIR-CLEANUP');
+    }
+  });
   it('continues donor protection and interrupts adoption while its preparation is pending', async () => {
     const h = await harness(); const original = await h.task(); await h.manager.tick(); h.config.management!.adoptExisting = true;
     let release!: () => void;
@@ -1451,6 +1764,142 @@ describe('generic adopted position groups and explicit stop intent', () => {
   });
 });
 
+it('review: quote loss with a nonzero notional minimum remains recoverable', async () => {
+  const h=await harness(), id=await h.task(); await h.manager.tick();
+  h.manager.requestExit(id); await h.manager.tick();
+  h.db.prepare("UPDATE crossex_instruments SET min_notional='1'").run();
+  const original=h.markets.market; let reads=0;
+  vi.spyOn(h.markets,'market').mockImplementation(symbol => ++reads<=2 ? original(symbol):null);
+  h.ack(1,'FILLED','10'); h.quantities('90','100'); await h.manager.waitForIdle();
+  expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+});
+it('review: queued pairing must wait for fresh recovery evidence', async () => {
+  const h=await harness(), id=await h.task(); await h.manager.tick();
+  h.manager.requestExit(id); await h.manager.tick();
+  let release: (()=>void)|undefined;
+  h.setSubmitWait(()=>new Promise<void>(resolve=>{release=resolve;}));
+  h.ack(1,'FILLED','10'); h.quantities('90','100');
+  for(let i=0;i<100&&!release;i++) await Promise.resolve();
+  expect(release).toBeTypeOf('function');
+  h.manager.holdForMarginRead('margin_account_version_regressed');
+  release!(); await h.manager.waitForIdle();
+  expect(h.created).toHaveLength(1);
+});
+it('review: manual EXIT partial fill cancels maker and recovers before deadline', async () => {
+  const h=await harness(), id=await h.task(); await h.manager.tick();
+  h.manager.beginStop(id,true); await h.manager.finishStop(id); await h.manager.tick();
+  expect(readManagedState(h.db,id)?.stopIntent).toBe('EXIT');
+  const original=h.markets.market; let reads=0;
+  const spy=vi.spyOn(h.markets,'market').mockImplementation(symbol=>++reads<=2?original(symbol):null);
+  h.ack(1,'PARTIALLY_FILLED','3'); h.quantities('97','100'); await h.manager.waitForIdle();
+  expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+  spy.mockRestore();
+  for(let i=0;i<6;i++){vi.setSystemTime(Date.now()+1000);await h.manager.tick();}
+  expect(h.cancelled).toEqual(['remote-1']);
+  expect(h.created.some(o=>o.type==='MARKET'&&o.qty==='3')).toBe(true);
+});
+
+it('recovers a full manual close without pausing or trading an unrelated managed group',async()=>{
+  const h=await harness();h.config.management!.perOrderQuantity='100';
+  const id=await h.task();await h.manager.tick();h.missingFunding(true);
+  const second='PAIR-OTHER', config={...h.config,asset:'ETH'}, legs=managedLegs(config), stamp=new Date().toISOString();
+  h.db.prepare(`INSERT INTO execution_strategies(id,kind,environment,status,config_json,progress,filled_quantity,filled_left,filled_right,open_position,credential_profile_id,created_at,updated_at)
+    VALUES (?,'position','live','RUNNING',?,100,'100','100','100','100','account-1',?,?)`).run(second,JSON.stringify(config),stamp,stamp);
+  h.db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run(second,'account-1',JSON.stringify({...readManagedState(h.db,id),groupId:second}),stamp);
+  for(const leg of legs) h.db.prepare('INSERT INTO managed_position_claims VALUES (?,?,?)').run('account-1',leg.symbol,second);
+  h.setRead(async()=>({...h.facts(),positions:[...h.facts().positions,...legs.map(l=>({symbol:l.symbol,position_side:l.side==='BUY'?'LONG':'SHORT',position_qty:'100'} as GateCrossExPosition))]}));
+  h.manager.beginStop(id,true);await h.manager.finishStop(id);await h.manager.tick();
+  const original=h.markets.market;let reads=0;
+  const spy=vi.spyOn(h.markets,'market').mockImplementation(s=>++reads<=2?original(s):null);
+  h.ack(1,'FILLED','100');h.quantities('0','100');await h.manager.waitForIdle();spy.mockRestore();
+  expect(h.runtime.getStrategy(second).status).toBe('RUNNING');
+  for(let i=0;i<7&&h.created.length<2;i++){vi.setSystemTime(Date.now()+1000);await h.manager.tick();}
+  expect(h.created[1]).toMatchObject({qty:'100',reduce_only:'true'});
+  h.ack(2,'FILLED','100');h.quantities('0','0');
+  for(let i=0;i<7&&h.runtime.getStrategy(id).status!=='COMPLETED';i++){vi.setSystemTime(Date.now()+1000);await h.manager.tick();}
+  expect(managedRiskReason(h.db)).toBeNull();expect(h.runtime.getStrategy(id).status).toBe('COMPLETED');
+  expect(h.runtime.getStrategy(second)).toMatchObject({status:'RUNNING',management:{phase:'MONITORING'}});
+  expect(h.created).toHaveLength(2);expect(h.session.current).toBe('live');
+});
+
+describe('bounded quote recovery authority', () => {
+  it('does not let quote-recovery authority bypass another task external-reduction incident', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    h.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)')
+      .run('managed_account_rechecking', new Date().toISOString());
+    const state = readManagedState(h.db, id)!;
+    writeManagedState(h.db, id, { ...state, protectionIncident: {
+      reason: 'managed_external_reduction', before: ['100', '100'], at: Date.now(),
+    } });
+    expect(managedOrderBlock(h.db, 'UNOWNED_FUTURE_TEST_USDT', 'another-task', true, true, true))
+      .toBe('managed_external_reduction_pending');
+    expect(managedOrderBlock(h.db, h.legs[0].symbol, id, false, true, true))
+      .toBe('managed_account_rechecking');
+  });
+  async function waiting() {
+    const h=await harness(), id=await h.task(); await h.manager.tick();
+    h.manager.beginStop(id,true); await h.manager.finishStop(id); await h.manager.tick();
+    const original=h.markets.market; let reads=0;
+    const spy=vi.spyOn(h.markets,'market').mockImplementation(s=>++reads<=2?original(s):null);
+    h.ack(1,'FILLED','10'); h.quantities('90','100'); await h.manager.waitForIdle(); spy.mockRestore();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    return {h,id};
+  }
+  it.each(['expiry','account','claims','KEEP','readonly','hard-lock','position-event','config'])('invalidates queued recovery capability on %s',async change=>{
+    const {h,id}=await waiting();
+    let release:(()=>void)|undefined;
+    h.setSubmitWait(()=>new Promise<void>(resolve=>{release=resolve;}));
+    vi.setSystemTime(Date.now()+2000); await h.manager.tick();
+    vi.setSystemTime(Date.now()+1000); const turn=h.manager.tick();
+    for(let n=0;n<150&&!release;n++) await Promise.resolve();
+    expect(release).toBeTypeOf('function');
+    if(change==='expiry') vi.setSystemTime(Date.now()+26000);
+    if(change==='account') h.changeAccount();
+    if(change==='claims') h.db.prepare('DELETE FROM managed_position_claims WHERE strategy_id=?').run(id);
+    if(change==='KEEP') h.manager.beginStop(id,false);
+    if(change==='readonly') h.session.set('readonly');
+    if(change==='hard-lock') h.manager.failAll('synthetic_review');
+    if(change==='position-event') h.manager.notifyPosition({symbol:h.legs[1].symbol,position_qty:'101',update_time:String(Date.now())});
+    if(change==='config') h.db.prepare("UPDATE execution_strategies SET config_json=json_set(config_json,'$.management.perOrderQuantity','11') WHERE id=?").run(id);
+    release!(); await turn;
+    expect(h.created).toHaveLength(1);
+    expect(h.runtime.listOrders().some(o=>o.failureReason==='ORDER_NOT_DISPATCHED')).toBe(true);
+  });
+  it('retains the original deadline across manager recreation and never restores live on startup',async()=>{
+    const {h,id}=await waiting(), lock=h.db.prepare('SELECT created_at FROM managed_risk_lock').get();
+    await h.manager.stop();
+    const session=new TradingSession(), runtime=new TradingRuntime(h.db,session,h.vault,h.gateway);
+    const manager=new ManagedPositionManager(h.db,session,runtime,h.markets,h.sources); managers.push(manager);
+    expect(session.current).toBe('unset'); expect(h.db.prepare('SELECT created_at FROM managed_risk_lock').get()).toEqual(lock);
+    vi.setSystemTime(Date.now()+26000); session.set('live'); await manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+    expect(runtime.getStrategy(id).status).toBe('PAUSED'); expect(h.created).toHaveLength(1);
+  });
+  it('clears an expired quote recovery only after the official explicit review succeeds',async()=>{
+    const {h,id}=await waiting();
+    vi.setSystemTime(Date.now()+26000);await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+    expect(readManagedState(h.db,id)?.quoteRecovery).toBeDefined();
+    h.session.set('live');await h.manager.resume(id,'account-1','EXITING');
+    expect(readManagedState(h.db,id)?.quoteRecovery).toBeUndefined();
+    await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBeNull();expect(h.created).toHaveLength(2);
+  });
+  it('restores an interrupted STOPPING EXIT as protected reduce-only responsibility after restart', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    h.manager.beginStop(id, true); await h.manager.stop();
+    const session = new TradingSession(), runtime = new TradingRuntime(h.db, session, h.vault, h.gateway);
+    const manager = new ManagedPositionManager(h.db, session, runtime, h.markets, h.sources); managers.push(manager);
+    manager.protection.authority.configure('risk-account', [id], 0, true);
+
+    expect(session.current).toBe('unset');
+    expect(runtime.getStrategy(id)).toMatchObject({ status: 'PAUSED', management: {
+      phase: 'RISK_PAUSED', stopIntent: 'EXIT', exitRequested: true, reason: 'managed_stop_recovery_pending',
+    } });
+    expect(manager.protection.owns(id)).toBe(true);
+  });
+});
+
 describe('managed lifecycle using the real order runtime and isolated database', () => {
   it.each(['unknown', 'not-sent', 'rejected', 'confirmed-ws'] as const)(
     'classifies a cancellation failure before changing global authority (%s)', async outcome => {
@@ -1531,6 +1980,36 @@ describe('managed lifecycle using the real order runtime and isolated database',
     await expect(h.manager.validateForActivation()).rejects.toMatchObject({ code: 'managed_account_recovery_expired' });
     expect(h.session.current).toBe('readonly'); expect(h.created).toHaveLength(0);
   });
+  it('allows deployment past dormant recovery deadlines without clearing a durable hard pause', async () => {
+    const h = await harness(), id = await h.task(); await h.manager.tick();
+    h.manager.failAll('managed_external_reduction');
+    h.session.armProtection();
+    Reflect.set(h.manager, 'invalidatedSince', Date.now() - 26_000);
+    const lock = h.db.prepare('SELECT * FROM managed_risk_lock').get();
+    const state = readManagedState(h.db, id), mode = h.session.current;
+    const grant = h.manager.protection.authority.grant();
+    await expect(h.manager.validateForActivation('deployment')).resolves.toBeUndefined();
+    expect(h.db.prepare('SELECT * FROM managed_risk_lock').get()).toEqual(lock);
+    expect(readManagedState(h.db, id)).toEqual(state); expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+    expect(h.session.current).toBe(mode); expect(h.manager.protection.authority.grant()).toEqual(grant);
+    expect(h.created).toHaveLength(0);
+    await expect(h.manager.validateForActivation()).rejects.toMatchObject({ code: 'managed_account_recovery_expired' });
+  });
+  it.each(['temporary-lock', 'running-task', 'pause-not-persisted'])(
+    'retains deployment expiry checks for %s', async scenario => {
+      const h = await harness(), id = await h.task(); await h.manager.tick();
+      if (scenario === 'temporary-lock') {
+        h.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)')
+          .run('managed_account_rechecking', new Date(Date.now() - 26_000).toISOString());
+      } else {
+        h.manager.failAll('managed_external_reduction');
+        if (scenario === 'running-task') h.db.prepare("UPDATE execution_strategies SET status='RUNNING' WHERE id=?").run(id);
+        else Reflect.set(h.manager, 'pendingHardPause', { reason: 'managed_external_reduction', records: [id] });
+      }
+      Reflect.set(h.manager, 'invalidatedSince', Date.now() - 26_000);
+      await expect(h.manager.validateForActivation('deployment')).rejects.toMatchObject({ code: 'managed_account_recovery_expired' });
+      expect(h.created).toHaveLength(0);
+    });
   it('uses the whole fixed recovery window for three temporary read failures', async () => {
     const h = await harness(); const id = await h.task(); await h.manager.tick(); const start = Date.now();
     h.missingFunding(true); h.unavailable();
@@ -1781,8 +2260,11 @@ describe('managed lifecycle using the real order runtime and isolated database',
     expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
     expect(h.runtime.getStrategy(id).status).toBe('RUNNING'); expect(h.created).toHaveLength(1);
     h.ack(1, 'CANCELLED', '2'); await h.manager.tick(); await h.manager.tick();
-    expect(managedRiskReason(h.db)).toBeNull(); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking'); await h.manager.tick();
     expect(h.created[1]).toMatchObject({ side: 'BUY', qty: '2', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '2'); h.quantities('98', '98');
+    for (let i=0;i<5;i++) { vi.setSystemTime(Date.now()+1000); await h.manager.tick(); }
+    expect(managedRiskReason(h.db)).toBeNull();
   });
   it('does not confuse an old own maker with a foreign order after 100 unrelated orders', async () => {
     const h = await harness(); const id = await h.task(); await h.manager.tick(); h.manager.requestExit(id); await h.manager.tick();
@@ -1855,8 +2337,98 @@ describe('managed lifecycle using the real order runtime and isolated database',
     const first = h.manager.resume(id, 'account-1');
     const second = h.manager.resume(id, 'account-1');
     resolves[0](h.facts()); await first; h.manager.requestExit(id);
-    resolves[1](h.facts()); await expect(second).rejects.toMatchObject({ code: 'strategy_not_paused' });
+    resolves[1](h.facts()); await expect(second).rejects.toMatchObject({ code: 'managed_review_changed' });
     expect(readManagedState(h.db, id)?.exitRequested).toBe(true);
+  });
+  it('retires a reviewed hard-pause deadline before a later account recheck', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    Reflect.set(h.manager, 'invalidatedSince', Date.now() - 24_900);
+    h.db.prepare('INSERT INTO managed_risk_lock VALUES (1,?,?)')
+      .run('managed_account_rechecking', new Date(Date.now() - 24_900).toISOString());
+    h.manager.failAll('synthetic_review'); h.session.set('live');
+    await h.manager.resume(id, 'account-1');
+    expect(Reflect.get(h.manager, 'invalidatedSince')).toBeNull();
+
+    h.unavailable(); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+  });
+  it('does not let explicit resume bypass a temporary account recheck', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    h.manager.failAll('synthetic_review'); h.session.set('live');
+    h.db.prepare("UPDATE managed_risk_lock SET reason='managed_account_rechecking'").run();
+    const state = readManagedState(h.db, id)!;
+    writeManagedState(h.db, id, { ...state, reason: 'managed_account_rechecking' });
+
+    await expect(h.manager.resume(id, 'account-1')).rejects.toMatchObject({ code: 'managed_account_rechecking' });
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.runtime.getStrategy(id).status).toBe('PAUSED');
+  });
+  it('continues an existing EXIT responsibility in protect-only without unlocking ordinary trading', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    h.manager.protection.authority.configure('risk-account', [id], 0, true);
+    expect(h.manager.protection.owns(id)).toBe(true);
+    h.manager.beginStop(id, true); await h.manager.finishStop(id);
+    h.manager.failAll('synthetic_review');
+    expect(h.session.current).toBe('protect_only');
+
+    const resumed = await h.manager.resume(id, 'account-1', 'EXITING');
+    expect(resumed).toMatchObject({ status: 'PAUSED', management: {
+      phase: 'EXITING', stopIntent: 'EXIT', exitRequested: true,
+    } });
+    expect(h.session.current).toBe('protect_only');
+    expect(managedRiskReason(h.db)).toBe('synthetic_review');
+    expect(h.manager.protection.owns(id)).toBe(true);
+  });
+  it('still starts account recheck for a STOPPING position increase beyond owned entry responsibility', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick();
+    h.manager.beginStop(id, true); Reflect.set(h.manager, 'readingAccount', true);
+    try {
+      h.manager.notifyPosition({ symbol: h.legs[0].symbol, position_side: 'LONG', position_qty: '101', update_time: String(Date.now() + 1) });
+    } finally { Reflect.set(h.manager, 'readingAccount', false); }
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+  });
+  it('treats an attributable TAKER_TAKER partial entry fill during STOPPING as exit responsibility', async () => {
+    const h = await harness(); const id = await h.task('PAIR-TAKER-STOP', false, 'TAKER_TAKER');
+    await h.runtime.createOrder({ symbol: h.legs[0].symbol, side: 'BUY', type: 'MARKET', timeInForce: 'IOC', quantity: '10' },
+      { strategyId: id, strategyLeg: 'left', feePhase: 'entry' });
+    h.manager.beginStop(id, true); Reflect.set(h.manager, 'readingAccount', true);
+    try { h.ack(1, 'PARTIALLY_FILLED', '3'); }
+    finally { Reflect.set(h.manager, 'readingAccount', false); }
+    expect(managedRiskReason(h.db)).toBeNull();
+    expect(readManagedState(h.db, id)).toMatchObject({ phase: 'STOPPING', stopIntent: 'EXIT', exitRequested: true });
+  });
+  it('discards a stale stop snapshot when an owned position event arrives during the read', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick(); h.manager.beginStop(id, true);
+    let release!: (facts: ManagedAccountFacts) => void;
+    h.setRead(() => new Promise(resolve => { release = resolve; }));
+    const pending = h.manager.finishStop(id);
+    for (let attempt = 0; attempt < 20 && !release; attempt += 1) await Promise.resolve();
+    h.manager.notifyPosition({ symbol: h.legs[0].symbol, position_side: 'LONG', position_qty: '100', update_time: String(Date.now() + 1) });
+    release(h.facts()); await pending;
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'RUNNING', management: { phase: 'STOPPING', stopIntent: 'EXIT' } });
+    expect(hasManagedClaims(h.db)).toBe(true); expect(managedRiskReason(h.db)).toBeNull();
+
+    h.setRead(null);
+    for (let attempt = 0; attempt < 4 && h.runtime.getStrategy(id).management?.phase === 'STOPPING'; attempt += 1) await h.manager.tick();
+    expect(h.runtime.getStrategy(id).management?.phase).toBe('EXITING');
+  });
+  it('recovers a transient stop account read and continues EXIT without user action', async () => {
+    const h = await harness(); const id = await h.task(); await h.manager.tick(); h.manager.beginStop(id, true);
+    h.unavailable(); await h.manager.finishStop(id);
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.runtime.getStrategy(id).management?.phase).toBe('STOPPING');
+
+    h.unavailable(false);
+    for (let attempt = 0; attempt < 6 && h.runtime.getStrategy(id).management?.phase === 'STOPPING'; attempt += 1) {
+      vi.setSystemTime(Date.now() + 2100); await h.manager.tick();
+    }
+    expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'RUNNING', management: {
+      phase: 'EXITING', stopIntent: 'EXIT', exitRequested: true,
+    } });
   });
   it('blocks new orders when a locally terminal maker remains open remotely', async () => {
     const h = await harness(); const id = await h.task(); await h.manager.tick(); h.manager.requestExit(id); await h.manager.tick();
@@ -1899,13 +2471,97 @@ describe('managed lifecycle using the real order runtime and isolated database',
     h.ack(1, 'OPEN', filled); h.quantities(filled === '0' ? '100' : '99.35', '100');
     h.missingQuote(h.legs[1].symbol); await h.manager.waitForIdle(); await h.manager.tick();
     expect(h.remote.get('remote-1')?.state).toBe('CANCELLED');
-    expect(h.created).toHaveLength(1); expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.created).toHaveLength(1);
+    expect(managedRiskReason(h.db)).toBe(filled === '0' ? null : 'managed_account_rechecking');
     await h.manager.tick(); // terminal cancellation is reconciled before a new account snapshot
     expect(h.created).toHaveLength(1);
     await h.manager.tick();
     expect(h.created).toHaveLength(1);
     await h.manager.tick(); // cancel request, terminal confirmation, then fresh post-cancel facts
-    if (filled !== '0') expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED');
+    if (filled !== '0') {
+      h.missingQuote(h.legs[1].symbol, false);
+      for (let i=0;i<4;i++) { vi.setSystemTime(Date.now()+1000); await h.manager.tick(); }
+      expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED');
+      expect(managedRiskReason(h.db)).toBe('managed_partial_untradeable');
+    }
+  });
+  it('recovers a confirmed exit fill when the hedge quote expires between validation and pairing', async () => {
+    const h = await harness('AERO', 'GATE'); const id = await h.task(); await h.manager.tick();
+    h.manager.requestExit(id); await h.manager.tick(); expect(h.created).toHaveLength(1);
+    const original = h.markets.market; const quoteReads = new Map<string, number>();
+    vi.spyOn(h.markets, 'market').mockImplementation(symbol => {
+      const reads = (quoteReads.get(symbol) ?? 0) + 1; quoteReads.set(symbol, reads);
+      return reads === 1 ? original(symbol) : null;
+    });
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100'); await h.manager.waitForIdle();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+    expect(readManagedState(h.db, id)?.reason).toBe('managed_pairing_quote_rechecking');
+    vi.restoreAllMocks();
+    for (let turn = 0; turn < 5 && h.created.length < 2; turn++) {
+      vi.setSystemTime(Date.now() + 1000); await h.manager.tick();
+    }
+    expect(h.created[1]).toMatchObject({ symbol: h.legs[1].symbol, side: 'BUY', qty: '10', reduce_only: 'true' });
+    h.ack(2, 'FILLED', '10'); h.quantities('90', '90');
+    for (let turn = 0; turn < 5 && managedRiskReason(h.db); turn++) {
+      vi.setSystemTime(Date.now() + 1000); await h.manager.tick();
+    }
+    expect(managedRiskReason(h.db)).toBeNull();
+    expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id).status).toBe('RUNNING');
+  });
+  it('recovers a pairing order rejected before dispatch without duplicating the hedge', async () => {
+    const h = await harness('AERO', 'GATE'); const id = await h.task(); await h.manager.tick();
+    h.manager.requestExit(id); await h.manager.tick(); expect(h.created).toHaveLength(1);
+    let release: (() => void) | undefined;
+    h.setSubmitWait(() => new Promise<void>(resolve => { release = resolve; }));
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100');
+    for (let i = 0; i < 100 && !release; i++) await Promise.resolve();
+    expect(release).toBeTypeOf('function');
+    h.missingQuote(h.legs[0].symbol); h.missingQuote(h.legs[1].symbol); release!();
+    await h.manager.waitForIdle();
+    expect(h.runtime.listOrders().find(order => order.strategyId === id && order.failureReason))
+      .toMatchObject({ state: 'FAIL', failureReason: 'ORDER_NOT_DISPATCHED' });
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.created).toHaveLength(1);
+    expect(readManagedState(h.db, id)?.reason).toBe('managed_pairing_quote_rechecking');
+    h.setSubmitWait(null); h.missingQuote(h.legs[0].symbol, false); h.missingQuote(h.legs[1].symbol, false);
+    for (let turn = 0; turn < 5 && h.created.length < 2; turn++) {
+      vi.setSystemTime(Date.now() + 1000); await h.manager.tick();
+    }
+    expect(h.created).toHaveLength(2);
+    expect(h.created[1]).toMatchObject({ symbol: h.legs[1].symbol, side: 'BUY', qty: '10', reduce_only: 'true' });
+  });
+  it('escalates a recoverable pairing quote outage after the original fixed deadline', async () => {
+    const h = await harness('AERO', 'GATE'); const id = await h.task(); await h.manager.tick();
+    h.manager.requestExit(id); await h.manager.tick();
+    const original = h.markets.market; const quoteReads = new Map<string, number>();
+    vi.spyOn(h.markets, 'market').mockImplementation(symbol => {
+      const reads = (quoteReads.get(symbol) ?? 0) + 1; quoteReads.set(symbol, reads);
+      return reads === 1 ? original(symbol) : null;
+    });
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100'); await h.manager.waitForIdle();
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    const startedAt = (h.db.prepare('SELECT created_at FROM managed_risk_lock').get() as { created_at: string }).created_at;
+    vi.setSystemTime(Date.now() + 2000); await h.manager.tick();
+    vi.setSystemTime(Date.now() + 2000); await h.manager.tick();
+    expect((h.db.prepare('SELECT created_at FROM managed_risk_lock').get() as { created_at: string }).created_at).toBe(startedAt);
+    vi.setSystemTime(Date.parse(startedAt) + 25_001); await h.manager.tick();
+    expect(managedRiskReason(h.db)).toBe('managed_account_recovery_expired');
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'PAUSED', management: { phase: 'RISK_PAUSED' } });
+  });
+  it('keeps an unknown pairing submission on the hard-pause path and never replays it', async () => {
+    const h = await harness('AERO', 'GATE'); const id = await h.task(); await h.manager.tick();
+    h.manager.requestExit(id); await h.manager.tick(); h.failSubmit();
+    h.ack(1, 'FILLED', '10'); h.quantities('90', '100'); await h.manager.waitForIdle();
+    expect(managedRiskReason(h.db)).toBe('managed_order_unresolved');
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'PAUSED', management: { phase: 'RISK_PAUSED' } });
+    expect(h.runtime.listOrders().find(order => order.failureReason === 'ORDER_SUBMISSION_UNKNOWN'))
+      .toMatchObject({ state: 'PENDING_SUBMIT', strategyId: id });
+    h.failSubmit(false); h.missingQuote(h.legs[0].symbol, false); h.missingQuote(h.legs[1].symbol, false);
+    for (let turn = 0; turn < 4; turn++) { vi.setSystemTime(Date.now() + 1000); await h.manager.tick(); }
+    expect(h.created).toHaveLength(2);
   });
   it.each([false, true])('rechecks both exit legs after awaited credentials (market fallback=%s)', async fallback => {
     const h = await harness('ZHIPU'); h.config.management!.marketFallback = fallback;
@@ -1925,7 +2581,9 @@ describe('managed lifecycle using the real order runtime and isolated database',
     await h.manager.tick();
     expect(h.created).toHaveLength(before);
     expect(h.runtime.listOrders()).toHaveLength(before);
-    expect(readManagedState(h.db, id)?.phase).toBe('RISK_PAUSED');
+    expect(managedRiskReason(h.db)).toBe('managed_account_rechecking');
+    expect(h.session.current).toBe('live');
+    expect(h.runtime.getStrategy(id)).toMatchObject({ status: 'RUNNING', management: { phase: 'EXITING' } });
   });
   it('publishes PAUSED consistently and reconciles confirmed cancellation without unlocking risk', async () => {
     const h = await harness('ZHIPU'); const id = await h.task(); await h.manager.tick(); h.manager.requestExit(id);

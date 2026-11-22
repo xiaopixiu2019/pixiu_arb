@@ -5,7 +5,7 @@ import type { TradingSession } from './trading-session.js';
 import type { TradingRuntime, StrategyRecord } from './trading-runtime.js';
 import { ProtectionAuthority, type ProtectionOrder } from './protection-authority.js';
 import { managedLegs, type ManagedAccountFacts } from './managed-position-manager.js';
-import { readManagedState, writeManagedState, managedHardRiskReason, managedRiskReason } from './managed-position-store.js';
+import { MANAGED_RECOVERY_WINDOW_MS, readManagedState, writeManagedState, managedHardRiskReason, managedRiskReason } from './managed-position-store.js';
 import { entryHoldings } from './managed-position-adoption.js';
 import { pairedQuantities } from './managed-position-model.js';
 import { assertMarginSubmission } from './managed-margin-batch.js';
@@ -77,6 +77,7 @@ export class ContinuousProtection {
     });
   }
   needsTick(): boolean {
+    if (this.session.maintenancePending) return false;
     if (this.now() - this.lastRun < 1000) return false;
     if (!this.authority.grant()?.enabled || this.session.current === 'readonly') return false;
     // The ordinary manager owns bounded live read recovery; do not starve or promote its soft lock.
@@ -140,6 +141,7 @@ export class ContinuousProtection {
       this.runtime.listOpenOrders().map(o => [o.id, o.state, o.executedQuantity]).sort()]);
   }
   async run(): Promise<void> {
+    if (this.session.maintenancePending) return;
     if (this.now() - this.lastRun < 1000) return;
     this.lastRun = this.now(); this.observation = null;
     const records = this.records().filter(r => !this.session.liveTradingEnabled || !!managedRiskReason(this.db) || r.status === 'PAUSED');
@@ -165,6 +167,7 @@ export class ContinuousProtection {
     if (this.session.liveTradingEnabled && managedRiskReason(this.db) && !managedHardRiskReason(this.db)) {
       this.confirmed = null; return;
     }
+    if (this.session.maintenancePending) return;
     if (this.session.current === 'unset') {
       for (const r of records) this.authority.status(r.id,'RECONCILING');
       this.session.protect();
@@ -233,6 +236,24 @@ export class ContinuousProtection {
     const state = readManagedState(this.db, record.id)!;
     if (state.verified || state.marginBatch) return true;
     const caps = entryHoldings(this.db, record.id), quantities = pairedQuantities(facts.positions, managedLegs(record.config));
+    if (state.stopIntent === 'EXIT' && state.exitRequested) {
+      const settled = quantities.every((quantity, index) => new Decimal(quantity).eq(caps[index]));
+      if (!settled) {
+        const row = this.db.prepare(`SELECT MIN(updated_at) AS at FROM execution_orders
+          WHERE strategy_id=? AND reduce_only=0 AND CAST(executed_quantity AS REAL)>0`).get(record.id) as { at: string | null };
+        const evidenceAt = row.at ? Date.parse(row.at) : Number.NaN;
+        const since = state.positionSettlementSince ?? (Number.isFinite(evidenceAt) ? evidenceAt : this.now());
+        if (this.now() - since >= MANAGED_RECOVERY_WINDOW_MS) throw new Error('managed_positions_settlement_expired');
+        writeManagedState(this.db, record.id, { ...state, leftQuantity: quantities[0], rightQuantity: quantities[1],
+          maxLeft: caps[0], maxRight: caps[1], positionSettlementSince: since,
+          checkedAt: new Date(this.now()).toISOString(), reason: 'managed_positions_settlement_pending' });
+        this.authority.status(record.id, 'RECONCILING', 'managed_positions_settlement_pending'); return false;
+      }
+      writeManagedState(this.db, record.id, { ...state, verified: true, leftQuantity: quantities[0], rightQuantity: quantities[1],
+        maxLeft: caps[0], maxRight: caps[1], positionSettlementSince: undefined,
+        checkedAt: new Date(this.now()).toISOString(), reason: 'managed_stop_recovery_pending' });
+      return true;
+    }
     if (quantities.every(q => new Decimal(q).isZero())) {
       this.authority.status(record.id, 'RECONCILING', 'protection_holdings_pending'); return false;
     }
@@ -280,7 +301,12 @@ export class ContinuousProtection {
       if (state.marginBatch) {
         assertMarginSubmission(this.db, record.id, state.marginBatch, index, quantity, exclude);
         if (index === state.marginBatch.firstLeg) this.sources.margin()!.assertFirstLeg(record.id, state.marginBatch.id!);
-      } else if (!quantity.eq(new Decimal(q[index]).minus(q[1 - index])) || quantity.lte(0)) throw new Error('protection_difference_changed');
+      } else {
+        const exactDifference = quantity.eq(new Decimal(q[index]).minus(q[1 - index])) && quantity.gt(0);
+        const exitClip = state.stopIntent === 'EXIT' && state.exitRequested && new Decimal(q[0]).eq(q[1])
+          && quantity.gt(0) && quantity.lte(q[index]);
+        if (!exactDifference && !exitClip) throw new Error('protection_difference_changed');
+      }
       const originalPairing = state.marginBatch && index !== state.marginBatch.firstLeg;
       if (!originalPairing && !this.sources.margin()!.snapshot().policy.protectedGroupIds.includes(state.groupId ?? record.id))
         throw new Error('protection_authority_revoked');

@@ -44,6 +44,8 @@ export function recoveryHoldings(db: Database.Database, record: StrategyRecord, 
   if (state.marginBatch) {
     try {
       const batch = marginBatchFills(db, record.id, state.marginBatch);
+      if (!batch.rows.length && state.quoteRecovery) return quantities.every(q => new Decimal(q).eq(state.marginBatch!.before))
+        ? { kind: 'match' } : fault('managed_margin_holdings_conflict');
       if (!batch.terminal) return quantities.every((q, i) => new Decimal(q).lte(state.marginBatch!.before)
         && new Decimal(q).gte(new Decimal(state.marginBatch!.before).minus(batch.reserved[i])))
         ? { kind: 'wait', reason: 'margin_order_confirmation_pending' } : fault('managed_margin_holdings_conflict');

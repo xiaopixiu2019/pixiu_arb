@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolve } from 'node:path';
 import { openDatabase } from './database.js';
-import { CreateStrategyInputSchema, TradingRuntime } from './trading-runtime.js';
+import { CreateStrategyInputSchema, TradingRuntime, TradingRuntimeError } from './trading-runtime.js';
 import { MemoryCredentialVault, DEFAULT_CREDENTIAL_PROFILE } from './credential-vault.js';
 import { TradingSession } from './trading-session.js';
 import { createMarginRiskService } from './margin-risk-service.js';
@@ -59,7 +59,8 @@ async function harness(split = false, initialBalance = '10000', target = '20', p
     VALUES('PAIR-TEST','position','live','RUNNING',?,'account',?,?)`).run(JSON.stringify(config), now, now);
   db.prepare('INSERT INTO managed_positions VALUES (?,?,?,?)').run('PAIR-TEST', 'account', JSON.stringify({ ...initialManagedState(),
     phase: 'OPENING', verified: true, groupId: 'PAIR-TEST', adoptedLeft: '0', adoptedRight: '0' }), now);
-  for (const symbol of symbols) db.prepare('INSERT INTO managed_position_claims VALUES(?,?,?)').run(symbol, 'account', 'PAIR-TEST');
+  for (const symbol of symbols) db.prepare('INSERT INTO managed_position_claims(account_id,symbol,strategy_id) VALUES(?,?,?)')
+    .run('account', symbol, 'PAIR-TEST');
   let observe: (facts: ManagedAccountFacts) => void = () => undefined;
   const failAll = vi.fn();
   const monitor = createMarginRiskService({ db, runtime, gateway, enforce: true, profile: () => ({ id: 'account', label: 'Synthetic' }),
@@ -92,6 +93,32 @@ async function reflectedMaker(h: Awaited<ReturnType<typeof harness>>, balance = 
 }
 
 describe('paired preparation request ownership', () => {
+  it('reuses fresh managed facts instead of duplicating the account snapshot', async () => {
+    const h = await harness(false, '10000', '20', true);
+    h.runtime.invalidatePairedEntries();
+    h.managed.mockClear();
+    h.observe({ positions: [], openOrders: [] });
+
+    await h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+
+    expect(h.managed).not.toHaveBeenCalled();
+    expect(h.runtime.pairedEntryReady('PAIR-TEST')).toBe(true);
+  });
+
+  it('does not reuse managed facts beyond the existing five-second evidence window', async () => {
+    vi.useFakeTimers();
+    const h = await harness(false, '10000', '20', true);
+    h.runtime.invalidatePairedEntries();
+    h.observe({ positions: [], openOrders: [] });
+    h.managed.mockClear();
+    await vi.advanceTimersByTimeAsync(5001);
+
+    await h.runtime.preparePairedEntry('PAIR-TEST', h.config, 'account');
+
+    expect(h.managed).toHaveBeenCalled();
+    expect(h.runtime.pairedEntryReady('PAIR-TEST')).toBe(true);
+  });
+
   it('shares concurrent matching preparation and reads both leverages once', async () => {
     const h = await harness(); h.runtime.invalidatePairedEntries();
     Object.values(h.reads).forEach(read => read.mockClear());
@@ -502,7 +529,8 @@ describe('paired entry through the real order runtime', () => {
       VALUES('PAIR-TWO','position','live','RUNNING',?,'account',?,?)`).run(JSON.stringify(second), now, now);
     h.db.prepare('INSERT INTO managed_positions VALUES(?,?,?,?)').run('PAIR-TWO', 'account', JSON.stringify({ ...initialManagedState(),
       phase: 'OPENING', verified: true, groupId: 'PAIR-TWO', adoptedLeft: '0', adoptedRight: '0' }), now);
-    for (const symbol of symbols) h.db.prepare('INSERT INTO managed_position_claims VALUES(?,?,?)').run(symbol, 'account', 'PAIR-TWO');
+    for (const symbol of symbols) h.db.prepare('INSERT INTO managed_position_claims(account_id,symbol,strategy_id) VALUES(?,?,?)')
+      .run('account', symbol, 'PAIR-TWO');
     await h.runtime.preparePairedEntry('PAIR-TWO', second, 'account'); await h.maker();
     await h.runtime.createOrder({ symbol: symbols[0], side: 'SELL', type: 'LIMIT', timeInForce: 'POC', quantity: '10', price: '80' },
       { strategyId: 'PAIR-TWO', strategyLeg: 'left' });
@@ -534,6 +562,25 @@ describe('paired entry through the real order runtime', () => {
     for (const read of Object.values(h.reads)) expect(read).not.toHaveBeenCalled();
     await expect(h.hedge()).rejects.toMatchObject({ code: 'paired_entry_unconfirmed_hedge' });
     expect(h.writes).toHaveLength(2);
+  });
+  it('rejects a stale hedge both while a protective trim is pending and after it fills', async () => {
+    const h = await harness();
+    await h.maker(); h.fill('order-1', '10', 'FILLED');
+    await h.hedge('10'); h.fill('order-2', '2', 'CANCELLED');
+    await h.runtime.createOrder({ symbol: h.symbols[0], side: 'BUY', type: 'MARKET', timeInForce: 'IOC',
+      quantity: '8', reduceOnly: true }, { strategyId: 'PAIR-TEST', strategyLeg: 'left', feePhase: 'adjustment' });
+    await expect(h.hedge('8')).rejects.toThrow('paired_entry_unconfirmed_hedge');
+    h.fill('order-3', '8', 'FILLED');
+    await expect(h.hedge('1')).rejects.toThrow('paired_entry_unconfirmed_hedge');
+    expect(h.writes).toHaveLength(3);
+  });
+  it('does not turn lost contract ownership into a temporary hedge deferral', async () => {
+    const h = await harness();
+    await h.maker(); h.fill('order-1', '10', 'FILLED');
+    h.db.prepare('DELETE FROM managed_position_claims WHERE symbol=?').run(h.symbols[1]);
+    h.db.prepare('INSERT INTO managed_risk_lock VALUES(1,?,?)').run('managed_account_rechecking', new Date().toISOString());
+    await expect(h.hedge('10')).rejects.toMatchObject({ code: 'paired_entry_authority_changed' });
+    expect(h.writes).toHaveLength(1);
   });
   it('retains sufficient existing padding but refuses growth beyond the approved task budget', async () => {
     const h = await harness(); await h.maker(); h.fill('order-1', '5'); h.price('84');
@@ -587,5 +634,58 @@ describe('paired entry through the real order runtime', () => {
     const h = await harness(); await h.maker(); h.fill('order-1', '5'); h.runtime.invalidatePairedEntries();
     await expect(h.hedge()).rejects.toMatchObject({ code: 'paired_entry_preparation_unavailable' });
     expect(readEntryBudget(h.db, 'PAIR-TEST')?.legs[0].target).toBe('20'); expect(h.writes).toHaveLength(1);
+  });
+
+  it('retains an unexpired certificate after a transient background refresh failure', async () => {
+    const h = await harness(); const controller = (h.runtime as unknown as { pairedEntry: PairedEntryAdmission }).pairedEntry;
+    const certificates = Reflect.get(controller, 'certificates') as Map<string, { at: number }>;
+    const certificate = certificates.get('PAIR-TEST')!;
+    vi.useFakeTimers(); vi.setSystemTime(certificate.at + 4_500);
+    vi.spyOn(controller, 'prepare').mockRejectedValue(new TradingRuntimeError('paired_entry_read_failed', 409,
+      JSON.stringify({ kind: 'network', stage: 'catalog' })));
+    controller.refreshActive(); await Promise.resolve(); await Promise.resolve();
+    expect(certificates.get('PAIR-TEST')).toBe(certificate);
+  });
+
+  it('invalidates an unexpired certificate after a confirmed leverage change', async () => {
+    const h = await harness(); const controller = (h.runtime as unknown as { pairedEntry: PairedEntryAdmission }).pairedEntry;
+    const certificates = Reflect.get(controller, 'certificates') as Map<string, { at: number }>;
+    const certificate = certificates.get('PAIR-TEST')!;
+    vi.useFakeTimers(); vi.setSystemTime(certificate.at + 4_500);
+    vi.spyOn(controller, 'prepare').mockRejectedValue(new TradingRuntimeError('paired_entry_leverage_mismatch', 409));
+    controller.refreshActive(); await Promise.resolve(); await Promise.resolve();
+    expect(certificates.has('PAIR-TEST')).toBe(false);
+  });
+
+  it('invalidates an unexpired certificate when preparation unavailability has no transient evidence', async () => {
+    const h = await harness(); const controller = (h.runtime as unknown as { pairedEntry: PairedEntryAdmission }).pairedEntry;
+    const certificates = Reflect.get(controller, 'certificates') as Map<string, { at: number }>;
+    const certificate = certificates.get('PAIR-TEST')!;
+    vi.useFakeTimers(); vi.setSystemTime(certificate.at + 4_500);
+    vi.spyOn(controller, 'prepare').mockRejectedValue(new TradingRuntimeError('paired_entry_preparation_unavailable', 409));
+    controller.refreshActive(); await Promise.resolve(); await Promise.resolve();
+    expect(certificates.has('PAIR-TEST')).toBe(false);
+  });
+
+  it('retains an unexpired certificate when preparation explicitly times out', async () => {
+    const h = await harness(); const controller = (h.runtime as unknown as { pairedEntry: PairedEntryAdmission }).pairedEntry;
+    const certificates = Reflect.get(controller, 'certificates') as Map<string, { at: number }>;
+    const certificate = certificates.get('PAIR-TEST')!;
+    vi.useFakeTimers(); vi.setSystemTime(certificate.at + 4_500);
+    vi.spyOn(controller, 'prepare').mockRejectedValue(new TradingRuntimeError('paired_entry_preparation_unavailable', 409,
+      JSON.stringify({ kind: 'timeout', stage: 'preparation' })));
+    controller.refreshActive(); await Promise.resolve(); await Promise.resolve();
+    expect(certificates.get('PAIR-TEST')).toBe(certificate);
+  });
+
+  it('invalidates an expired certificate even after a transient background failure', async () => {
+    const h = await harness(); const controller = (h.runtime as unknown as { pairedEntry: PairedEntryAdmission }).pairedEntry;
+    const certificates = Reflect.get(controller, 'certificates') as Map<string, { at: number }>;
+    const certificate = certificates.get('PAIR-TEST')!;
+    vi.useFakeTimers(); vi.setSystemTime(certificate.at + 10_001);
+    vi.spyOn(controller, 'prepare').mockRejectedValue(new TradingRuntimeError('paired_entry_read_failed', 409,
+      JSON.stringify({ kind: 'timeout', stage: 'catalog' })));
+    controller.refreshActive(); await Promise.resolve(); await Promise.resolve();
+    expect(certificates.has('PAIR-TEST')).toBe(false);
   });
 });

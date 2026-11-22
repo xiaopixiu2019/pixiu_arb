@@ -20,6 +20,7 @@ import {
   type TradingCrossExGateway,
 } from './crossex-client.js';
 import { CreateStrategyInputSchema, TradingRuntime, isTerminalOrderState, type TradingRuntimeOptions } from './trading-runtime.js';
+import { CredentialOperationGate } from './credential-operation-gate.js';
 
 function remoteOrder(overrides: Partial<GateCrossExOrder> & { order_id: string; state: string }): GateCrossExOrder {
   return {
@@ -108,6 +109,7 @@ async function createHarness(script: GatewayScript = {}, options: TradingRuntime
   const runtime = new TradingRuntime(database, session, vault, gateway, {
     submitResolvePollMs: options.submitResolvePollMs ?? 10,
     submitResolveMaxAttempts: options.submitResolveMaxAttempts ?? 50,
+    ...(options.runAuthenticatedWrite ? { runAuthenticatedWrite: options.runAuthenticatedWrite } : {}),
   });
   const harness = { database, runtime, gateway, directory };
   harnesses.push(harness);
@@ -311,6 +313,36 @@ describe('trading runtime order submission', () => {
 });
 
 describe('private event ingestion guards', () => {
+  it('deployment fencing blocks strategy cancellation, cancellation retry, and leverage writes', async () => {
+    const gate = new CredentialOperationGate();
+    const h = await createHarness({}, { runAuthenticatedWrite: (work) => gate.runAuthenticatedWrite(work) });
+    const order = await h.runtime.createOrder(marketOrderInput);
+    const fence = await gate.acquireDeploymentFence('deployment-runtime-write-fence');
+    await expect(h.runtime.cancelOrder(order.id)).rejects.toThrow('deployment_fence_active');
+    await expect(h.runtime.retryConfirmedCancellation(order.id)).rejects.toThrow('deployment_fence_active');
+    await expect(h.runtime.prepareStrategyMargin([{
+      symbol: marketOrderInput.symbol, venue: 'BINANCE', side: 'BUY', leverage: '5',
+      estimatedQuantity: '0.1', estimatedPrice: '100000',
+    }])).rejects.toThrow('deployment_fence_active');
+    gate.releaseDeploymentFence(fence.operationId, fence.leaseToken);
+    await expect(h.runtime.cancelOrder(order.id)).resolves.toMatchObject({ state: 'PENDING_CANCEL' });
+  });
+
+  it('reports only unresolved write responsibility to the deployment fence', async () => {
+    const h = await createHarness();
+    const order = await h.runtime.createOrder(marketOrderInput);
+    expect(h.runtime.deploymentUnresolvedWriteCount()).toBe(0);
+    h.database.prepare("UPDATE execution_orders SET state='PENDING_CANCEL' WHERE id=?").run(order.id);
+    expect(h.runtime.deploymentUnresolvedWriteCount()).toBe(1);
+    h.database.prepare("UPDATE execution_orders SET state='OPEN' WHERE id=?").run(order.id);
+    expect(h.runtime.deploymentUnresolvedWriteCount()).toBe(0);
+    h.database.prepare("UPDATE execution_orders SET state='REMOTE_NOT_FOUND' WHERE id=?").run(order.id);
+    expect(h.runtime.deploymentUnresolvedWriteCount()).toBe(1);
+    h.database.prepare("UPDATE execution_orders SET state='FILLED', failure_reason='ORDER_SUBMISSION_UNKNOWN' WHERE id=?")
+      .run(order.id);
+    expect(h.runtime.deploymentUnresolvedWriteCount()).toBe(0);
+  });
+
   it.each(['REJECT', 'REJECTED'])('preserves a known %s push as a terminal zero-fill order', async state => {
     const h = await createHarness(), order = await h.runtime.createOrder(marketOrderInput);
     h.runtime.ingestPrivateEvent({ channel: 'order', payload: { order_id: 'remote-1', state, executed_qty: '0', reason: 'post_only_reject' } });

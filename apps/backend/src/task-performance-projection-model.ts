@@ -15,8 +15,9 @@ const trading = z.object({ base: TaskTradingResultSchema, tail: z.string(), from
   cash: z.object({ confirmed: amount.nullable(), subtotal: amount.nullable(), adjustment: amount, estimated: z.boolean(), components,
     provisionalCashflows: amount, provisional: z.boolean(), error: amount.nullable(), issues: z.array(z.string()) }).nullable() });
 const group = z.object({ id: z.string(), taskIds: z.array(z.string()), symbols: z.array(z.string()), orders: z.array(z.string()), from: z.number(), to: z.number() });
-export const GroupStageSchema = z.object({ schema: z.literal(1), group, legacy: z.array(legacy), trading });
-export interface GroupStage { schema: 1; group: GroupScope; legacy: LegacyStage[]; trading: TradingStage }
+export const TASK_PERFORMANCE_GROUP_SCHEMA = 2 as const;
+export const GroupStageSchema = z.object({ schema: z.literal(TASK_PERFORMANCE_GROUP_SCHEMA), group, legacy: z.array(legacy), trading });
+export interface GroupStage { schema: typeof TASK_PERFORMANCE_GROUP_SCHEMA; group: GroupScope; legacy: LegacyStage[]; trading: TradingStage }
 const valuedRow = z.object({ at: z.number(), id: z.string(), value: z.object({ id: z.string(), kind: z.enum(['price','funding','fees','other']),
   coin: z.string(), change: z.string(), rate: z.string().nullable(), conflict: z.boolean() }) });
 export const PoolStageSchema = z.object({ symbol: z.string(), unallocated: TaskPnlComponentSchema,

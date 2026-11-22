@@ -7,7 +7,7 @@ import { sharedIds, tradingLedger } from './task-trading-ledger.js';
 import { tradingStage } from './task-performance-trading-stage.js';
 import { pnlComponent, type PnlEntry } from './task-performance-model.js';
 import type { GroupScope } from './task-performance-projection-scope.js';
-import type { ProjectionWork, FxDependency } from './task-performance-projection-model.js';
+import { TASK_PERFORMANCE_GROUP_SCHEMA, type ProjectionWork, type FxDependency } from './task-performance-projection-model.js';
 
 /** One contract-connected component supplies attribution context; only dirty groups calculate cash stages. */
 export function buildProjection(db: Database.Database, key: string, profile: string, at: number, scope: FinancialReadScope,
@@ -24,7 +24,7 @@ export function buildProjection(db: Database.Database, key: string, profile: str
     const members=legacy.all.filter(p=>group.taskIds.includes(p.task.id));
     const retainedScope={...group,from:Math.min(group.from,Number.isFinite(g.from)?g.from:0,...members.map(p=>Number.isFinite(p.from)?p.from:0)),
       to:g.closed&&members.every(p=>p.closed)?Math.max(group.to,Number.isFinite(g.to)?g.to+60000:Number.MAX_SAFE_INTEGER):Number.MAX_SAFE_INTEGER};
-    return { schema: 1 as const, group:retainedScope, legacy: members.map(p => legacyStage(p, legacy, at)),
+    return { schema: TASK_PERFORMANCE_GROUP_SCHEMA, group:retainedScope, legacy: members.map(p => legacyStage(p, legacy, at)),
       trading: tradingStage(g, ledger, fees, key) };
   });
   const ordered = (selected: PnlBook[], value: (row: PnlBook) => PnlEntry) => selected.map(r => ({at:Number(r.create_time),id:r.id,value:value(r)}));

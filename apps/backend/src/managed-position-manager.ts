@@ -5,9 +5,11 @@ import { mergeMarginVersions, snapshotVersions, versionsAdvance, type MarginVers
 import { isolatedRouterRejection, ROUTER_REVIEW, routerRetry, resetRouterRetry, provenRouterHistory, routerOwner } from './router-entry-retry.js';
 import { confirmedExitQuantity, ordinaryManagedOrder, ownsManagedExecution, projectedExitHoldings } from './managed-execution-proof.js';
 import { randomUUID } from 'node:crypto';
+import { commitReplacement, proveReplacementTrades, replacementPositionEvidence, replacementSource, type Replacement } from './managed-replacement.js';
+import { marginAccountKey } from './margin-account-key.js';
 import { Decimal } from 'decimal.js';
 import { hyperliquidLimitPrice, isHyperliquidFuture } from './hyperliquid-limit-price.js';
-import type { GateCrossExOrder, GateCrossExPosition } from './crossex-client.js';
+import type { GateCrossExOrder, GateCrossExPortfolio, GateCrossExPosition } from './crossex-client.js';
 import { isHyperliquidOpenInterestCapFailure, type MarketSource } from './strategy-engine.js';
 import type { TradingSession } from './trading-session.js';
 import { TradingRuntimeError, isTerminalOrderState, type TradingRuntime, type CreateStrategyInput, type StrategyRecord } from './trading-runtime.js';
@@ -19,6 +21,7 @@ export { managedLegs } from './managed-legs.js';
 import { quoteUnavailableReason } from './quote-recovery.js';
 import { managedOrderSizeIssue, managedConstraintsValid, isManagedQuantityIssue, type ManagedSizeIssue } from './managed-position-validation.js';
 import { ManagedAdoption, entryHoldings } from './managed-position-adoption.js';
+import { acceptedEntryPending, entryOrders } from './paired-entry-ledger.js';
 import type { ProtectionLaunchAuthorization } from './protection-authority.js';
 import { ManagedReadFailure, recoveryHoldings, recoveryOrder, type ControlledCancellation } from './managed-account-recovery.js';
 import { canContinueEntry, managedResumeAction, verifyResumableEntry, type ManagedResumeAction } from './managed-position-resume.js';
@@ -40,6 +43,20 @@ const opposite = (side: 'BUY' | 'SELL'): 'BUY' | 'SELL' => side === 'BUY' ? 'SEL
 const ACCOUNT_READ_TIMEOUT_MS = 8_000;
 const isDatabaseBusy = (error: unknown): boolean => error !== null && typeof error === 'object' && 'code' in error
   && ['SQLITE_BUSY','SQLITE_BUSY_SNAPSHOT','SQLITE_LOCKED'].includes(String(error.code));
+const LAUNCH_STORAGE_RETRY_DELAYS_MS = [25, 100] as const;
+const MANAGED_PAIRING_QUOTE_RECHECKING = 'managed_pairing_quote_rechecking';
+function commonLotSize(lotSizes: string[]): string {
+  const scale = Math.max(...lotSizes.map(lot => new Decimal(lot).decimalPlaces()));
+  const factor = new Decimal(10).pow(scale);
+  const integers = lotSizes.map(lot => BigInt(new Decimal(lot).mul(factor).toFixed(0)));
+  const gcd = (left: bigint, right: bigint): bigint => {
+    let a = left, b = right;
+    while (b !== 0n) { const remainder = a % b; a = b; b = remainder; }
+    return a;
+  };
+  const lcm = integers.reduce((value, next) => value / gcd(value, next) * next);
+  return new Decimal(lcm.toString()).div(factor).toString();
+}
 interface CapacityProtection {
   startedAt: number; context: string; identity: string; before: [string, string];
 }
@@ -100,11 +117,25 @@ export class ManagedPositionManager {
   setEntryRecoveryController(controller: NonNullable<ManagedPositionManager['entryRecovery']>): void { this.entryRecovery = controller; }
   private readContext(): string { return `${this.sources.context?.() ?? this.sources.activeAccount()}:${this.controlEpoch}`; }
   private resetConfirmations(): void { this.recoverySignature = null; this.recoveryConfirmations = 0; this.marginRecoveryAt = null; this.marginRecoveryVersions = null; }
+  private riskLock(): { reason: string; createdAt: string } | null {
+    const row = this.db.prepare('SELECT reason,created_at FROM managed_risk_lock WHERE singleton=1')
+      .get() as { reason: string; created_at: string } | undefined;
+    return row ? { reason: row.reason, createdAt: row.created_at } : null;
+  }
+  private retireReviewedRiskLock(): void {
+    this.controlEpoch += 1; this.revision += 1; this.abortReads(); this.clearRecoveryTimer();
+    this.invalidatedSince = null; this.recoveryKey = null; this.recoveryObservation = null;
+    this.readFailures = 0; this.nextReadAt = 0; this.resetConfirmations();
+    this.marginMonitor?.invalidateNormalRecovery();
+  }
   private recoveryDeadline(): number | null {
     const row = this.db.prepare('SELECT reason,created_at FROM managed_risk_lock WHERE singleton=1').get() as { reason: string; created_at: string } | undefined;
+    const quote = this.db.prepare(`SELECT MIN(json_extract(m.state_json,'$.quoteRecovery.deadline')) AS deadline
+      FROM managed_positions m JOIN execution_strategies s ON s.id=m.strategy_id WHERE s.status='RUNNING'`)
+      .get() as { deadline: number | null };
     const deadlines = [row?.reason === MANAGED_ACCOUNT_RECHECKING ? Date.parse(row.created_at) + MANAGED_RECOVERY_WINDOW_MS : null,
       this.invalidatedSince === null ? null : this.invalidatedSince + MANAGED_RECOVERY_WINDOW_MS,
-      this.entryProgress.deadline()].filter((at): at is number => at !== null);
+      this.entryProgress.deadline(), quote.deadline].filter((at): at is number => at !== null);
     return deadlines.length ? Math.min(...deadlines) : null;
   }
   private clearRecoveryTimer(): void { if (this.recoveryTimer) clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
@@ -121,6 +152,16 @@ export class ManagedPositionManager {
   }
   private recoverySignature: string | null = null;
   private recoveryConfirmations = 0;
+  private recoveryObservation: { revision: number; context: string; at: number; deadline: number;
+    scope: string; facts: ManagedAccountFacts } | null = null;
+  private recoveryScope(): string {
+    const margin = this.marginMonitor?.snapshot();
+    return JSON.stringify([this.protection.authority.grant(), margin?.accountId, margin?.policy.revision, this.active().map(r => {
+      const s = readManagedState(this.db, r.id);
+      const claims = this.db.prepare('SELECT account_id,symbol FROM managed_position_claims WHERE strategy_id=? ORDER BY symbol').all(r.id);
+      return [r.id, r.accountProfileId, r.config, s?.stopIntent, s?.exitRequested, claims];
+    })]);
+  }
   private marginRecoveryAt: number | null = null;
   private marginRecoveryVersions: MarginVersionEvidence | null = null;
   private readonly adoption: ManagedAdoption;
@@ -194,14 +235,20 @@ export class ManagedPositionManager {
           makerOrderId: state.makerOrderId === order.id ? null : state.makerOrderId,
           pendingOrderId: state.pendingOrderId === order.id ? null : state.pendingOrderId });
       }
-      const normal = this.isCapacityOrderUpdate(order) || this.isNormalEntryQuote(order) || this.isOrdinaryExecution(order) || this.isKnownMarginExecution(order);
+      const stoppingEntry = this.isStoppingEntryOrder(order);
+      const normal = this.isCapacityOrderUpdate(order) || this.isNormalEntryQuote(order) || stoppingEntry
+        || this.isOrdinaryExecution(order) || this.isKnownMarginExecution(order);
+      if (stoppingEntry && new Decimal(order.executedQuantity).gt(0)) this.markStoppingSettlement(order.strategyId!);
       this.wake(!normal);
       if (normal && order.reduceOnly && new Decimal(order.executedQuantity).gt(0) && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
     this.unsubscribers.push(runtime.onFill((fill) => {
       if (!this.claimed(fill.symbol)) return;
       const order = this.runtime.getOrder(fill.orderId);
-      const normal = this.isCapacityOrderUpdate(order) || this.isOrdinaryExecution(order) || this.isCoveredMonitoringFill(order) || this.isKnownMarginExecution(order);
+      const stoppingEntry = this.isStoppingEntryOrder(order);
+      const normal = this.isCapacityOrderUpdate(order) || stoppingEntry || this.isOrdinaryExecution(order)
+        || this.isCoveredMonitoringFill(order) || this.isKnownMarginExecution(order);
+      if (stoppingEntry && new Decimal(order.executedQuantity).gt(0)) this.markStoppingSettlement(order.strategyId!);
       this.wake(!normal);
       if (normal && order.reduceOnly && order.strategyId) this.pairConfirmedExit(order.strategyId);
     }));
@@ -210,7 +257,10 @@ export class ManagedPositionManager {
     // Dwell never crosses process downtime; persisted exit intent and claims do.
     for (const row of db.prepare('SELECT strategy_id FROM managed_positions').all() as Array<{ strategy_id: string }>) {
       const state = readManagedState(db, row.strategy_id)!;
-      writeManagedState(db, row.strategy_id, { ...state, conditionSince: null });
+      const interruptedExit = state.phase === 'STOPPING' && state.stopIntent === 'EXIT' && state.exitRequested;
+      writeManagedState(db, row.strategy_id, interruptedExit
+        ? { ...state, phase: 'RISK_PAUSED', reason: 'managed_stop_recovery_pending', conditionSince: null }
+        : { ...state, conditionSince: null });
       if (state.phase === 'STOPPING') db.prepare("UPDATE execution_strategies SET status = 'PAUSED' WHERE id = ?").run(row.strategy_id);
     }
   }
@@ -230,7 +280,9 @@ export class ManagedPositionManager {
     await this.persistHardPauseBeforeStop();
   }
   async waitForIdle(): Promise<void> { await Promise.all([this.inFlight, ...this.fastPairing.values()]); }
-  async validateForActivation(): Promise<void> {
+  async validateForActivation(purpose: 'live' | 'deployment' = 'live'): Promise<void> {
+    // A durable hard pause survives deployment; dormant timers are not live-entry authority.
+    if (purpose === 'deployment' && managedHardRiskReason(this.db) && !this.pendingHardPause && !this.active().length) return;
     if (this.recoveryDeadline() !== null && this.now() >= this.recoveryDeadline()!) {
       this.failAll('managed_account_recovery_expired');
       throw new TradingRuntimeError('managed_account_recovery_expired', 409);
@@ -269,6 +321,17 @@ export class ManagedPositionManager {
         .get(payload.symbol, this.sources.activeAccount()) as { strategy_id: string } | undefined;
       if (!claim) return false;
       const record = this.runtime.getStrategy(claim.strategy_id), state = readManagedState(this.db, record.id), legs = managedLegs(record.config);
+      if (state?.phase === 'STOPPING' && state.stopIntent) {
+        const index = legs.findIndex(leg => leg.symbol === payload.symbol);
+        if (index < 0) return false;
+        let quantity = new Decimal(String(payload.position_qty));
+        if (payload.position_side === 'SHORT') quantity = quantity.abs().neg();
+        if (payload.position_side === 'LONG') quantity = quantity.abs();
+        const correctSide = quantity.isZero() || (quantity.gt(0) ? 'BUY' : 'SELL') === legs[index].side;
+        const maximum = new Decimal(entryHoldings(this.db, record.id)[index])
+          .plus(acceptedEntryPending(legs[index], index, entryOrders(this.db, record.id)));
+        return quantity.isFinite() && correctSide && quantity.abs().lte(maximum);
+      }
       if (knownMarginPosition(this.db, record, state, this.sources.activeAccount(), legs, payload)) return true;
       if (!ownsManagedExecution(this.db, record, state, this.sources.activeAccount(), legs)) return false;
       const index = legs.findIndex(l => l.symbol === payload.symbol);
@@ -297,6 +360,33 @@ export class ManagedPositionManager {
       && managedLegs(record.config).some(leg => leg.symbol === order.symbol && leg.side === order.side)
       && Boolean(this.db.prepare('SELECT 1 FROM managed_position_claims WHERE symbol = ? AND strategy_id = ? AND account_id = ?')
         .get(order.symbol, order.strategyId, record.accountProfileId));
+  }
+  private isStoppingEntryOrder(order: ReturnType<TradingRuntime['getOrder']>): boolean {
+    if (!order.strategyId || !order.remoteOrderId || order.reduceOnly) return false;
+    const maker = order.type === 'LIMIT' && order.timeInForce === 'POC'
+      && ['NEW', 'OPEN', 'PARTIALLY_FILLED', 'FILLED', 'PENDING_CANCEL', 'CANCELLED'].includes(order.state);
+    const taker = order.type === 'MARKET' && order.timeInForce === 'IOC'
+      && ['PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'FAIL'].includes(order.state);
+    if (!maker && !taker) return false;
+    const ordinaryCancel = order.state === 'CANCELLED' && order.failureReason?.toLowerCase() === 'cancelled_by_user';
+    const definitiveTakerFailure = taker && order.state === 'FAIL' && new Decimal(order.executedQuantity).isZero()
+      && !['ORDER_SUBMISSION_UNKNOWN', 'ORDER_CANCELLATION_UNKNOWN'].includes(order.failureReason ?? '');
+    if (order.failureReason && !ordinaryCancel && !definitiveTakerFailure) return false;
+    try {
+      const record = this.runtime.getStrategy(order.strategyId), state = readManagedState(this.db, order.strategyId);
+      const legs = managedLegs(record.config), index = legs.findIndex(leg => leg.symbol === order.symbol);
+      const filled = new Decimal(order.executedQuantity), quantity = new Decimal(order.quantity);
+      return record.status === 'RUNNING' && state?.phase === 'STOPPING' && Boolean(state.stopIntent)
+        && index >= 0 && order.strategyLeg === (index === 0 ? 'left' : 'right') && order.side === legs[index].side
+        && filled.isFinite() && filled.gte(0) && quantity.gt(0) && filled.lte(quantity)
+        && Boolean(this.db.prepare('SELECT 1 FROM managed_position_claims WHERE symbol=? AND strategy_id=? AND account_id=?')
+          .get(order.symbol, order.strategyId, record.accountProfileId));
+    } catch { return false; }
+  }
+  private markStoppingSettlement(id: string): void {
+    const state = readManagedState(this.db, id);
+    if (!state || state.phase !== 'STOPPING' || state.positionSettlementSince) return;
+    this.save(id, { ...state, positionSettlementSince: this.now(), reason: 'managed_positions_settlement_pending' });
   }
   private isOrdinaryExecution(order: ReturnType<TradingRuntime['getOrder']>): boolean {
     if (!order.strategyId) return false;
@@ -338,7 +428,8 @@ export class ManagedPositionManager {
   }
   private pairConfirmedExit(id: string): void {
     if (this.fastPairing.has(id) || this.stopped || !this.session.liveTradingEnabled || managedRiskReason(this.db)) return;
-    const work = Promise.resolve().then(async () => {
+    const work = this.runtime.runApplicationTurn(async () => {
+      await Promise.resolve();
       const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id);
       if (!ownsManagedExecution(this.db, record, state, this.sources.activeAccount(), managedLegs(record.config))) return;
       if (this.marginMonitor && (!this.marginMonitor.snapshot().fresh || this.marginMonitor.snapshot().incidentId)) return;
@@ -346,14 +437,32 @@ export class ManagedPositionManager {
       const quantities = projectedExitHoldings(this.db, id, state!);
       if (!quantities || new Decimal(quantities[0]).eq(quantities[1])) return;
       if (managedLegs(record.config).some(l => !freshManagedQuote(this.markets.market(l.symbol), this.now()))) {
+        this.recoverUndispatchedMarket(this.sizeFailure({ code: 'managed_market_data_unavailable',
+          symbol: managedLegs(record.config)[0].symbol, quantity: new Decimal(quantities[0]).minus(quantities[1]).abs().toString() }, id), id);
         if (state!.makerOrderId) await this.cancelMaker(record, state!);
         return;
       }
       await this.balance(record, state!, quantities);
     }).catch(error => {
-      if (this.session.liveTradingEnabled) this.failAll(error instanceof Error ? error.message : 'managed_pairing_failed');
+      if (error instanceof TradingRuntimeError && error.code === 'deployment_fence_active') return;
+      if (error instanceof TradingRuntimeError && error.notDispatched && error.code === MANAGED_ACCOUNT_RECHECKING
+        && managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING) return;
+      if (this.session.liveTradingEnabled && !this.recoverUndispatchedMarket(error, id))
+        this.failAll(error instanceof Error ? error.message : 'managed_pairing_failed');
     }).finally(() => { this.fastPairing.delete(id); });
     this.fastPairing.set(id, work);
+  }
+  private recoverUndispatchedMarket(error: unknown, strategyId = error instanceof TradingRuntimeError ? error.strategyId : undefined): boolean {
+    if (!(error instanceof TradingRuntimeError) || error.code !== 'managed_market_data_unavailable'
+      || !error.notDispatched || !strategyId || managedHardRiskReason(this.db)) return false;
+    const state = readManagedState(this.db, strategyId);
+    if (!state || state.protectionIncident || state.pauseAfterProtection || !state.exitRequested && !state.marginBatch) return false;
+    this.recheck(error.code, true);
+    if (managedHardRiskReason(this.db)) return true;
+    const current = readManagedState(this.db, strategyId)!;
+    this.save(strategyId, { ...current, reason: MANAGED_PAIRING_QUOTE_RECHECKING,
+      quoteRecovery: current.quoteRecovery ?? { scope: this.recoveryScope(), deadline: this.recoveryDeadline()! } });
+    return true;
   }
   private wake(risk = true): void {
     this.revision += 1;
@@ -378,8 +487,18 @@ export class ManagedPositionManager {
     if (this.wakeTimer) { clearTimeout(this.wakeTimer); this.wakeTimer = null; }
     this.scheduleTick(); return true;
   }
+  async settleMaintenanceTurns(): Promise<void> {
+    await Promise.all([this.inFlight, this.recoveryOrders, ...this.fastPairing.values()]);
+  }
+
   async tick(): Promise<void> {
+    if (this.session.maintenancePending) return;
+    return this.runtime.runApplicationTurn(() => this.tickAdmitted());
+  }
+
+  private async tickAdmitted(): Promise<void> {
     if (!this.stopped) this.checkCapacityDeadline();
+    if (!this.stopped) this.checkExternalReductionProtectionDeadline();
     const ordinaryTurn = this.ordinaryTurnDue && this.session.liveTradingEnabled && !managedRiskReason(this.db);
     if (!this.stopped && !ordinaryTurn && this.protection.needsTick()) {
       if (this.inFlight) return this.inFlight;
@@ -407,14 +526,17 @@ export class ManagedPositionManager {
     const remoteWriteSequence = this.remoteWriteSequence;
     this.inFlight = this.run().catch((error: unknown) => {
       if (this.stopped || context !== this.readContext() || !this.session.liveTradingEnabled || managedHardRiskReason(this.db)) return;
-      if (error instanceof TradingRuntimeError && error.code === 'managed_task_stopped') return;
+      if (error instanceof TradingRuntimeError && (error.code === 'managed_task_stopped'
+        || error.notDispatched && managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING
+        && error.code === MANAGED_ACCOUNT_RECHECKING)) return;
+      if (this.recoverUndispatchedMarket(error)) return;
       if (error instanceof ManagedReadFailure) {
         if (error.fault.fatal) this.failAll(error.fault.code);
         else this.recheck(error.fault.code, true);
         this.logReadFault(error);
       } else if (!this.deferDatabaseBusy(error, remoteWriteSequence)) this.failAll(error instanceof TradingRuntimeError && error.label
         ? `${error.code}:${error.label}` : error instanceof Error ? error.message : 'managed_monitor_failed');
-    }).finally(() => { this.inFlight = null; if (this.pendingWake && !this.stopped) this.wake(); });
+    }).finally(() => { this.recoveryObservation = null; this.inFlight = null; if (this.pendingWake && !this.stopped) this.wake(); });
     return this.inFlight;
   }
   private logReadFault(error: ManagedReadFailure): void {
@@ -448,7 +570,7 @@ export class ManagedPositionManager {
       for (const record of this.active()) {
         if (!valid()) return;
         const state = readManagedState(this.db, record.id)!;
-        if (state.stopIntent) continue;
+        if (state.stopIntent === 'KEEP' || ['STOPPING', 'STOPPED', 'TRANSFERRED'].includes(state.phase)) continue;
         if (state.phase === 'OPENING') {
           const open = this.runtime.listOpenOrders(record.id);
           if (open.some(order => order.type === 'LIMIT' && !isTerminalOrderState(order.state))) {
@@ -477,7 +599,8 @@ export class ManagedPositionManager {
         }
       }
     };
-    this.recoveryOrders = work().catch((error: unknown) => {
+    this.recoveryOrders = this.runtime.runApplicationTurn(work).catch((error: unknown) => {
+      if (error instanceof TradingRuntimeError && error.code === 'deployment_fence_active') return;
       if (valid()) this.failAll(error instanceof Error ? error.message : 'managed_recovery_unresolved_orders');
     }).finally(() => { this.recoveryOrders = null; });
   }
@@ -504,9 +627,9 @@ export class ManagedPositionManager {
     } catch (error) { throw new ManagedReadFailure(error); }
     finally { if (timer) clearTimeout(timer); this.readControllers.delete(controller); }
   }
-  private async factsForAction(): Promise<ManagedAccountFacts> {
+  private async factsForAction(protectionRead = false): Promise<ManagedAccountFacts> {
     const context = this.readContext(), risk = managedRiskReason(this.db);
-    try { return await this.facts(); }
+    try { return await this.facts(protectionRead); }
     catch (error) {
       if (context !== this.readContext() || risk !== managedRiskReason(this.db)) throw new TradingRuntimeError('managed_review_changed', 409);
       if (error instanceof ManagedReadFailure) throw new TradingRuntimeError(error.fault.code, error.fault.fatal ? 403 : 503);
@@ -514,6 +637,7 @@ export class ManagedPositionManager {
     }
   }
   private recheck(reason: string, failed = false): void {
+    this.recoveryObservation = null;
     const current = managedRiskReason(this.db);
     if (current && current !== MANAGED_ACCOUNT_RECHECKING) return;
     if (!current) this.db.prepare('INSERT INTO managed_risk_lock VALUES (1, ?, ?)')
@@ -548,6 +672,8 @@ export class ManagedPositionManager {
     if (!lock || this.now() - Date.parse(lock.created_at) >= MANAGED_RECOVERY_WINDOW_MS)
       throw new Error('managed_account_recovery_expired');
     const records = this.active(); let waiting = false, versionReady = true;
+    const scopedExternalReductions: Array<{ record: StrategyRecord; state: ManagedState;
+      quantities: [string, string]; reductions: [string, string] }> = [];
     if (records.some(record => readManagedState(this.db, record.id)?.marginReadPending)) {
       const margin = this.marginMonitor?.snapshot();
       if (!margin?.fresh || margin.entryBlocked || margin.sampledAt == null) { this.resetConfirmations(); return false; }
@@ -565,12 +691,25 @@ export class ManagedPositionManager {
     for (const record of records) {
       if (record.accountProfileId !== account) throw new Error('managed_account_changed');
       const state = readManagedState(this.db, record.id)!;
+      if (state.quoteRecovery && (state.quoteRecovery.scope !== this.recoveryScope()
+        || this.now() >= state.quoteRecovery.deadline)) throw new Error('managed_quote_recovery_scope_changed');
+      if (state.pendingOrderId) {
+        const pending = this.runtime.getOrder(state.pendingOrderId);
+        if (isTerminalOrderState(pending.state) && new Decimal(pending.executedQuantity).lte(0)) throw new Error('managed_reduction_failed');
+      }
       const claims = this.db.prepare('SELECT symbol FROM managed_position_claims WHERE account_id=? AND strategy_id=?').all(account, record.id) as Array<{ symbol: string }>;
       if (claims.length !== 2 || !managedLegs(record.config).every(leg => claims.some(c => c.symbol === leg.symbol))) throw new Error('managed_group_released');
-      const verdict = recoveryHoldings(this.db, record, state, pairedQuantities(facts.positions, managedLegs(record.config)));
-      if (verdict.kind === 'fault') throw new Error(verdict.reason);
+      const quantities = pairedQuantities(facts.positions, managedLegs(record.config));
+      const verdict = recoveryHoldings(this.db, record, state, quantities);
+      if (verdict.kind === 'fault') {
+        const reductions = managedReductionTotals(this.db, record.id);
+        if (verdict.reason !== 'managed_external_reduction'
+          || !this.canIsolateExternalReduction(record, state, quantities, reductions)) throw new Error(verdict.reason);
+        scopedExternalReductions.push({ record, state, quantities, reductions });
+      }
       waiting ||= verdict.kind === 'wait';
     }
+    if (scopedExternalReductions.length > 1) throw new Error('managed_external_reduction');
     const remoteOrders = facts.openOrders.filter((order) => symbols.has(order.symbol));
     const localOrders = this.runtime.listOpenOrders().filter((order) => symbols.has(order.symbol));
     const matches = (remote: GateCrossExOrder, local: ReturnType<TradingRuntime['listOpenOrders']>[number]) =>
@@ -595,6 +734,7 @@ export class ManagedPositionManager {
       const verdict = recoveryOrder(remote, local);
       if (verdict.kind === 'fault') throw new Error(verdict.reason);
       waiting ||= verdict.kind === 'wait';
+      waiting ||= !isTerminalOrderState(local.state);
     }
     if (waiting) { this.resetConfirmations(); return false; }
     const signature = JSON.stringify({
@@ -609,24 +749,76 @@ export class ManagedPositionManager {
     this.recoveryConfirmations = signature === this.recoverySignature ? this.recoveryConfirmations + 1 : 1;
     this.recoverySignature = signature;
     if (this.recoveryConfirmations < 2) return false;
+    const scoped = scopedExternalReductions[0];
+    if (scoped) {
+      if (this.recoveryPairingPending(records.filter(record => record.id !== scoped.record.id)))
+        throw new Error('managed_external_reduction');
+      this.completeRecovery(records, account, scoped);
+      return false;
+    }
+    return true;
+  }
+  private completeRecovery(records: StrategyRecord[], account: string | null, scoped?: {
+    record: StrategyRecord; state: ManagedState; quantities: [string, string]; reductions: [string, string];
+  }): void {
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM managed_risk_lock WHERE reason = ?').run(MANAGED_ACCOUNT_RECHECKING);
       for (const record of records) {
         const state = readManagedState(this.db, record.id)!;
-        writeManagedState(this.db, record.id, { ...state, marginReadPending: false, marginVersionFloor:undefined, reason: state.reason === MANAGED_ACCOUNT_RECHECKING ? null : state.reason });
+        if (scoped?.record.id === record.id) {
+          const incident = { reason: 'managed_external_reduction', before: [scoped.state.leftQuantity!, scoped.state.rightQuantity!] as [string, string], at: this.now() };
+          this.db.prepare("UPDATE execution_strategies SET status='PAUSED' WHERE id=? AND status='RUNNING'").run(record.id);
+          writeManagedState(this.db, record.id, { ...state, phase: 'RISK_PAUSED', entryIntent: 'MONITORING',
+            marginReadPending: false, marginVersionFloor: undefined, reason: incident.reason, protectionIncident: incident,
+            pauseAfterProtection: true, positionSettlementSince: undefined, verified: true,
+            leftQuantity: scoped.quantities[0], rightQuantity: scoped.quantities[1], maxLeft: scoped.quantities[0], maxRight: scoped.quantities[1],
+            observedReductions: scoped.reductions, checkedAt: new Date(this.now()).toISOString(), after: this.now() });
+          this.db.prepare('INSERT INTO audit_events (id,created_at,type,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+            .run(randomUUID(), new Date(this.now()).toISOString(), 'managed_external_reduction_isolated', record.id,
+              JSON.stringify({ strategyId: record.id, before: incident.before, after: scoped.quantities,
+                observedReductions: scoped.reductions }));
+        } else {
+          const recoveredReason = [MANAGED_ACCOUNT_RECHECKING, MANAGED_PAIRING_QUOTE_RECHECKING].includes(state.reason ?? '');
+          writeManagedState(this.db, record.id, { ...state, marginReadPending: false, marginVersionFloor:undefined, quoteRecovery: undefined,
+            reason: recoveredReason ? null : state.reason });
+        }
       }
     })();
     this.readFailures = 0; this.resetConfirmations(); this.clearRecoveryTimer(); this.recoveryKey = null; this.nextReadAt = 0;
     for (const record of records) this.log(record.id, 'Account monitoring recovered', 'Two matching fresh position and order snapshots');
+    if (scoped) {
+      this.log(scoped.record.id, 'External reduction isolated', 'Task paused; continuous protection retained exact reduce-only responsibility');
+      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(scoped.record.id));
+      this.revision += 1; this.pendingWake = true; this.scheduleTick();
+    }
     this.entryRecovery?.recovered?.(account);
-    return true;
+  }
+  private recoveryPairingPending(records: StrategyRecord[]): boolean {
+    return records.some(record => {
+      const state = readManagedState(this.db, record.id);
+      if (!state) return false;
+      if (state.marginBatch) return true;
+      const projected = projectedExitHoldings(this.db, record.id, state);
+      return Boolean(projected && !new Decimal(projected[0]).eq(projected[1]));
+    });
+  }
+  private canIsolateExternalReduction(record: StrategyRecord, state: ManagedState, quantities: [string, string],
+    reductions: [string, string]): boolean {
+    if (!this.protection.owns(record.id) || !state.verified || !['MONITORING', 'BALANCING'].includes(state.phase)
+      || state.stopIntent || state.exitRequested || state.marginBatch || state.protectionIncident || state.pauseAfterProtection
+      || state.leftQuantity === null || state.rightQuantity === null || this.runtime.listOpenOrders(record.id).length) return false;
+    const before = [state.leftQuantity, state.rightQuantity];
+    if (quantities.some((q, i) => new Decimal(q).lt(0) || new Decimal(q).gt(before[i]))) return false;
+    return observedHoldings(state, reductions, quantities) === 'external';
   }
   private active(): StrategyRecord[] {
     return this.runtime.listStrategies().filter((s) => s.config.management && s.status === 'RUNNING');
   }
   private async run(): Promise<void> {
-    const records = this.active().filter((s) => !['STOPPING', 'STOPPED', 'TRANSFERRED'].includes(readManagedState(this.db, s.id)!.phase));
-    if (!records.length) return;
+    const activeRecords = this.active().filter(strategy => !['STOPPED', 'TRANSFERRED'].includes(readManagedState(this.db, strategy.id)!.phase));
+    if (!activeRecords.length) return;
+    const stoppingRecords = activeRecords.filter(strategy => readManagedState(this.db, strategy.id)!.phase === 'STOPPING');
+    const records = activeRecords.filter(strategy => readManagedState(this.db, strategy.id)!.phase !== 'STOPPING');
     this.checkRecheckDeadline();
     void this.sources.refreshFunding().catch(() => { /* missing funding disables and resets the economic trigger */ });
     const revision = this.revision, started = this.now(), account = this.sources.activeAccount(), context = this.readContext(), recoveryKey = this.recoveryKey;
@@ -639,12 +831,21 @@ export class ManagedPositionManager {
       if (managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING) this.recheck('managed_account_snapshot_invalidated');
       return;
     }
-    if (managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING) {
+    const recovering = managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING;
+    let recoveryPairing = false;
+    if (recovering) {
       this.nextReadAt = 0;
       if (!this.confirmRecovery(facts, account)) return;
+      if (records.some(r => readManagedState(this.db, r.id)?.quoteRecovery
+        && managedLegs(r.config).some(l => !freshManagedQuote(this.markets.market(l.symbol), this.now())))) return;
+      recoveryPairing = this.recoveryPairingPending(records);
+      if (recoveryPairing) this.recoveryObservation = { revision, context, at: started,
+        deadline: this.recoveryDeadline()!, scope: this.recoveryScope(), facts };
+      if (!recoveryPairing) this.completeRecovery(activeRecords, account);
     }
     this.invalidatedSince = null;
     this.marginFacts?.(facts);
+    for (const record of stoppingRecords) this.finishStopWithFacts(record.id, facts);
     const priorities = new Map(records.map(r => [r.id, managedActionPriority(this.db, r.id, readManagedState(this.db, r.id)!, pairedQuantities(facts.positions, managedLegs(r.config)))]));
     const ordered = [...records].sort((a, b) => priorities.get(a.id)! - priorities.get(b.id)!);
     for (const record of ordered) {
@@ -656,9 +857,13 @@ export class ManagedPositionManager {
       for (const leg of managedLegs(record.config)) {
         if (!this.markets.market(leg.symbol)) this.markets.ensureMarket?.(leg.symbol);
       }
-      await this.evaluate(record, facts, started);
-      if (managedRiskReason(this.db) || revision !== this.revision) return;
+      try { await this.evaluate(record, facts, started); }
+      catch (error) { if (this.recoverUndispatchedMarket(error, record.id)) return; throw error; }
+      const risk = managedRiskReason(this.db);
+      if ((risk && !(recoveryPairing && risk === MANAGED_ACCOUNT_RECHECKING)) || revision !== this.revision) return;
     }
+    if (recoveryPairing && managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING
+      && !this.recoveryPairingPending(records)) this.completeRecovery(records, account);
   }
 
   async reserve(id: string, config: CreateStrategyInput, accountId: string, prepareQuotes?: () => Promise<void>): Promise<void> {
@@ -667,7 +872,11 @@ export class ManagedPositionManager {
     const riskBlock = managedRiskBlock(this.db);
     if (riskBlock) throw new TradingRuntimeError(riskBlock, 409);
     const legs = managedLegs(config);
-    this.adoption.reserve(id, config, accountId);
+    try { this.adoption.reserve(id, config, accountId); }
+    catch (error) {
+      if (!isDatabaseBusy(error)) throw error;
+      await this.retryLaunchStorage(() => this.adoption.reserve(id, config, accountId));
+    }
     this.revision += 1;
     let cancelledOldOrders = false;
     try {
@@ -702,11 +911,25 @@ export class ManagedPositionManager {
       this.checkLaunchAccount(accountId);
       this.adoption.capture(id, config, facts);
     } catch (error) {
-      this.abortReservation(id);
+      try { this.abortReservation(id); }
+      catch (cleanupError) {
+        if (!isDatabaseBusy(cleanupError)) throw cleanupError;
+        await this.retryLaunchStorage(() => this.abortReservation(id), 'managed_launch_cleanup_busy');
+      }
       if (cancelledOldOrders) this.failAll('managed_adoption_reconcile_failed');
       if (error instanceof Error && !(error instanceof TradingRuntimeError) && /^(managed_|margin_|protection_)/.test(error.message)) throw new TradingRuntimeError(error.message, 409);
       throw error;
     }
+  }
+  private async retryLaunchStorage<T>(work: () => T, failure = 'managed_launch_storage_busy'): Promise<T> {
+    for (const delay of LAUNCH_STORAGE_RETRY_DELAYS_MS) {
+      await new Promise(resolve => setTimeout(resolve, delay));
+      try { return work(); }
+      catch (error) {
+        if (!isDatabaseBusy(error)) throw error;
+      }
+    }
+    throw new TradingRuntimeError(failure, 503);
   }
   private checkLaunchAccount(account: string): void {
     if (!this.session.liveTradingEnabled || managedRiskReason(this.db)) throw new TradingRuntimeError('live_trading_locked', 403);
@@ -766,7 +989,7 @@ export class ManagedPositionManager {
     this.log(id, 'Exit requested', 'Stop and exit; new entries permanently disabled');
     this.wake();
   }
-  beginStop(id: string, closePositions: boolean): void {
+  beginStop(id: string, closePositions: boolean, marketFallback = false): void {
     this.marginMonitor?.invalidateNormalRecovery();
     const state = readManagedState(this.db, id)!;
     if (this.runtime.getStrategy(id).accountProfileId !== this.sources.activeAccount()) throw new TradingRuntimeError('managed_account_changed', 409);
@@ -777,37 +1000,65 @@ export class ManagedPositionManager {
     this.revision += 1;
     writeManagedState(this.db, id, { ...state, phase: 'STOPPING', stopIntent: intent,
       stopFromOpening: state.phase === 'OPENING' || state.stopFromOpening === true,
-      exitRequested: closePositions, maxLeft: caps[0], maxRight: caps[1], conditionSince: null });
+      exitRequested: closePositions, fallback: closePositions ? marketFallback || state.fallback : state.fallback,
+      maxLeft: caps[0], maxRight: caps[1], conditionSince: null });
     this.log(id, 'Stop requested', closePositions ? 'Exit all adopted and new holdings after order reconciliation' : 'Keep all holdings; stop automation after order reconciliation');
   }
-  async finishStop(id: string): Promise<void> {
+  private stopIdentity(id: string): string {
+    const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id);
+    const claims = this.db.prepare('SELECT account_id,symbol FROM managed_position_claims WHERE strategy_id=? ORDER BY symbol').all(id);
+    return JSON.stringify([record.status, record.accountProfileId, record.config, state?.phase, state?.stopIntent,
+      state?.exitRequested, state?.stopFromOpening, claims]);
+  }
+  private finishStopWithFacts(id: string, facts: ManagedAccountFacts): boolean {
     const state = readManagedState(this.db, id)!, record = this.runtime.getStrategy(id);
-    if (state.phase !== 'STOPPING') throw new TradingRuntimeError('managed_stop_not_requested', 409);
-    try {
-      const facts = await this.factsForAction();
-      if (this.sources.activeAccount() !== record.accountProfileId) throw new Error('managed_account_changed');
-      const legs = managedLegs(record.config), quantities = pairedQuantities(facts.positions, legs);
-      if (this.runtime.listOpenOrders(id).length || facts.openOrders.some((o) => legs.some((l) => l.symbol === o.symbol))) throw new Error('managed_stop_unresolved_orders');
-      if (state.positionSettlementSince && observedHoldings(state, managedReductionTotals(this.db, id), quantities) === 'pending') throw new Error('managed_positions_settlement_pending');
-      const caps = state.stopFromOpening ? entryHoldings(this.db, id) : [state.maxLeft, state.maxRight];
-      if (quantities.some((q, i) => new Decimal(q).gt(caps[i]))) throw new Error('managed_position_increased');
-      const keep = state.stopIntent === 'KEEP';
-      const flat = quantities.every((q) => new Decimal(q).isZero());
-      if (!keep && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) throw new Error('managed_review_required');
-      this.db.transaction(() => {
+    if (state.phase !== 'STOPPING') return false;
+    if (this.sources.activeAccount() !== record.accountProfileId) throw new Error('managed_account_changed');
+    const legs = managedLegs(record.config), quantities = pairedQuantities(facts.positions, legs);
+    if (this.runtime.listOpenOrders(id).length || facts.openOrders.some(order => legs.some(leg => leg.symbol === order.symbol)))
+      throw new Error('managed_stop_unresolved_orders');
+    const caps = state.stopFromOpening ? entryHoldings(this.db, id) : [state.maxLeft, state.maxRight];
+    if (quantities.some((quantity, index) => new Decimal(quantity).gt(caps[index]))) throw new Error('managed_position_increased');
+    if (state.stopFromOpening && quantities.some((quantity, index) => new Decimal(quantity).lt(caps[index]))) {
+      const since = state.positionSettlementSince ?? this.now();
+      if (this.now() - since >= MANAGED_RECOVERY_WINDOW_MS) throw new Error('managed_positions_settlement_expired');
+      this.save(id, { ...state, leftQuantity: quantities[0], rightQuantity: quantities[1], maxLeft: caps[0], maxRight: caps[1],
+        positionSettlementSince: since, checkedAt: new Date(this.now()).toISOString(), reason: 'managed_positions_settlement_pending' });
+      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id)); this.scheduleTick(); return false;
+    }
+    const keep = state.stopIntent === 'KEEP', flat = quantities.every(quantity => new Decimal(quantity).isZero());
+    if (!keep && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) return false;
+    this.db.transaction(() => {
       writeManagedState(this.db, id, { ...state, phase: flat ? 'COMPLETED' : keep ? 'STOPPED' : 'EXITING', verified: true,
         leftQuantity: quantities[0], rightQuantity: quantities[1], maxLeft: quantities[0], maxRight: quantities[1],
         checkedAt: new Date(this.now()).toISOString(), reason: keep ? 'manual_stop_keep' : 'manual_exit', stopFromOpening: false,
-        signalReason: null, signalMissingSince: null,
-        positionSettlementSince: undefined,
+        signalReason: null, signalMissingSince: null, positionSettlementSince: undefined,
         makerOrderId: null, pendingOrderId: null, pendingOrderIds: [], after: this.now() });
-      this.db.prepare('UPDATE execution_strategies SET status = ?, open_position = ?, stopped_at = ? WHERE id = ?')
-        .run(flat ? 'COMPLETED' : keep ? 'STOPPED' : 'RUNNING', Decimal.min(...quantities).toString(), keep || flat ? new Date().toISOString() : null, id);
-      if (flat) this.db.prepare('DELETE FROM managed_position_claims WHERE strategy_id = ?').run(id);
-      })();
-      if (keep && !new Decimal(quantities[0]).eq(quantities[1])) this.failAll('managed_stopped_unbalanced');
-      this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
+      this.db.prepare('UPDATE execution_strategies SET status=?,open_position=?,stopped_at=? WHERE id=?')
+        .run(flat ? 'COMPLETED' : keep ? 'STOPPED' : 'RUNNING', Decimal.min(...quantities).toString(),
+          keep || flat ? new Date().toISOString() : null, id);
+      if (flat) this.db.prepare('DELETE FROM managed_position_claims WHERE strategy_id=?').run(id);
+    })();
+    if (keep && !new Decimal(quantities[0]).eq(quantities[1])) this.failAll('managed_stopped_unbalanced');
+    this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id)); return true;
+  }
+  async finishStop(id: string): Promise<void> {
+    const state = readManagedState(this.db, id)!;
+    if (state.phase !== 'STOPPING') throw new TradingRuntimeError('managed_stop_not_requested', 409);
+    const revision = this.revision, context = this.readContext(), risk = this.riskLock(), identity = this.stopIdentity(id);
+    if (risk?.reason === MANAGED_ACCOUNT_RECHECKING) { this.scheduleTick(); return; }
+    try {
+      const facts = await this.facts();
+      const currentRisk = this.riskLock();
+      if (revision !== this.revision || context !== this.readContext() || identity !== this.stopIdentity(id)
+        || risk?.reason !== currentRisk?.reason || risk?.createdAt !== currentRisk?.createdAt) {
+        this.scheduleTick(); return;
+      }
+      this.finishStopWithFacts(id, facts);
     } catch (error) {
+      if (error instanceof ManagedReadFailure && !error.fault.fatal) {
+        this.recheck(error.fault.code, true); this.logReadFault(error); this.scheduleTick(); return;
+      }
       this.failAll(error instanceof Error ? error.message : 'managed_stop_reconcile_failed');
       throw new TradingRuntimeError('managed_stop_reconcile_failed', 409);
     }
@@ -837,13 +1088,57 @@ export class ManagedPositionManager {
     const caps = entryHoldings(this.db, record.id);
     this.save(record.id, { ...readManagedState(this.db, record.id)!, maxLeft: caps[0], maxRight: caps[1], after: this.now() });
   }
-  async resume(id: string, accountId: string, expectedAction?: ManagedResumeAction): Promise<StrategyRecord> {
+  private replacementControl(id: string, request: Replacement): string {
+    const grant = this.protection.authority.grant(), margin = this.marginMonitor?.snapshot();
+    if (this.stopped || this.pendingHardPause || this.session.maintenancePending || this.session.current !== 'protect_only'
+      || this.sources.activeAccount() !== request.profileId || this.riskLock()?.reason !== 'paired_entry_authority_changed'
+      || !grant || !this.protection.owns(id) || this.protection.isEvaluating(id) || this.fastPairing.has(id)
+      || !margin?.fresh || margin.accountId !== grant.accountId || margin.incidentId || margin.costAccounting?.pendingBatches
+      || !margin.policy.protectedGroupIds.includes(request.groupId) || this.runtime.listOpenOrders().length)
+      throw new TradingRuntimeError('managed_replacement_control_unverified', 409);
+    return JSON.stringify([this.readContext(), this.revision, this.riskLock(), grant, this.protection.authority.epoch(), margin.policy.revision]);
+  }
+  async replaceFlatOwner(id: string, request: Replacement, readPortfolio: () => Promise<GateCrossExPortfolio>): Promise<StrategyRecord> {
+    const control = this.replacementControl(id, request);
+    const donor = this.runtime.getStrategy(id), { review } = replacementSource(this.db, donor, request);
+    const facts = await readPortfolio();
+    const account = facts.account;
+    if (!account.user_id || account.account_mode !== 'CROSS_EXCHANGE' || account.position_mode !== 'SINGLE' || facts.marginPositions.length || facts.openOrders.length
+      || marginAccountKey(request.profileId, account.user_id, account.account_mode) !== this.protection.authority.grant()?.accountId)
+      throw new TradingRuntimeError('managed_replacement_portfolio_unverified', 409);
+    const fills = proveReplacementTrades(facts.recentTrades, request.legs, request.closingOrderIds, review, request.quantity, this.now());
+    const final = await this.factsForAction(true);
+    const observedAt = this.now();
+    if (final.openOrders.length || replacementPositionEvidence(final.positions,request,review.protectedAt,observedAt)
+      !== replacementPositionEvidence(facts.positions,request,review.protectedAt,observedAt))
+      throw new TradingRuntimeError('managed_replacement_holdings_changed', 409);
+    for (const leg of request.legs) this.requireSize(leg, Decimal.min(request.quantity, donor.config.management!.perOrderQuantity));
+    const next = this.db.transaction(() => {
+      if (control !== this.replacementControl(id, request)) throw new TradingRuntimeError('managed_review_changed', 409);
+      const current = this.runtime.getStrategy(id), latest = replacementSource(this.db,current,request);
+      if (JSON.stringify(current.config) !== JSON.stringify(donor.config) || JSON.stringify(latest.review) !== JSON.stringify(review))
+        throw new TradingRuntimeError('managed_review_changed', 409);
+      return commitReplacement(this.db, current, request, facts, fills, this.now());
+    })();
+    this.controlEpoch += 1; this.revision += 1;
+    const record = this.runtime.getStrategy(next);
+    this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id)); this.runtime.emitStrategyUpdate(record);
+    return record;
+  }
+  async resume(id: string, accountId: string, expectedAction?: ManagedResumeAction, requestNewExit = false,
+    marketFallback = false): Promise<StrategyRecord> {
     if (readManagedState(this.db, id)?.reason === ROUTER_REVIEW) {
       if (expectedAction && expectedAction !== 'OPENING') throw new TradingRuntimeError('managed_resume_action_changed', 409);
       await this.reviewRouterTask(id, true, accountId); return this.runtime.getStrategy(id);
     }
-    const riskAtStart = managedRiskReason(this.db);
+    const riskAtStart = this.riskLock();
+    if (riskAtStart?.reason === MANAGED_ACCOUNT_RECHECKING) throw new TradingRuntimeError(MANAGED_ACCOUNT_RECHECKING, 409);
     const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id)!;
+    const reviewedExit = requestNewExit && expectedAction === 'EXITING' && record.status === 'PAUSED'
+      && state.phase === 'RISK_PAUSED' && state.stopIntent !== 'EXIT' && !state.exitRequested;
+    if (requestNewExit && !reviewedExit) throw new TradingRuntimeError('managed_review_changed', 409);
+    const protectedExit = expectedAction === 'EXITING' && state.stopIntent === 'EXIT' && state.exitRequested
+      && this.session.current === 'protect_only' && this.protection.owns(id);
     const continuing = expectedAction === 'OPENING' && canContinueEntry(this.db, record, state);
     const localReview = state.reason === PREPARATION_REVIEW;
     if ((continuing || localReview) && riskAtStart) throw new TradingRuntimeError('managed_global_risk_paused', 409);
@@ -855,18 +1150,21 @@ export class ManagedPositionManager {
     if (record.accountProfileId !== accountId) throw new TradingRuntimeError('strategy_account_not_active', 409);
     if (this.runtime.listOpenOrders().length) throw new TradingRuntimeError('strategy_resume_unresolved_orders', 409);
     const revision = this.revision;
-    const facts = await this.factsForAction(), legs = managedLegs(record.config);
+    const facts = await this.factsForAction(protectedExit), legs = managedLegs(record.config);
     if (this.runtime.getStrategy(id).status !== record.status || this.adoption.reservedOwner(id)) throw new TradingRuntimeError('strategy_not_paused', 409);
     const latestState = readManagedState(this.db, id)!;
     const latestClaims = this.db.prepare('SELECT symbol FROM managed_position_claims WHERE strategy_id = ? AND account_id = ?').all(id, accountId) as Array<{ symbol: string }>;
     if (latestState.phase === 'TRANSFERRED' || latestClaims.length !== 2 || !legs.every((leg) => latestClaims.some((claim) => claim.symbol === leg.symbol)))
       throw new TradingRuntimeError('managed_group_released', 409);
-    if (this.revision !== revision || managedRiskReason(this.db) !== riskAtStart || latestState.reason !== state.reason
+    const latestRisk = this.riskLock();
+    if (this.revision !== revision || latestRisk?.reason !== riskAtStart?.reason || latestRisk?.createdAt !== riskAtStart?.createdAt
+      || latestState.reason !== state.reason
       || latestState.exitRequested !== state.exitRequested || latestState.stopIntent !== state.stopIntent
       || latestState.verified !== state.verified || latestState.phase !== state.phase)
       throw new TradingRuntimeError('managed_review_changed', 409);
     if (latestState.stopIntent !== state.stopIntent || latestState.phase === 'STOPPING' && state.phase !== 'STOPPING') throw new TradingRuntimeError('managed_stop_in_progress', 409);
-    if (!this.session.liveTradingEnabled || accountId !== this.sources.activeAccount()) throw new TradingRuntimeError('live_trading_locked', 403);
+    if ((!this.session.liveTradingEnabled && !protectedExit) || accountId !== this.sources.activeAccount())
+      throw new TradingRuntimeError('live_trading_locked', 403);
     for (const managed of this.runtime.listStrategies().filter((s) => s.config.management
       && Boolean(this.db.prepare('SELECT 1 FROM managed_position_claims WHERE strategy_id = ?').get(s.id)))) {
       const owned = readManagedState(this.db, managed.id)!, ownedLegs = managedLegs(managed.config);
@@ -883,24 +1181,37 @@ export class ManagedPositionManager {
       throw new TradingRuntimeError('managed_positions_settlement_pending', 409);
     const latestRecord = this.runtime.getStrategy(id);
     if (JSON.stringify(latestRecord.config) !== JSON.stringify(record.config)) throw new TradingRuntimeError('managed_review_changed', 409);
-    const action = continuing ? 'OPENING' : managedResumeAction(latestRecord, current), opening = action === 'OPENING';
+    const action = reviewedExit ? 'EXITING' : continuing ? 'OPENING' : managedResumeAction(latestRecord, current), opening = action === 'OPENING';
     if (opening) verifyResumableEntry(this.db, latestRecord, current, quantities, legs);
     if (expectedAction && expectedAction !== action) throw new TradingRuntimeError('managed_resume_action_changed', 409);
     const resumed: ManagedState = { ...current, phase: action, entryIntent: opening ? 'OPENING' : 'MONITORING', preparationRecovery: undefined,
-      marginReadPending: false, marginVersionFloor: undefined,
-      stopIntent: null, stopFromOpening: false, pauseAfterProtection: false,
-      protectionIncident: null, observedReductions: managedReductionTotals(this.db, id), leftQuantity: quantities[0], rightQuantity: quantities[1],
+      marginReadPending: false, marginVersionFloor: undefined, quoteRecovery: undefined,
+      stopIntent: action === 'EXITING' ? 'EXIT' : null, stopFromOpening: false, pauseAfterProtection: false,
+      fallback: action === 'EXITING' ? marketFallback || current.fallback : current.fallback,
+      protectionIncident: null, protectionReview: undefined,
+      observedReductions: managedReductionTotals(this.db, id), leftQuantity: quantities[0], rightQuantity: quantities[1],
       positionSettlementSince: undefined,
       exitRequested: action === 'EXITING', verified: !opening, maxLeft: quantities[0], maxRight: quantities[1],
       pendingOrderId: null, makerOrderId: null, pendingOrderIds: [], cancelRequestedAt: null, conditionSince: null, reason: null };
+    let reviewedHardLock = false;
     this.db.transaction(() => {
-      if (!continuing && !localReview) this.db.prepare('DELETE FROM managed_risk_lock').run();
-      this.db.prepare("UPDATE execution_strategies SET status = 'RUNNING', stopped_at = NULL WHERE id = ? AND status = ?").run(id, record.status);
+      if (!protectedExit && !continuing && !localReview && riskAtStart) {
+        const removed = this.db.prepare('DELETE FROM managed_risk_lock WHERE singleton=1 AND reason=? AND created_at=?')
+          .run(riskAtStart.reason, riskAtStart.createdAt).changes;
+        if (removed !== 1) throw new TradingRuntimeError('managed_review_changed', 409);
+        reviewedHardLock = true;
+      }
+      if (!protectedExit) this.db.prepare("UPDATE execution_strategies SET status = 'RUNNING', stopped_at = NULL WHERE id = ? AND status = ?")
+        .run(id, record.status);
       writeManagedState(this.db, id, resumed);
     })();
+    if (reviewedHardLock) this.retireReviewedRiskLock();
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
     this.openingMismatch.delete(id);
-    this.log(id, 'Risk reviewed', 'Explicit resume after fresh account and order reconciliation');
+    this.log(id, reviewedExit ? 'Exit requested' : 'Risk reviewed', reviewedExit
+      ? 'Paused task reviewed; exit all holdings without reopening entry'
+      : 'Explicit resume after fresh account and order reconciliation');
+    this.wake();
     return this.runtime.getStrategy(id);
   }
 
@@ -1032,11 +1343,21 @@ export class ManagedPositionManager {
     return this.runtime.listStrategies().filter(r => (readManagedState(this.db, r.id) as CapacityState)?.capacityProtection
       && !['COMPLETED', 'TRANSFERRED', 'STOPPED'].includes(r.management?.phase ?? ''));
   }
+  private checkExternalReductionProtectionDeadline(): void {
+    for (const record of this.runtime.listStrategies()) {
+      const state = readManagedState(this.db, record.id);
+      if (record.status !== 'PAUSED' || !state?.protectionIncident || !state.pauseAfterProtection) continue;
+      if (!this.protection.owns(record.id)) { this.failAll('managed_external_reduction_protection_scope_changed'); return; }
+      if (this.now() - state.protectionIncident.at >= MANAGED_RECOVERY_WINDOW_MS) {
+        this.failAll('managed_external_reduction_protection_expired'); return;
+      }
+    }
+  }
   private capacityIdentity(record: StrategyRecord): string {
     return JSON.stringify([record.accountProfileId, record.config, this.protection.authority.grant(),
       this.db.prepare('SELECT symbol,account_id FROM managed_position_claims WHERE strategy_id=? ORDER BY symbol').all(record.id)]);
   }
-  /** Only the engine's confirmed, zero-fill Hyperliquid rejection may enter this path. */
+  /** Engine has proved a terminal capacity rejection or exhausted IOC hedges. */
   pauseTaskForProtection(id: string, reason: string): void {
     const record = this.runtime.getStrategy(id), state = readManagedState(this.db, id)!;
     const before = entryHoldings(this.db, id);
@@ -1054,7 +1375,7 @@ export class ManagedPositionManager {
         observedReductions: managedReductionTotals(this.db, id), after: this.now() } as CapacityState);
     })();
     this.revision += 1; this.pendingWake = true;
-    this.log(id, 'Hyperliquid capacity protection', reason);
+    this.log(id, reason === 'managed_entry_hedge_exhausted' ? 'Entry hedge attempts exhausted' : 'Hyperliquid capacity protection', reason);
     const timer = setTimeout(() => { this.capacityTimers.delete(id); this.checkCapacityDeadline(); }, MANAGED_RECOVERY_WINDOW_MS);
     timer.unref?.(); this.capacityTimers.set(id, timer); this.scheduleTick();
   }
@@ -1126,7 +1447,7 @@ export class ManagedPositionManager {
     if (this.protection.isEvaluating(id) && current && this.runtime.getStrategy(id).status === 'PAUSED') {
       state = { ...state, phase: current.phase, conditionSince: current.conditionSince };
     }
-    writeManagedState(this.db, id, { ...state, exitRequested,
+    writeManagedState(this.db, id, { ...state, exitRequested, quoteRecovery: current?.quoteRecovery ?? state.quoteRecovery,
       phase: exitRequested && state.phase === 'MONITORING' && managedRiskReason(this.db) !== MANAGED_ACCOUNT_RECHECKING ? 'EXITING' : state.phase,
       pendingOrderIds: this.runtime.listOpenOrders(id).map((o) => o.id) });
     if (state.leftQuantity !== null && state.rightQuantity !== null) {
@@ -1136,6 +1457,29 @@ export class ManagedPositionManager {
     this.runtime.emitStrategyUpdate(this.runtime.getStrategy(id));
   }
   private log(id: string, event: string, reason: string): void { this.runtime.addStrategyLog(id, 'info', event, reason, '—', 'Managed paired position'); }
+
+  private settleEntryHandoff(record: StrategyRecord, state: ManagedState, quantities: [string, string], facts: ManagedAccountFacts): ManagedState | null | false {
+    if (state.phase !== 'VERIFYING' || state.entryIntent !== 'MONITORING' || state.stopIntent || state.exitRequested) return false;
+    const expected = entryHoldings(this.db, record.id), before = [state.leftQuantity ?? '0', state.rightQuantity ?? '0'];
+    if (!new Decimal(quantities[0]).eq(quantities[1])) return false;
+    if (quantities.some((quantity, index) => new Decimal(quantity).lt(before[index]) || new Decimal(quantity).gt(expected[index]))) {
+      throw new Error('managed_entry_exposure_changed');
+    }
+    const legs = managedLegs(record.config), pending = this.runtime.listOpenOrders(record.id).length > 0
+      || facts.openOrders.some(order => legs.some(leg => leg.symbol === order.symbol));
+    if (pending || quantities.some((quantity, index) => !new Decimal(quantity).eq(expected[index]))) {
+      const since = state.positionSettlementSince ?? this.now();
+      if (this.now() - since >= MANAGED_RECOVERY_WINDOW_MS) throw new Error('managed_entry_settlement_expired');
+      this.save(record.id, { ...state, leftQuantity: quantities[0], rightQuantity: quantities[1],
+        positionSettlementSince: since, reason: 'managed_positions_settlement_pending' });
+      return null;
+    }
+    this.save(record.id, { ...state, phase: 'MONITORING', verified: true, leftQuantity: quantities[0], rightQuantity: quantities[1],
+      maxLeft: expected[0], maxRight: expected[1], observedReductions: managedReductionTotals(this.db, record.id),
+      positionSettlementSince: undefined, reason: null, checkedAt: new Date(this.now()).toISOString() });
+    this.log(record.id, 'Entry holdings verified', 'Known entry fills and fresh account positions match');
+    return readManagedState(this.db, record.id)!;
+  }
 
   private async evaluate(record: StrategyRecord, facts: ManagedAccountFacts, started: number): Promise<void> {
     if (!this.protection.isEvaluating(record.id) && this.runtime.getStrategy(record.id).status !== 'RUNNING') return;
@@ -1158,9 +1502,18 @@ export class ManagedPositionManager {
     state = readManagedState(this.db, record.id)!;
     if (['STOPPING', 'STOPPED', 'TRANSFERRED', 'COMPLETED'].includes(state.phase)) return;
     const quantities = pairedQuantities(facts.positions, legs);
+    const settledEntry = this.settleEntryHandoff(record, state, quantities, facts);
+    if (settledEntry === null) return;
+    if (settledEntry) state = settledEntry;
     if (new Decimal(quantities[0]).gt(state.maxLeft) || new Decimal(quantities[1]).gt(state.maxRight)) throw new Error('managed_position_increased');
     const reductions = managedReductionTotals(this.db, record.id);
     if (state.marginBatch) {
+      const batchEvidence = marginBatchFills(this.db, record.id, state.marginBatch);
+      if (!batchEvidence.rows.length && state.quoteRecovery) {
+        if (quantities.some(q => !new Decimal(q).eq(state.marginBatch!.before))) throw new Error('managed_margin_holdings_conflict');
+        await this.submit(record, state.marginBatch.firstLeg!, new Decimal(state.marginBatch.quantity), false, 'paired-first-leg', 'adjustment');
+        return;
+      }
       try { assertMarginHoldings(this.db, record.id, state.marginBatch, quantities); }
       catch (error) {
         if (!(error instanceof Error) || error.message !== 'margin_positions_settlement_pending') throw error;
@@ -1179,6 +1532,10 @@ export class ManagedPositionManager {
         await this.cancelMaker(record, readManagedState(this.db, record.id)!);
       this.revision += 1; return;
     } else if (observedHoldings(state, reductions, quantities) === 'external') {
+      if (!this.protection.isEvaluating(record.id)
+        && this.canIsolateExternalReduction(record, state, quantities, reductions)) {
+        this.recheck('managed_external_reduction_confirmation'); return;
+      }
       state = { ...state, protectionIncident: state.protectionIncident ?? { reason: 'managed_external_reduction',
         before: [state.leftQuantity!, state.rightQuantity!], at: this.now() }, pauseAfterProtection: true };
     }
@@ -1187,12 +1544,17 @@ export class ManagedPositionManager {
       observedReductions: reductions,
       maxLeft: quantities[0], maxRight: quantities[1], checkedAt: new Date(this.now()).toISOString() };
     this.save(record.id, state);
+    if (state.protectionIncident && this.protection.isEvaluating(record.id)
+      && new Decimal(quantities[0]).eq(quantities[1])) {
+      this.finishExternalReductionProtection(record, state, quantities, reductions); return;
+    }
     const open = this.runtime.listOpenOrders(record.id);
     if (quantities.every((q) => new Decimal(q).isZero())) {
       if (open.length) { await this.cancelMaker(record, state); return; }
       if (facts.openOrders.some((o) => legs.some((l) => l.symbol === o.symbol))) return;
       if (state.marginBatch) this.completeMarginBatch(record, state, quantities);
       if (state.protectionIncident) { if (!this.protection.isEvaluating(record.id)) this.failAll(state.protectionIncident.reason); return; }
+      if (state.pauseAfterProtection || managedRiskReason(this.db) === MANAGED_ACCOUNT_RECHECKING) return;
       this.complete(record, readManagedState(this.db, record.id)!); return;
     }
     if (open.some((o) => o.id !== state.makerOrderId)) throw new Error('managed_unexpected_order');
@@ -1219,11 +1581,29 @@ export class ManagedPositionManager {
       if (snapshot.groups?.some(g => g.eligible && g.authorized) || snapshot.protection?.stage === 'settlement_pending'
         || snapshot.protection?.stage === 'confirming_recovery' || !state.exitRequested) return;
     }
-    if (this.protection.isEvaluating(record.id)) { await this.reduceForMargin(record, state, facts); return; }
+    if (this.protection.isEvaluating(record.id)) {
+      if (state.stopIntent === 'EXIT' && state.exitRequested) await this.exitUnderProtection(record, state, quantities);
+      else await this.reduceForMargin(record, state, facts);
+      return;
+    }
     if (state.exitRequested) { this.adoption.abortOwner(record.id); await this.exit(record, state, quantities); return; }
     if (await this.reduceForMargin(record, state, facts)) return;
     this.observe(record, state, legs);
     if (readManagedState(this.db, record.id)?.exitRequested) this.adoption.abortOwner(record.id);
+  }
+  private finishExternalReductionProtection(record: StrategyRecord, state: ManagedState, quantities: [string, string],
+    reductions: [string, string]): void {
+    const incident = state.protectionIncident!;
+    const protectedAt = this.now();
+    this.save(record.id, { ...state, phase: 'RISK_PAUSED', reason: incident.reason, protectionIncident: null,
+      pauseAfterProtection: true, leftQuantity: quantities[0], rightQuantity: quantities[1], maxLeft: quantities[0], maxRight: quantities[1],
+      observedReductions: reductions, checkedAt: new Date(protectedAt).toISOString(),
+      protectionReview: { reason: incident.reason, before: incident.before, after: quantities,
+        observedReductions: reductions, detectedAt: incident.at, protectedAt } });
+    this.db.prepare('INSERT INTO audit_events (id,created_at,type,correlation_id,payload_json) VALUES (?,?,?,?,?)')
+      .run(randomUUID(), new Date(protectedAt).toISOString(), 'managed_external_reduction_protected', record.id,
+        JSON.stringify({ strategyId: record.id, before: incident.before, after: quantities, observedReductions: reductions }));
+    this.log(record.id, 'External reduction protected', 'Task remains paused for explicit review; unrelated tasks may continue');
   }
 
   private async reduceForMargin(record: StrategyRecord, state: ManagedState, facts: ManagedAccountFacts, incident = false): Promise<boolean> {
@@ -1233,12 +1613,7 @@ export class ManagedPositionManager {
     const legs = managedLegs(record.config), constraints = legs.map((l) => this.constraints(l.symbol));
     if (legs.some((leg) => facts.positions.find((p) => p.symbol === leg.symbol)?.margin_mode !== 'CROSS')) return false;
     // LCM of decimal lot sizes gives a quantity both venues can represent exactly.
-    const scale = Math.max(...constraints.map((c) => new Decimal(c.lot_size).decimalPlaces()));
-    const factor = new Decimal(10).pow(scale);
-    const a = BigInt(new Decimal(constraints[0].lot_size).mul(factor).toFixed(0));
-    const b = BigInt(new Decimal(constraints[1].lot_size).mul(factor).toFixed(0));
-    let x = a, y = b; while (y !== 0n) { const remainder = x % y; x = y; y = remainder; }
-    const lot = new Decimal((a / x * b).toString()).div(factor).toString();
+    const lot = commonLotSize(constraints.map(constraint => constraint.lot_size));
     const limits = legs.map((leg) => this.db.prepare('SELECT max_market_size FROM crossex_instruments WHERE symbol = ?').get(leg.symbol) as { max_market_size: string | null });
     const max = Decimal.min(...limits.map((l) => l.max_market_size ?? state.leftQuantity!)).toString();
     const quantity = this.db.transaction(() => {
@@ -1291,8 +1666,10 @@ export class ManagedPositionManager {
       && !(await this.cancelMaker(record, state))) return;
     const index = plan.leg === 'left' ? 0 : 1;
     const exact = new Decimal(quantities[0]).minus(quantities[1]).abs();
+    const sizeIssue = this.sizeIssue(legs[index], exact);
+    if (sizeIssue && !isManagedQuantityIssue(sizeIssue)) throw this.sizeFailure(sizeIssue, record.id);
     if (state.exitRequested && !state.marginBatch && !state.protectionIncident
-      && (!new Decimal(plan.quantity).eq(exact) || this.sizeIssue(legs[index], exact))) {
+      && (!new Decimal(plan.quantity).eq(exact) || sizeIssue)) {
       if (state.makerOrderId && !isTerminalOrderState(this.runtime.getOrder(state.makerOrderId).state)) {
         this.save(record.id, { ...state, reason: 'managed_pairing_below_minimum' }); return;
       }
@@ -1302,7 +1679,7 @@ export class ManagedPositionManager {
     if ((state.marginBatch || state.protectionIncident || capacity) && !new Decimal(plan.quantity).eq(exact)) throw new Error('margin_partial_untradeable');
     // Enlarge only the reduction (never the position) if an exact trim is below venue minimums.
     if (state.marginBatch && new Decimal(plan.quantity).gt(state.marginBatch.quantity)) throw new Error('margin_batch_quantity_exceeded');
-    if (state.marginBatch && this.sizeIssue(legs[index], new Decimal(plan.quantity))) throw new Error('margin_partial_untradeable');
+    if (state.marginBatch && sizeIssue) throw new Error('margin_partial_untradeable');
     if (state.protectionIncident || capacity) this.requireSize(legs[index], exact);
     const quantity = state.marginBatch || state.protectionIncident || capacity || state.exitRequested ? new Decimal(plan.quantity)
       : this.reductionQuantity(legs[index], new Decimal(plan.quantity), new Decimal(quantities[index]));
@@ -1312,8 +1689,8 @@ export class ManagedPositionManager {
   private sizeIssue(leg: ManagedLeg, quantity: Decimal): ManagedSizeIssue | null {
     return managedOrderSizeIssue(leg, quantity, this.constraints(leg.symbol), this.markets.market(leg.symbol), this.now());
   }
-  private sizeFailure(issue: ManagedSizeIssue): TradingRuntimeError {
-    return new TradingRuntimeError(issue.code, isManagedQuantityIssue(issue) ? 400 : 409, JSON.stringify(issue));
+  private sizeFailure(issue: ManagedSizeIssue, strategyId?: string): TradingRuntimeError {
+    return new TradingRuntimeError(issue.code, isManagedQuantityIssue(issue) ? 400 : 409, JSON.stringify(issue), true, strategyId);
   }
   private requireSize(leg: ManagedLeg, quantity: Decimal, limitPrice?: string): void {
     const issue = this.sizeIssue(leg, quantity);
@@ -1403,25 +1780,61 @@ export class ManagedPositionManager {
     }
     await this.submit(record, index, quantity, !state.fallback, 'paired-first-leg');
   }
+  private async exitUnderProtection(record: StrategyRecord, state: ManagedState, quantities: [string, string]): Promise<void> {
+    if (this.now() < state.nextBatchAt) return;
+    const config = record.config.management!, legs = managedLegs(record.config);
+    const index = config.makerLeg === 'left' ? 0 : 1, leg = legs[index];
+    const constraints = legs.map(item => this.constraints(item.symbol));
+    const lot = commonLotSize(constraints.map(constraint => constraint.lot_size));
+    const planned = Decimal.min(config.perOrderQuantity, quantities[0], quantities[1]).div(lot).floor().mul(lot);
+    let quantity = this.reductionQuantity(leg, planned, new Decimal(quantities[index]));
+    const remainder = new Decimal(quantities[index]).minus(quantity);
+    if (remainder.gt(0) && !this.reductionQuantity(leg, remainder, new Decimal(quantities[index])).eq(remainder))
+      quantity = new Decimal(quantities[index]);
+    this.requireSize(legs[1 - index], quantity);
+    await this.submit(record, index, quantity, false, 'protected-exit');
+  }
   private async submit(record: StrategyRecord, index: number, quantity: Decimal, maker: boolean,
-    purpose: 'paired-first-leg' | 'existing-imbalance', feePhase: 'exit' | 'adjustment' = purpose === 'existing-imbalance' ? 'adjustment' : 'exit'): Promise<void> {
+    purpose: 'paired-first-leg' | 'existing-imbalance' | 'protected-exit',
+    feePhase: 'exit' | 'adjustment' = purpose === 'existing-imbalance' ? 'adjustment' : 'exit'): Promise<void> {
     const protecting = this.protection.isEvaluating(record.id);
-    if (!protecting && (!this.session.liveTradingEnabled || managedRiskReason(this.db))) return;
-    if (purpose === 'paired-first-leg' && this.fastPairing.has(record.id)) return;
     const control = this.controlEpoch, context = this.readContext();
     const leg = managedLegs(record.config)[index], side = opposite(leg.side);
+    const batch = readManagedState(this.db, record.id)?.marginBatch;
+    const pairing = (excludeOrderId?: string): boolean => purpose === 'existing-imbalance' && !batch
+      && confirmedExitQuantity(this.db, this.runtime.getStrategy(record.id), readManagedState(this.db, record.id),
+        this.sources.activeAccount(), managedLegs(record.config), index, quantity, excludeOrderId);
+    const risk = managedRiskReason(this.db);
+    const observation = this.recoveryObservation;
+    const recoveryTurnValid = observation?.revision === this.revision;
+    let dispatchRevision = this.revision;
+    const recoveryPermit = (exclude?: string): boolean => {
+      if (maker || !recoveryTurnValid || !observation || observation !== this.recoveryObservation
+        || this.recoveryConfirmations < 2 || this.revision !== dispatchRevision || observation.context !== this.readContext()
+        || observation.scope !== this.recoveryScope() || this.now() < observation.at || this.now() - observation.at > 5000
+        || this.now() >= observation.deadline || this.recoveryDeadline() !== observation.deadline
+        || !this.session.liveTradingEnabled || managedRiskReason(this.db) !== MANAGED_ACCOUNT_RECHECKING) return false;
+      const q = pairedQuantities(observation.facts.positions, managedLegs(record.config));
+      if (this.marginMonitor && !this.marginMonitor.snapshot().fresh) return false;
+      if (batch) {
+        assertMarginSubmission(this.db, record.id, batch, index, quantity, exclude);
+        if (index === batch.firstLeg) return purpose === 'paired-first-leg' && !!readManagedState(this.db, record.id)?.quoteRecovery
+          && quantity.eq(batch.quantity) && q.every(v => new Decimal(v).eq(batch.before));
+        return quantity.eq(new Decimal(q[index]).minus(q[1 - index]));
+      }
+      return purpose === 'existing-imbalance' && quantity.eq(new Decimal(q[index]).minus(q[1 - index])) && pairing(exclude);
+    };
+    const recoveryPairing = risk === MANAGED_ACCOUNT_RECHECKING && recoveryPermit();
+    if (!protecting && (!this.session.liveTradingEnabled || risk && !recoveryPairing)) return;
+    if (purpose === 'paired-first-leg' && this.fastPairing.has(record.id)) return;
     const quote = this.markets.market(leg.symbol);
     if (!freshManagedQuote(quote, this.now())) throw this.sizeFailure({ code: 'managed_market_data_unavailable',
-      symbol: leg.symbol, quantity: quantity.toString() });
+      symbol: leg.symbol, quantity: quantity.toString() }, record.id);
     const tick = this.constraints(leg.symbol).tick_size;
-    const batch = readManagedState(this.db, record.id)?.marginBatch;
     const quotePrice = side === 'BUY' ? quote!.bidPrice : quote!.askPrice;
     const price = !maker ? undefined : isHyperliquidFuture(leg.symbol)
       ? hyperliquidLimitPrice(quotePrice, tick, side)
       : new Decimal(quotePrice).div(tick).toDecimalPlaces(0, side === 'BUY' ? Decimal.ROUND_FLOOR : Decimal.ROUND_CEIL).mul(tick).toString();
-    const pairing = (excludeOrderId?: string): boolean => purpose === 'existing-imbalance' && !batch
-      && confirmedExitQuantity(this.db, this.runtime.getStrategy(record.id), readManagedState(this.db, record.id),
-        this.sources.activeAccount(), managedLegs(record.config), index, quantity, excludeOrderId);
     const wasPairing = pairing();
     const authorize = (excludeOrderId?: string): void => {
         const latestRecord = this.runtime.getStrategy(record.id), latestState = readManagedState(this.db, record.id);
@@ -1429,7 +1842,10 @@ export class ManagedPositionManager {
           this.checkCapacityDeadline();
           if (managedRiskReason(this.db)) throw new TradingRuntimeError('capacity_protection_scope_changed', 409);
         }
+        const latestRisk = managedRiskReason(this.db);
+        const recoveryStillValid = recoveryPermit(excludeOrderId);
         if (control !== this.controlEpoch || context !== this.readContext() || (!protecting && !this.session.liveTradingEnabled)
+          || (!protecting && latestRisk && !recoveryStillValid)
           || (!protecting && latestRecord.status !== 'RUNNING') || latestRecord.accountProfileId !== this.sources.activeAccount()
           || latestState?.stopIntent === 'KEEP')
           throw new TradingRuntimeError('managed_review_changed', 409);
@@ -1437,9 +1853,9 @@ export class ManagedPositionManager {
           assertMarginSubmission(this.db, record.id, batch, index, quantity, excludeOrderId);
           if (purpose === 'paired-first-leg') this.marginMonitor!.assertFirstLeg(record.id, batch.id!);
         }
-        const required = purpose === 'paired-first-leg' ? managedLegs(record.config) : [leg];
+        const required = purpose === 'existing-imbalance' ? [leg] : managedLegs(record.config);
         for (const item of required) if (!freshManagedQuote(this.markets.market(item.symbol), this.now())) {
-          throw this.sizeFailure({ code: 'managed_market_data_unavailable', symbol: item.symbol, quantity: quantity.toString() });
+          throw this.sizeFailure({ code: 'managed_market_data_unavailable', symbol: item.symbol, quantity: quantity.toString() }, record.id);
         }
         this.requireSize(leg, quantity, isHyperliquidFuture(leg.symbol) ? price : undefined);
         if (wasPairing && (!pairing(excludeOrderId)
@@ -1447,13 +1863,14 @@ export class ManagedPositionManager {
           throw new TradingRuntimeError('managed_pairing_evidence_changed', 409);
     };
     if (!protecting) this.revision += 1;
+    dispatchRevision = this.revision;
     const protectionPermit = protecting ? this.protection.permit(record, index, quantity,
       { symbol: leg.symbol, side, type: 'MARKET', quantity: quantity.toString(), reduceOnly: true }) : undefined;
     const order = await this.bounded(this.runtime.createOrder({ symbol: leg.symbol, side, type: maker ? 'LIMIT' : 'MARKET',
       timeInForce: maker ? 'POC' : 'IOC', quantity: quantity.toString(), reduceOnly: true, ...(price ? { price } : {}) },
     { feePhase, strategyId: record.id, strategyLeg: index === 0 ? 'left' : 'right', strategyClip: batch?.id ? `margin:${batch.id}` : `managed-${this.now()}`,
       ...(protectionPermit ? { protectionPermit } : {}),
-      confirmedPairing: pairing, beforeSubmit: () => authorize(), beforeDispatch: (excludeOrderId?: string) => {
+      confirmedPairing: pairing, recoveryPairing: recoveryPermit, beforeSubmit: () => authorize(), beforeDispatch: (excludeOrderId?: string) => {
         authorize(excludeOrderId); this.remoteWriteSequence += 1;
       } }), 'managed_submission_unknown');
     const state = readManagedState(this.db, record.id)!;

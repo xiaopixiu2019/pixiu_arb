@@ -17,6 +17,15 @@ export class TradingSession {
   private readonly listeners = new Set<TradingModeListener>();
   private protectionAvailable = () => false;
   private revokeProtection = () => {};
+  private maintenanceActive = () => false;
+  private admittedMaintenanceWork = () => false;
+  private controlEpoch = 0;
+  get controlRevision(): number { return this.controlEpoch; }
+
+  attachMaintenance(active: () => boolean, admitted: () => boolean): void {
+    this.maintenanceActive = active; this.admittedMaintenanceWork = admitted;
+  }
+  get maintenancePending(): boolean { return this.maintenanceActive(); }
 
   attachProtection(available: () => boolean, revoke: () => void): void {
     this.protectionAvailable = available; this.revokeProtection = revoke;
@@ -25,11 +34,13 @@ export class TradingSession {
     return this.mode !== 'readonly' && this.protectionAvailable() ? this.protect() : this.set('readonly');
   }
   protect(): TradingMode {
+    if (this.maintenanceActive() && !this.admittedMaintenanceWork()) return this.mode;
     if (this.mode === 'readonly' || !this.protectionAvailable()) return this.mode;
     return this.publish('protect_only');
   }
   /** Called only after an explicit continuous-protection enrollment. */
   armProtection(): TradingMode {
+    if (this.maintenanceActive() && !this.admittedMaintenanceWork()) return this.mode;
     return this.protectionAvailable() ? this.publish('protect_only') : this.mode;
   }
 
@@ -38,10 +49,11 @@ export class TradingSession {
   }
 
   get liveTradingEnabled(): boolean {
-    return this.mode === 'live';
+    return this.mode === 'live' && (!this.maintenanceActive() || this.admittedMaintenanceWork());
   }
 
   set(mode: 'readonly' | 'live'): TradingMode {
+    this.controlEpoch += 1;
     const applied = this.publish(mode);
     if (mode === 'readonly') this.revokeProtection();
     return applied;

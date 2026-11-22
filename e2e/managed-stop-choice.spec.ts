@@ -39,3 +39,38 @@ for (const closePositions of [false, true]) {
     }
   });
 }
+
+test('paused EXIT continues reduce-only while trading stays protect-only', async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem('crossex-language', 'zh'));
+  await page.route('**/api/preferences', route => route.fulfill({ json: { preferences: { language: 'zh' } } }));
+  expect((await page.request.post('/__e2e/paused-managed-strategy')).ok()).toBe(true);
+  const response = await page.request.get('/api/strategies');
+  const payload = await response.json() as { strategies: Array<{ id: string; [key: string]: unknown }> };
+  const original = payload.strategies.find(strategy => strategy.id === 'PAIR-LAYOUT01') as Record<string, unknown>;
+  const pausedExit = { ...original, status: 'PAUSED', management: {
+    ...(original.management as Record<string, unknown>), phase: 'RISK_PAUSED', stopIntent: 'EXIT', exitRequested: true,
+    resumeAction: 'EXITING', reason: 'managed_account_recovery_expired',
+  } };
+  const resumed: unknown[] = [];
+  await page.route('**/api/trading-mode', route => route.fulfill({ json: { mode: 'protect_only' } }));
+  await page.routeWebSocket('**/ws/stream', socket => {
+    socket.send(JSON.stringify({ type: 'mode.update', payload: { mode: 'protect_only' } }));
+  });
+  await page.route('**/api/strategies', route => route.fulfill({ json: { strategies: payload.strategies.map(strategy =>
+    strategy.id === 'PAIR-LAYOUT01' ? pausedExit : strategy) } }));
+  await page.route('**/api/strategies/PAIR-LAYOUT01/resume', route => {
+    resumed.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ...pausedExit, management: {
+      ...(pausedExit.management as Record<string, unknown>), phase: 'EXITING', reason: null,
+    } } });
+  });
+  try {
+    await page.goto('/strategies/paired-position');
+    const row = page.locator('.running-row').filter({ hasText: 'PAIR-LAYOUT01' });
+    await row.getByRole('button', { name: '继续平仓', exact: true }).click();
+    await expect.poll(() => resumed).toEqual([{ expectedAction: 'EXITING' }]);
+    await expect(page.getByRole('dialog', { name: /风险免责声明|Risk disclaimer/ })).toHaveCount(0);
+  } finally {
+    await page.request.delete('/__e2e/paused-managed-strategy');
+  }
+});

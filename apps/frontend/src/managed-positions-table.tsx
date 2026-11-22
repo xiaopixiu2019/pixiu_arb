@@ -72,7 +72,22 @@ function useCloseRequest(selection: ManagedCloseTarget | null, profileId: string
       setError(`${detail}${detail ? ' ' : ''}${zh ? '请到原任务核实结果，勿重复提交。' : 'Check the original task; do not resubmit.'}`);
     } finally { submitting.current = false; if (alive.current) setBusy(false); }
   }
-  return { busy, submitting, error, setError, notice, setNotice, receipts, confirm };
+  async function continueExit(target: ManagedCloseTarget) {
+    if (dataUnavailable || submitting.current || target.scope.accountProfileId !== profileId) return;
+    if (!['live', 'protect_only'].includes(tradingMode ?? '')) { onOpenModeDialog(); return; }
+    submitting.current = true; setBusy(true); setError(null);
+    try {
+      await api.resumeStrategy(target.strategy.id, 'EXITING');
+      if (!alive.current) return;
+      setNotice(zh ? '已重新核实退出责任，系统将保持仅减仓直到真实零仓。' : 'Exit responsibility reverified; reduce-only execution will continue until verified flat.');
+      await onChanged();
+    } catch (failure) {
+      if (!alive.current) return;
+      const detail = failure instanceof ApiError ? strategyErrorMessage(failure, language) : '';
+      setError(detail || (zh ? '暂时无法继续清仓，请核对当前订单和账户权限。' : 'Exit cannot continue yet; review the current orders and account permission.'));
+    } finally { submitting.current = false; if (alive.current) setBusy(false); }
+  }
+  return { busy, submitting, error, setError, notice, setNotice, receipts, confirm, continueExit };
 }
 
 interface ManagedPositionsTableProps {
@@ -87,7 +102,7 @@ function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, t
   const { language } = useLanguage(), zh = language === 'zh';
   const { targets, readStatus } = useCloseTargets(profileId, !staleReason);
   const [selection, setSelection] = useState<ManagedCloseTarget | null>(null);
-  const { busy, submitting, error, setError, notice, setNotice, receipts, confirm } = useCloseRequest(
+  const { busy, submitting, error, setError, notice, setNotice, receipts, confirm, continueExit } = useCloseRequest(
     selection, profileId, tradingMode, onOpenModeDialog, onChanged, () => setSelection(null), Boolean(staleReason));
   const latest = receipts.filter(r => r.scope.accountProfileId === profileId).at(-1);
   const completed = latest?.state === 'completed' ? latest.strategyId : null;
@@ -100,9 +115,16 @@ function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, t
     const target = matchManagedCloseTarget(group, targets, profileId);
     const phase = target?.strategy.management?.phase;
     const paused = target?.strategy.status === 'PAUSED' || phase === 'RISK_PAUSED';
+    const resumableExit = phase === 'RISK_PAUSED' && target?.strategy.management?.stopIntent === 'EXIT'
+      && target.strategy.management.exitRequested && target.strategy.management.resumeAction === 'EXITING';
+    const protectedExit = target?.strategy.status === 'PAUSED' && phase === 'EXITING'
+      && target.strategy.management?.stopIntent === 'EXIT' && target.strategy.management.exitRequested;
     const receipt = receiptForRows(group, receipts, profileId, targets);
+    if (resumableExit) return { disabled: busy || readStatus !== 'loaded', submitted: Boolean(receipt),
+      label: zh ? '重新核实并继续清仓' : 'Reverify and continue exit',
+      reason: zh ? '仅恢复本任务的只减仓责任，不开启普通交易' : 'Restores only this task\'s reduce-only exit responsibility' };
     if (receipt) {
-      const review = receipt.state === 'review' || paused && receipt.state !== 'completed';
+      const review = !protectedExit && (receipt.state === 'review' || paused && receipt.state !== 'completed');
       const done = receipt.state === 'completed' && !review;
       const pending = receipt.state === 'pending';
       return { disabled: true, submitted: true,
@@ -117,15 +139,19 @@ function AccountManagedPositionsTable({ rows, profileId, accountMarginBalance, t
     const exiting = phase === 'EXITING' || phase === 'STOPPING';
     const reason = readStatus === 'loading' ? (zh ? '正在核实托管归属' : 'Checking ownership')
       : readStatus === 'failed' ? (zh ? '托管归属读取失败，请等待更新' : 'Ownership read failed; awaiting an update')
-        : !target ? (zh ? '未能确认唯一托管任务，无法全部平仓' : 'No unique managed task owns this pair')
+          : !target ? (zh ? '未能确认唯一托管任务，无法全部平仓' : 'No unique managed task owns this pair')
           : paused ? (zh ? '任务需要人工核实，请在原任务中处理' : 'Review the paused task before closing') : '';
     return { disabled: busy || readStatus !== 'loaded' || !target || exiting || paused,
       label: paused ? (zh ? '需核实' : 'Review required') : exiting ? (zh ? '正在退出' : 'Exiting') : undefined, reason };
   }
   function requestClose(group: PositionTableRow[]) {
-    if (submitting.current || closeAction(group).disabled) return;
+    const action = closeAction(group), target = matchManagedCloseTarget(group, targets, profileId);
+    if (submitting.current || action.disabled) return;
+    if (target?.strategy.management?.phase === 'RISK_PAUSED' && target.strategy.management.stopIntent === 'EXIT') {
+      void continueExit(target); return;
+    }
     if (tradingMode !== 'live') { onOpenModeDialog(); return; }
-    setSelection(matchManagedCloseTarget(group, targets, profileId));
+    setSelection(target);
     setError(null); setNotice(null);
   }
   return <>

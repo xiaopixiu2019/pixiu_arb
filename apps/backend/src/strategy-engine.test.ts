@@ -15,6 +15,7 @@ import { ManagedPositionManager } from './managed-position-manager.js';
 import { waitForStrategyQuotes } from './strategy-quote-readiness.js';
 import { TradingRuntime, TradingRuntimeError, isTerminalOrderState } from './trading-runtime.js';
 import { TradingSession } from './trading-session.js';
+import { CredentialOperationGate, CredentialOperationBusyError } from './credential-operation-gate.js';
 import { MarginRiskMonitor } from './margin-risk-monitor.js';
 import { MarginRiskStore } from './margin-risk-store.js';
 import { RequestNotDispatchedError } from './authenticated-scheduler.js';
@@ -245,7 +246,7 @@ interface Harness {
 
 const harnesses: Harness[] = [];
 
-async function createHarness(engineOptions: StrategyEngineOptions = {}): Promise<Harness> {
+async function createHarness(engineOptions: StrategyEngineOptions = {}, gate?: CredentialOperationGate): Promise<Harness> {
   const directory = mkdtempSync(join(tmpdir(), 'gate-crossex-engine-'));
   const config = loadConfig({
     GCT_DATA_DIR: directory,
@@ -253,11 +254,18 @@ async function createHarness(engineOptions: StrategyEngineOptions = {}): Promise
   });
   const session = new TradingSession();
   session.set('live');
+  if (gate) session.attachMaintenance(() => gate.deploymentActive, () => gate.admittedWrite);
   const database = openDatabase(config.databasePath, config.migrationsDir);
   const vault = new MemoryCredentialVault();
   await vault.set(DEFAULT_CREDENTIAL_PROFILE, { apiKey: 'engine-key', apiSecret: 'engine-secret' });
   const gateway = new ScriptedGateway();
-  const runtime = new TradingRuntime(database, session, vault, gateway);
+  const runtime = new TradingRuntime(database, session, vault, gateway, gate ? { runAuthenticatedWrite: async work => {
+    try { return await gate.runAuthenticatedWrite(work); }
+    catch (error) {
+      if (error instanceof CredentialOperationBusyError) throw new TradingRuntimeError(error.message, 409);
+      throw error;
+    }
+  } } : {});
   const markets = new StubMarkets(database);
   const engine = new StrategyEngine(database, session, runtime, markets, {
     tickIntervalMs: 20, orderTimeoutMs: 400, requoteIntervalMs: 10, repairCooldownMs: 0,
@@ -521,7 +529,7 @@ async function managedCroHarness() {
 }
 
 async function managedDeferralHarness(executionMethod: 'MAKER_TAKER' | 'TAKER_TAKER', options: StrategyEngineOptions = {}, beforeStart?: (h: Harness) => void,
-  managerNow?: () => number) {
+  managerNow?: () => number, sizes: { totalAmount: string; perOrderQuantity: string } = takerTakerConfig) {
   const h = await createHarness(options);
   h.markets.set('BINANCE_FUTURE_BTC_USDT', '110', '111'); h.markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
   const facts = async () => ({ positions: h.gateway.positions, openOrders: (await Promise.all(h.gateway.createdOrders
@@ -535,10 +543,110 @@ async function managedDeferralHarness(executionMethod: 'MAKER_TAKER' | 'TAKER_TA
   });
   h.engine.setPositionManager(h.manager);
   beforeStart?.(h);
-  const record = await h.engine.startStrategy({ ...takerTakerConfig, executionMethod, makerLeg: 'left',
-    management: { perOrderQuantity: '0.1' } }, { profileId: 'account-1', label: 'Synthetic' });
+  const record = await h.engine.startStrategy({ ...takerTakerConfig, totalAmount: sizes.totalAmount,
+    perOrderQuantity: sizes.perOrderQuantity, executionMethod, makerLeg: 'left',
+    management: { perOrderQuantity: sizes.perOrderQuantity } }, { profileId: 'account-1', label: 'Synthetic' });
   return { h, record, facts, setRead: (value: typeof read) => { read = value; } };
 }
+
+describe('managed stop exit responsibility', () => {
+  it('reviews a paused managed entry directly into exit without reopening entry', async () => {
+    const { h, record } = await managedDeferralHarness('MAKER_TAKER');
+    h.database.prepare("UPDATE execution_strategies SET filled_quantity='0.1',filled_left='0.1',filled_right='0.1',progress=50 WHERE id=?").run(record.id);
+    h.gateway.positions = [futuresPosition('BINANCE_FUTURE_BTC_USDT', 'SHORT', '0.1'),
+      futuresPosition('OKX_FUTURE_BTC_USDT', 'LONG', '0.1')];
+    h.manager!.failAll('paired_entry_authority_changed'); await h.engine.pauseForManagedRisk(); h.session.set('live');
+    const stopped = await h.engine.stopStrategy(record.id, true, true);
+    expect(stopped).toMatchObject({ status: 'RUNNING', filledQuantity: '0.1', management: {
+      phase: 'EXITING', entryIntent: 'MONITORING', stopIntent: 'EXIT', exitRequested: true,
+      leftQuantity: '0.1', rightQuantity: '0.1', verified: true, fallback: true,
+    } });
+    expect(h.engine.listActiveStrategyIds()).not.toContain(record.id);
+    expect(h.gateway.createdOrders).toHaveLength(0);
+  });
+  it('flattens a maker fill confirmed while stop cancellation is settling', async () => {
+    const { h, record } = await managedDeferralHarness('MAKER_TAKER');
+    await h.engine.tick();
+    const maker = h.gateway.createdOrders[0];
+    expect(maker).toMatchObject({ symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', reduce_only: 'false' });
+
+    h.gateway.holdCancellations = true;
+    const query = h.gateway.queryOrder.bind(h.gateway);
+    let makerSettlementApplied = false;
+    h.gateway.queryOrder = async (...args) => {
+      const order = await query(...args);
+      if (args[1] === maker.remoteId && h.gateway.cancelledOrders.includes(maker.remoteId)) {
+        if (!makerSettlementApplied) {
+          makerSettlementApplied = true;
+          h.gateway.positions = [futuresPosition(maker.symbol, 'SHORT', '0.05')];
+          h.manager!.notifyPosition({ symbol: maker.symbol, position_side: 'SHORT', position_qty: '0.05', update_time: String(Date.now() + 1) });
+        }
+        return { ...order, state: 'CANCELLED', executed_qty: '0.05', executed_avg_price: '110' };
+      }
+      const local = h.runtime.listOrders().find(candidate => candidate.remoteOrderId === args[1]);
+      return local && isTerminalOrderState(local.state)
+        ? { ...order, state: local.state, executed_qty: local.executedQuantity, executed_avg_price: local.executedAveragePrice ?? '0' }
+        : order;
+    };
+
+    // Reproduce the production race: an account snapshot is in flight while the stop-owned
+    // cancellation publishes its terminal partial fill.
+    Reflect.set(h.manager!, 'readingAccount', true);
+    let stopped: Awaited<ReturnType<StrategyEngine['stopStrategy']>>;
+    try { stopped = await h.engine.stopStrategy(record.id, true); }
+    finally { Reflect.set(h.manager!, 'readingAccount', false); }
+    expect(stopped).toMatchObject({ status: 'RUNNING', management: { phase: 'EXITING', stopIntent: 'EXIT', exitRequested: true } });
+    expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+    expect(h.gateway.cancelledOrders).toEqual([maker.remoteId]);
+
+    for (let attempt = 0; attempt < 6 && h.gateway.createdOrders.length < 2; attempt += 1) await h.manager!.tick();
+    const flatten = h.gateway.createdOrders[1];
+    expect(flatten).toMatchObject({ symbol: maker.symbol, side: 'BUY', qty: '0.05', reduce_only: 'true' });
+
+    ackOrder(h.runtime, flatten.remoteId, 'FILLED', '0.05', '111');
+    ingestFill(h.runtime, flatten.remoteId, maker.symbol, 'BUY', '0.05', '111');
+    h.gateway.positions = [];
+    await h.manager!.waitForIdle();
+    for (let attempt = 0; attempt < 10 && h.runtime.getStrategy(record.id).status !== 'COMPLETED'; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await h.manager!.tick();
+    }
+    expect(h.runtime.getStrategy(record.id)).toMatchObject({ status: 'COMPLETED', management: {
+      phase: 'COMPLETED', leftQuantity: '0', rightQuantity: '0', pendingOrderIds: [],
+    } });
+    expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+  });
+  it('waits for a confirmed stop fill to reach positions before closing it', async () => {
+    const { h, record } = await managedDeferralHarness('MAKER_TAKER');
+    await h.engine.tick();
+    const maker = h.gateway.createdOrders[0], query = h.gateway.queryOrder.bind(h.gateway);
+    h.gateway.holdCancellations = true;
+    h.gateway.queryOrder = async (...args) => {
+      const order = await query(...args);
+      return args[1] === maker.remoteId && h.gateway.cancelledOrders.includes(maker.remoteId)
+        ? { ...order, state: 'CANCELLED', executed_qty: '0.05', executed_avg_price: '110' }
+        : order;
+    };
+
+    const stopped = await h.engine.stopStrategy(record.id, true);
+    expect(stopped).toMatchObject({ status: 'RUNNING', management: {
+      phase: 'STOPPING', stopIntent: 'EXIT', reason: 'managed_positions_settlement_pending',
+    } });
+    expect(h.database.prepare('SELECT 1 FROM managed_position_claims WHERE strategy_id=?').get(record.id)).toBeDefined();
+    expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+
+    h.gateway.positions = [futuresPosition(maker.symbol, 'SHORT', '0.05')];
+    for (let attempt = 0; attempt < 8 && h.runtime.getStrategy(record.id).management?.phase === 'STOPPING'; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await h.manager!.tick();
+    }
+    const exiting = h.runtime.getStrategy(record.id);
+    expect(exiting).toMatchObject({ status: 'RUNNING', management: {
+      leftQuantity: '0.05', rightQuantity: '0', stopIntent: 'EXIT',
+    } });
+    expect(['EXITING', 'BALANCING']).toContain(exiting.management?.phase);
+  });
+});
 
 describe('durable router rejection isolation',()=>{
   it.each(['before','after'] as const)('bounds terminal rejections arriving %s the HTTP response and preserves six monitoring siblings',async timing=>{
@@ -606,7 +714,7 @@ describe('durable router rejection isolation',()=>{
   });
 });
 
-async function pendingProgressHarness(now?: () => number) {
+async function pendingProgressHarness(now?: () => number, sizes?: { totalAmount: string; perOrderQuantity: string }) {
   let monitor!: MarginRiskMonitor;
   const result = await managedDeferralHarness('MAKER_TAKER', {}, h => {
     h.gateway.leverages = { BINANCE_FUTURE_BTC_USDT: '1', OKX_FUTURE_BTC_USDT: '1' };
@@ -621,11 +729,83 @@ async function pendingProgressHarness(now?: () => number) {
     monitor = createMarginRiskService({ db: h.database, gateway: h.gateway, runtime: h.runtime, manager: h.manager!, engine: h.engine,
       markets: h.markets, context: () => 'account-1:1', profile: () => ({ id: 'account-1', label: 'Synthetic' }),
       credentials: () => h.vault.get(DEFAULT_CREDENTIAL_PROFILE), live: () => h.session.liveTradingEnabled, enforce: true });
-  }, now);
+  }, now, sizes);
   return { ...result, monitor };
 }
 
 describe('pre-submit account recheck deferral', () => {
+  it.each([850, 300, 0])('reconciles two partially cancelled IOC hedges before the remaining 850 (third fill %i)', async thirdFill => {
+    const { h, record, monitor, setRead } = await pendingProgressHarness(undefined, { totalAmount: '2000', perOrderQuantity: '1000' });
+    const left = 'BINANCE_FUTURE_BTC_USDT', right = 'OKX_FUTURE_BTC_USDT';
+    const iocReason = 'ioc_order_failed_because_it_would_not_be_executed';
+    let blockThird = true;
+    const create = h.runtime.createOrder.bind(h.runtime);
+    h.runtime.createOrder = async (...args) => {
+      const input = args[0] as { quantity: string; symbol: string };
+      if (blockThird && input.symbol === right && input.quantity === '850') {
+        blockThird = false;
+        h.database.prepare('INSERT OR IGNORE INTO managed_risk_lock VALUES (1,?,?)').run('managed_account_rechecking', new Date().toISOString());
+      }
+      return create(...args);
+    };
+    setRead(async () => ({ positions: h.gateway.positions, openOrders: [] }));
+    try {
+      const ethLeft = 'BINANCE_FUTURE_ETH_USDT', ethRight = 'OKX_FUTURE_ETH_USDT';
+      Object.assign(h.gateway.leverages, { [ethLeft]: '1', [ethRight]: '1' });
+      const baseCatalog = await h.gateway.querySymbols();
+      h.gateway.querySymbols = async () => [...baseCatalog, ...[ethLeft, ethRight].map(symbol => ({ symbol, support_cross: 'true' }) as GateCrossExSymbol)];
+      h.markets.set(ethLeft, '110', '111'); h.markets.set(ethRight, '99', '100');
+      const sibling = await h.engine.startStrategy({ ...takerTakerConfig, asset: 'ETH', management: { perOrderQuantity: '0.1' } },
+        { profileId: 'account-1', label: 'Synthetic' });
+      seedFilledStrategyOrder(h.database, sibling.id, 'eth-left', ethLeft, 'SELL', '0.2', 'left');
+      seedFilledStrategyOrder(h.database, sibling.id, 'eth-right', ethRight, 'BUY', '0.2', 'right');
+      const siblingPositions = [futuresPosition(ethLeft, 'SHORT', '0.2'), futuresPosition(ethRight, 'LONG', '0.2')];
+      h.gateway.positions = siblingPositions;
+      h.manager!.handoff(sibling.id, '0.2'); await h.manager!.tick();
+      await h.engine.tick();
+      h.gateway.positions = [futuresPosition(left, 'SHORT', '1000'), ...siblingPositions];
+      ackOrder(h.runtime, 'remote-1', 'FILLED', '1000', '111');
+      for (const [index, qty, executed, net] of [[2,'1000','110','110'],[3,'890','40','150']] as const) {
+        const tick = h.engine.tick();
+        await waitFor(() => h.gateway.createdOrders.length >= index);
+        expect(h.gateway.createdOrders[index - 1]).toMatchObject({ symbol: right, qty });
+        h.gateway.positions = [futuresPosition(left, 'SHORT', '1000'), futuresPosition(right, 'LONG', net), ...siblingPositions];
+        ackOrder(h.runtime, `remote-${index}`, 'CANCELLED', executed, '100', iocReason);
+        await tick;
+      }
+      await h.engine.tick();
+      expect(h.session.current).toBe('live');
+      expect(h.gateway.createdOrders).toHaveLength(3);
+      for (let i = 0; i < 6 && h.database.prepare('SELECT 1 FROM managed_risk_lock').get(); i++) await h.manager!.tick();
+      expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+      const repair = h.engine.tick();
+      await waitFor(() => h.gateway.createdOrders.length === 4);
+      expect(h.gateway.createdOrders[3]).toMatchObject({ symbol: right, qty: '850', type: 'MARKET' });
+      const filled = thirdFill === 850, matched = String(150 + thirdFill);
+      h.gateway.positions[1] = futuresPosition(right, 'LONG', matched);
+      ackOrder(h.runtime, 'remote-4', filled ? 'FILLED' : 'CANCELLED', String(thirdFill), '100', filled ? undefined : iocReason);
+      await repair;
+      if (filled) expect(h.runtime.getStrategy(record.id).filledQuantity).toBe('1000');
+      else {
+        await h.engine.tick();
+        expect(h.runtime.getStrategy(record.id)).toMatchObject({ status: 'PAUSED', management: { reason: 'managed_entry_hedge_exhausted' } });
+        for (let i = 0; i < 4 && !h.gateway.createdOrders.some(o => o.reduce_only === 'true'); i++) {
+          await new Promise(resolve => setTimeout(resolve, 1050));
+          await h.manager!.tick();
+        }
+        const trim = h.gateway.createdOrders.find(o => o.reduce_only === 'true');
+        const remaining = String(850 - thirdFill);
+        expect(trim, JSON.stringify(h.manager!.protection.view())).toMatchObject({ symbol: left, side: 'BUY', qty: remaining, reduce_only: 'true' });
+        h.gateway.positions[0] = futuresPosition(left, 'SHORT', matched);
+        ackOrder(h.runtime, trim!.remoteId, 'FILLED', remaining, '111');
+        await h.manager!.tick();
+        expect(h.runtime.getStrategy(record.id).status).toBe('PAUSED');
+      }
+      expect(h.runtime.getStrategy(sibling.id)).toMatchObject({ status: 'RUNNING', management: { phase: 'MONITORING' } });
+      expect(h.session.current).toBe('live');
+      expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+    } finally { await monitor.stop(); }
+  });
   it('discards a delayed preparation timeout after the user switches to readonly',async()=>{
     const {h,record}=await managedDeferralHarness('MAKER_TAKER');let reject!:(error:unknown)=>void;
     const prepare=vi.spyOn(h.runtime,'preparePairedEntry').mockImplementation(()=>new Promise((_,fail)=>{reject=fail;}));
@@ -1270,6 +1450,36 @@ describe('pre-submit account recheck deferral', () => {
     expect(h.gateway.createAttempts).toHaveLength(2);
   });
 
+  it('defers an approved hedge during preparation recheck without globally pausing the account', async () => {
+    const { h, record } = await managedDeferralHarness('MAKER_TAKER');
+    await h.engine.tick();
+    const create = h.runtime.createOrder.bind(h.runtime);
+    let rechecking = true;
+    h.runtime.createOrder = async (...args) => {
+      if (rechecking && args[1]?.strategyLeg === 'right') {
+        throw new TradingRuntimeError('paired_entry_preparation_unavailable', 409);
+      }
+      return create(...args);
+    };
+    h.gateway.positions = [futuresPosition('BINANCE_FUTURE_BTC_USDT', 'SHORT', '0.05')];
+    ackOrder(h.runtime, 'remote-1', 'PARTIALLY_FILLED', '0.05', '111');
+    ingestFill(h.runtime, 'remote-1', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.05', '111');
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await h.engine.tick();
+      expect(h.runtime.getStrategy(record.id).status).toBe('RUNNING');
+      expect(h.database.prepare('SELECT reason FROM managed_risk_lock').get()).toBeUndefined();
+      expect(h.session.current).toBe('live');
+    }
+
+    rechecking = false;
+    const resumed = h.engine.tick();
+    await waitFor(() => h.gateway.createdOrders.length === 2);
+    expect(h.gateway.createdOrders[1]).toMatchObject({ symbol: 'OKX_FUTURE_BTC_USDT', qty: '0.05' });
+    ackOrder(h.runtime, 'remote-2', 'FILLED', '0.05', '100');
+    await resumed;
+  });
+
   it('does not discard an accepted taker leg when the second leg is deferred', async () => {
     const { h, record, facts, setRead } = await managedDeferralHarness('TAKER_TAKER');
     const create = h.runtime.createOrder.bind(h.runtime);
@@ -1378,6 +1588,29 @@ describe('pre-submit account recheck deferral', () => {
 });
 
 describe('strategy engine', () => {
+  it('persists a private fill during maintenance without spending repair attempts and reconciles after cancellation', async () => {
+    const gate = new CredentialOperationGate();
+    const h = await createHarness({}, gate);
+    h.markets.set('BINANCE_FUTURE_BTC_USDT', '110', '111'); h.markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    const record = await h.engine.startStrategy({ ...takerTakerConfig, executionMethod: 'MAKER_TAKER', makerLeg: 'left', totalAmount: '0.1' });
+    await h.engine.tick(); expect(h.gateway.createdOrders).toHaveLength(1);
+    const lease = await gate.acquireDeploymentFence('stream-fill-maintenance');
+    ackOrder(h.runtime, 'remote-1', 'FILLED', '0.1', '110');
+    ingestFill(h.runtime, 'remote-1', 'BINANCE_FUTURE_BTC_USDT', 'SELL', '0.1', '110');
+    await h.engine.settleMaintenanceTurns();
+    expect(h.runtime.listOrders()[0].executedQuantity).toBe('0.1');
+    expect(h.gateway.createAttempts).toHaveLength(1);
+    expect(h.runtime.getStrategy(record.id).status).toBe('RUNNING');
+    expect(h.runtime.strategyLogs(record.id).some(log => log.event === 'Strategy engine error')).toBe(false);
+    gate.releaseDeploymentFence(lease.operationId, lease.leaseToken);
+    const resumed = h.engine.tick();
+    await waitFor(() => h.gateway.createdOrders.length === 2);
+    ackOrder(h.runtime, 'remote-2', 'FILLED', '0.1', '100');
+    await resumed;
+    expect(h.gateway.createdOrders[1]).toMatchObject({ symbol: 'OKX_FUTURE_BTC_USDT', qty: '0.1' });
+    expect(h.runtime.getStrategy(record.id).status).toBe('COMPLETED');
+    expect(h.session.current).toBe('live');
+  });
   it.each(['capped', 'unavailable'] as const)('holds a maker before any exposure when the Hyperliquid capacity check is %s', async fault => {
     let now = Date.now(); const h = await createHarness({ now: () => now });
     h.markets.set('BYBIT_FUTURE_SOPH_USDT', '1.1', '1.11'); h.markets.set('HYPERLIQUID_FUTURE_SOPH_USDC', '0.99', '1');
@@ -2524,6 +2757,97 @@ describe('strategy engine', () => {
     await engine.tick();
     await waitFor(() => gateway.createdOrders.length === 2);
     expect(gateway.createdOrders[1]?.price).toBe('100600.5');
+  });
+
+  it('keeps an economically valid sell maker when the maker ask moves higher', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]?.price).toBe('101');
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '102');
+    await new Promise(resolve => setTimeout(resolve, 15)); await engine.tick();
+    expect(gateway.cancelledOrders).toEqual([]);
+  });
+
+  it('requotes a sell maker when a lower competing ask moves ahead', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    const record = await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '100.5');
+    await new Promise(resolve => setTimeout(resolve, 15)); const tick = engine.tick();
+    await waitFor(() => gateway.cancelledOrders.length === 1);
+    expect(runtime.strategyLogs(record.id).find(log => log.event === 'Maker cancellation started')?.condition)
+      .toBe('competitive_requote');
+    ackOrder(runtime, 'remote-1', 'CANCELLED', '0', '0'); await tick;
+  });
+
+  it('keeps an economically valid buy maker when the maker bid moves lower', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'right' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]?.price).toBe('99');
+    markets.set('OKX_FUTURE_BTC_USDT', '98', '100');
+    await new Promise(resolve => setTimeout(resolve, 15)); await engine.tick();
+    expect(gateway.cancelledOrders).toEqual([]);
+  });
+
+  it('requotes a buy maker when a higher competing bid moves ahead', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'right' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    markets.set('OKX_FUTURE_BTC_USDT', '99.5', '100');
+    await new Promise(resolve => setTimeout(resolve, 15)); const tick = engine.tick();
+    await waitFor(() => gateway.cancelledOrders.length === 1);
+    ackOrder(runtime, 'remote-1', 'CANCELLED', '0', '0'); await tick;
+  });
+
+  it('accepts a still-safe maker price when the maker ask rises during preparation', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    runtime.setMarginAdmission(async () => { markets.set('BINANCE_FUTURE_BTC_USDT', '100', '102'); });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    expect(gateway.createdOrders[0]?.price).toBe('101');
+  });
+
+  it('cancels an existing maker when either required quote becomes stale', async () => {
+    const { engine, gateway, markets } = await createHarness();
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101');
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    const stale = new Date(Date.now() - 60_000).toISOString();
+    markets.set('OKX_FUTURE_BTC_USDT', '99', '100', stale, stale);
+    await engine.tick(); await waitFor(() => gateway.cancelledOrders.length === 1);
+  });
+
+  it('starts the competitive requote interval after maker acceptance', async () => {
+    let clock = Date.now(); const { engine, runtime, gateway, markets } = await createHarness({ now: () => clock, requoteIntervalMs: 2_000 });
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101'); markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    runtime.setMarginAdmission(async () => { clock += 3_000; });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '100.5'); await engine.tick();
+    expect(gateway.cancelledOrders).toEqual([]);
+    clock += 2_000; await engine.tick(); await waitFor(() => gateway.cancelledOrders.length === 1);
+  });
+
+  it('cancels immediately when the current maker price violates the economic boundary', async () => {
+    const { engine, gateway, markets } = await createHarness({ requoteIntervalMs: 60_000 });
+    markets.set('BINANCE_FUTURE_BTC_USDT', '100', '101'); markets.set('OKX_FUTURE_BTC_USDT', '99', '100');
+    await engine.startStrategy({ ...takerTakerConfig, entryBps: '-200', executionMethod: 'MAKER_TAKER', makerLeg: 'left' });
+    await engine.tick(); await waitFor(() => gateway.createdOrders.length === 1);
+    markets.set('OKX_FUTURE_BTC_USDT', '119', '120'); await engine.tick();
+    await waitFor(() => gateway.cancelledOrders.length === 1);
   });
 
   it('runs an auto spread bot through an entry and take-profit cycle with reduce-only exits', async () => {

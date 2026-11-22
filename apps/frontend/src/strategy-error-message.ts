@@ -63,6 +63,8 @@ export function strategyErrorMessage(error: StrategyFailure, language: string): 
     managed_stop_reconcile_failed: zh ? '停止意图已保存，但持仓或订单尚未核实完成，请复核。' : 'Stop intent is saved; positions or orders still require reconciliation.',
     manual_stop_keep: zh ? '仓位保留，自动监控和退出已停止。' : 'Holdings retained; monitoring and automatic exits stopped.',
     managed_account_rechecking: zh ? '账户持仓和挂单正在重新核实；暂不接受新的交易操作。' : 'Account positions and orders are being rechecked; new trading actions are temporarily blocked.',
+    managed_stop_recovery_pending: zh ? '已保留停止并平仓责任；系统正在保护模式下核实订单和持仓后继续只减仓。' : 'The stop-and-exit responsibility is retained; protection is reconciling orders and holdings before continuing reduce-only execution.',
+    managed_pairing_quote_rechecking: zh ? '减仓配对行情正在恢复；新增交易暂时冻结，系统核对后将继续原配平。' : 'The reduction-pairing quote is recovering. New trading is temporarily blocked while the original pairing is rechecked and continued.',
     managed_router_entry_review: zh ? '连续五次零成交路由拒单；本任务等待人工复核。' : 'Five zero-fill router rejections; this task requires manual review.',
     managed_entry_preparation_review: zh ? '建仓准备连续超时；仅本任务暂停新增，持仓保护按当前授权和核实结果执行。' : 'Entry preparation repeatedly timed out. Only this task stops entry; holdings protection follows current authority and verified evidence.',
     managed_entry_preparation_wait: zh ? '建仓准备暂未核实，等待重试；已有持仓保护继续。' : 'Entry preparation is awaiting retry; existing holdings protection continues.',
@@ -71,7 +73,7 @@ export function strategyErrorMessage(error: StrategyFailure, language: string): 
     managed_quote_unavailable: zh ? '退出报价缺失或过期，正在重连；退出条件计时已重置。' : 'Exit quote is missing or stale; reconnecting and resetting confirmation timing.',
     managed_funding_unavailable: zh ? '退出资金费率缺失或过期，正在重取；退出条件计时已重置。' : 'Exit funding is missing or stale; refreshing and resetting confirmation timing.',
     strategy_market_data_unavailable: zh ? '实时行情尚未就绪或已过期，暂不能执行；数量未被判定为不足。' : 'Live quotes are unavailable or stale. Execution is blocked; this is not a quantity rejection.',
-    managed_market_data_unavailable: zh ? '实时行情尚未就绪或已过期，无法核实最低交易金额；不会因此扩大减仓数量。' : 'Live quotes are unavailable or stale, so minimum notional cannot be verified. The reduction will not be enlarged.',
+    managed_market_data_unavailable: zh ? '执行行情缺失或已过期，暂不能核实减仓条件；不会因此扩大减仓数量，能否继续取决于当前核对结果和风险锁。' : 'Execution quotes are missing or stale, so reduction conditions cannot be verified. The reduction will not be enlarged; continuation depends on current reconciliation and risk locks.',
     managed_constraints_unavailable: zh ? '交易规则暂不可用，暂不能执行。' : 'Instrument constraints are unavailable. Execution is blocked.',
     managed_order_invalid_quantity: zh ? `数量 ${quantity} 无效，必须大于 0。` : `Quantity ${quantity} is invalid; it must be positive.`,
     managed_order_below_minimum_size: zh ? `数量 ${quantity} 低于最小数量 ${minimum}。` : `Quantity ${quantity} is below the minimum ${minimum}.`,
@@ -85,9 +87,6 @@ export function managedReasonMessage(reason: string, language: string): string {
   if (reason === 'Five consecutive maker quotes were rejected; check credentials, balances, and venue status') return language === 'zh'
     ? '连续五次 Maker 报价被拒绝，已触发风险暂停；请查看任务订单中的具体拒绝原因。'
     : 'Five consecutive maker quotes were rejected; risk paused. Inspect the task orders for the specific rejection reason.';
-  if (reason === 'managed_market_data_unavailable') return language === 'zh'
-    ? '行情或资金费率数据暂不可用，退出条件计时已重置。'
-    : 'Quote or funding data is unavailable. Exit confirmation timing has been reset.';
   const separator = reason.indexOf(':');
   return strategyErrorMessage({ code: separator < 0 ? reason : reason.slice(0, separator),
     label: separator < 0 ? undefined : reason.slice(separator + 1), message: reason }, language);

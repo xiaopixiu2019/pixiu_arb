@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { closeExpectations } from './managed-close-contract.mjs';
 
-export function requestBudget({ limit = 80, windowMs = 60000, now = Date.now } = {}) {
+export function requestBudget({ limit = 240, windowMs = 60000, now = Date.now } = {}) {
   const issued = [];
   return () => {
     const at = now();

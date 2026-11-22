@@ -1,3 +1,4 @@
+import { copyReviewedNotices, copyTrackedDirectory, cleanCompiledOutputs, isolatedRuntimeEnvironment, assertOwnedPayload, assertFreshInstalledApp } from './release-bundle-contract.mjs';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
@@ -22,7 +23,7 @@ import { pipeline } from 'node:stream/promises';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-const nodeVersion = process.env.GCT_RELEASE_NODE_VERSION ?? '24.18.0';
+const nodeVersion = process.env.GCT_RELEASE_NODE_VERSION ?? '24.22.1';
 const releasePlatform = process.env.GCT_RELEASE_PLATFORM ?? process.platform;
 const releaseArch = process.env.GCT_RELEASE_ARCH ?? process.arch;
 
@@ -85,7 +86,7 @@ function copy(relativePath, destination = join(appRoot, relativePath)) {
   const source = join(root, relativePath);
   if (!existsSync(source)) throw new Error(`Release input is missing: ${relativePath}`);
   mkdirSync(dirname(destination), { recursive: true });
-  cpSync(source, destination, { recursive: true, dereference: false });
+  cpSync(source, destination, { recursive: true, dereference: false, filter: path => !/\.test\.(?:js|d\.ts)$/.test(path) });
 }
 
 async function installRuntime() {
@@ -133,12 +134,16 @@ function copyApplicationInputs() {
   ]) {
     copy(builtDirectory);
   }
-  copy('migrations');
+  copyTrackedDirectory(root, 'migrations', join(appRoot, 'migrations'));
   for (const script of ['backup-database.mjs', 'restore-database.mjs', 'maintain-database.mjs']) {
     copy(`scripts/${script}`);
   }
   copy('uninstall.sh', join(appRoot, 'uninstall.sh'));
-  for (const document of ['README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'SECURITY.md']) copy(document);
+  copy('LICENSES');
+  copy('docs/desktop-installation.md', join(appRoot, 'README.md'));
+  copy('apps/frontend/src/assets/fonts/OFL.txt');
+  copy('apps/frontend/src/assets/exchanges/README.md');
+  for (const document of ['CHANGELOG.md', 'LICENSE', 'SOURCE_NOTICES.md', 'THIRD_PARTY_NOTICES.md', 'SECURITY.md']) copy(document);
 }
 
 async function freePort() {
@@ -160,7 +165,7 @@ async function smokeTestPackagedBackend() {
   const child = spawn(node, [join(appRoot, 'apps/backend/dist/server.js')], {
     cwd: appRoot,
     env: {
-      ...process.env,
+      ...isolatedRuntimeEnvironment(),
       NODE_ENV: 'production',
       GCT_DATA_DIR: dataDirectory,
       GCT_MIGRATIONS_DIR: join(appRoot, 'migrations'),
@@ -185,7 +190,10 @@ async function smokeTestPackagedBackend() {
           fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1_000) }),
           fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1_000) }),
         ]);
-        if (health.ok && page.ok && (await page.text()).includes('<div id="root">')) return;
+        if (health.ok && page.ok && (await page.text()).includes('<div id="root">')) {
+          await assertFreshInstalledApp(`http://127.0.0.1:${port}`, packageJson.version);
+          return;
+        }
       } catch {
         // Still starting.
       }
@@ -245,11 +253,13 @@ async function main() {
         }
       }
     }
+    cleanCompiledOutputs(root);
     console.log('Building production application...');
     run('npm', ['run', 'build']);
     mkdirSync(appRoot, { recursive: true });
     const { sourceNode, npmCli } = await installRuntime();
     copyApplicationInputs();
+    copyReviewedNotices(root, appRoot);
 
     console.log(`Installing production dependencies under Node ${nodeVersion}...`);
     run(sourceNode, [npmCli, 'ci', '--omit=dev', '--no-audit', '--no-fund', '--strict-allow-scripts'], {
@@ -257,7 +267,8 @@ async function main() {
       env: { ...process.env, PATH: `${dirname(sourceNode)}:${process.env.PATH ?? ''}` },
     });
 
-    const commit = process.env.GITHUB_SHA ?? commandOutput('git', ['rev-parse', 'HEAD']);
+    const commit = commandOutput('git', ['rev-parse', 'HEAD']);
+    if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== commit) throw new Error('Build checkout differs from event commit');
     if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error(`Invalid release commit: ${commit}`);
     const release = {
       schema: 1,
@@ -271,6 +282,7 @@ async function main() {
     };
     writeFileSync(join(bundleRoot, 'release.json'), `${JSON.stringify(release, null, 2)}\n`, { mode: 0o600 });
     assertProductionTree();
+    assertOwnedPayload(appRoot);
     console.log('Smoke-testing the packaged backend with its bundled Node runtime...');
     await smokeTestPackagedBackend();
 

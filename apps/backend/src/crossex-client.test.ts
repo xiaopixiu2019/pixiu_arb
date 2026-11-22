@@ -3,6 +3,124 @@ import { GateApiError, GateCrossExClient, signGateRequest, type AuthenticatedReq
 import { marginReadFault } from './margin-read-fault.js';
 
 describe('Gate APIv4 signing', () => {
+  it('dispatches managed positions and open orders on independent read lanes', async () => {
+    let releasePositions!: () => void;
+    const positionsHeld = new Promise<void>(resolve => { releasePositions = resolve; });
+    const started: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const path = new URL(String(url)).pathname;
+      started.push(path);
+      if (path.endsWith('/positions')) await positionsHeld;
+      return new Response('[]');
+    });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const read = client.queryManagedState(
+      { apiKey: 'synthetic', apiSecret: 'synthetic' },
+      new AbortController().signal,
+    );
+
+    try {
+      await vi.waitFor(() => expect(started).toContain('/api/v4/crossex/open_orders'));
+      expect(started).toContain('/api/v4/crossex/positions');
+    } finally {
+      releasePositions();
+      await read;
+    }
+  });
+
+  it('coalesces concurrent managed-state readers into one physical snapshot', async () => {
+    const fetchMock = vi.fn(async () => new Response('[]'));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
+
+    await Promise.all([
+      client.queryManagedState(credentials, new AbortController().signal),
+      client.queryManagedState(credentials, new AbortController().signal),
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces identical concurrent statistics account reads without sharing trading freshness', async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const account = { available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
+      initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE', account_mode: 'CROSS_EXCHANGE',
+      exchange_type: 'CROSSEX', update_time: '1783689000000', assets: [] };
+    const fetchMock = vi.fn(async () => { await held; return Response.json(account); });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
+    const statisticsA = client.createStatisticsReader().queryAccount(credentials);
+    const statisticsB = client.createStatisticsReader().queryAccount(credentials);
+    const trading = client.queryAccount(credentials);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    release();
+    await expect(Promise.all([statisticsA, statisticsB, trading])).resolves.toHaveLength(3);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not coalesce statistics account reads across credentials or venue units', async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const account = { available_margin: '100', margin_balance: '100', initial_margin: '0', maintenance_margin: '0',
+      initial_margin_rate: '0', maintenance_margin_rate: '0', position_mode: 'SINGLE', account_mode: 'CROSS_EXCHANGE',
+      exchange_type: 'CROSSEX', update_time: '1783689000000', assets: [] };
+    const fetchMock = vi.fn(async () => { await held; return Response.json(account); });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const reader = client.createStatisticsReader();
+    const reads = [
+      reader.queryAccount({ apiKey: 'synthetic', apiSecret: 'old-secret' }),
+      reader.queryAccount({ apiKey: 'synthetic', apiSecret: 'new-secret' }),
+      reader.queryAccount({ apiKey: 'synthetic', apiSecret: 'old-secret' }, 'GATE'),
+    ];
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    release(); await Promise.all(reads); expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps a shared managed-state read alive when one waiter cancels', async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const fetchMock = vi.fn(async () => { await held; return new Response('[]'); });
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
+    const cancelled = new AbortController();
+    const first = client.queryManagedState(credentials, cancelled.signal);
+    const second = client.queryManagedState(credentials, new AbortController().signal);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    cancelled.abort();
+    await expect(first).rejects.toMatchObject({ label: 'REQUEST_ABORTED' });
+    release();
+
+    await expect(second).resolves.toEqual({ positions: [], openOrders: [] });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not attach a new waiter to an already-aborted managed-state read', async () => {
+    const fetchMock = vi.fn(async () => new Response('[]'));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+    const credentials = { apiKey: 'synthetic', apiSecret: 'synthetic' };
+    const cancelled = new AbortController();
+    const first = client.queryManagedState(credentials, cancelled.signal);
+    cancelled.abort();
+    const second = client.queryManagedState(credentials, new AbortController().signal);
+
+    await expect(first).rejects.toMatchObject({ label: 'REQUEST_ABORTED' });
+    await expect(second).resolves.toEqual({ positions: [], openOrders: [] });
+  });
+
+  it('does not coalesce managed-state reads across rotated credentials', async () => {
+    const fetchMock = vi.fn(async () => new Response('[]'));
+    const client = new GateCrossExClient(fetchMock as typeof fetch, Date.now, undefined, 0);
+
+    await Promise.all([
+      client.queryManagedState({ apiKey: 'synthetic', apiSecret: 'old-secret' }, new AbortController().signal),
+      client.queryManagedState({ apiKey: 'synthetic', apiSecret: 'new-secret' }, new AbortController().signal),
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
   it.each(['managed','portfolio'] as const)('keeps bounded portfolio and protection reads independent when %s transport stalls',async blocked=>{
     vi.useFakeTimers();let release!:()=>void;const held=new Promise<void>(r=>{release=r;});
     const starts:number[]=[];let active=0,maximum=0,first=true;

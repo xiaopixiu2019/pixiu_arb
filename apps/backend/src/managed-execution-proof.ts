@@ -4,6 +4,7 @@ import type { ExecutionOrder, StrategyRecord } from './trading-runtime.js';
 import type { ManagedState } from './managed-position-store.js';
 import type { ManagedLeg } from './managed-position-model.js';
 import { managedReductionTotals } from './managed-margin-batch.js';
+import { expiredEntryIoc } from './entry-ioc.js';
 
 export function ownsManagedExecution(db: Database.Database, record: StrategyRecord, state: ManagedState | undefined,
   account: string | null, legs: ManagedLeg[]): boolean {
@@ -18,7 +19,9 @@ export function ownsManagedExecution(db: Database.Database, record: StrategyReco
 export function ordinaryManagedOrder(db: Database.Database, record: StrategyRecord, state: ManagedState | undefined,
   order: ExecutionOrder, account: string | null, legs: ManagedLeg[], entryPrepared: boolean): boolean {
   const ordinaryCancel = order.state === 'CANCELLED' && order.failureReason?.toLowerCase() === 'cancelled_by_user';
-  if (!ownsManagedExecution(db, record, state, account, legs) || !order.remoteOrderId || order.failureReason && !ordinaryCancel
+  const expiredHedge = record.config.executionMethod === 'MAKER_TAKER'
+    && order.strategyLeg !== (record.config.makerLeg ?? 'left') && expiredEntryIoc(order);
+  if (!ownsManagedExecution(db, record, state, account, legs) || !order.remoteOrderId || order.failureReason && !ordinaryCancel && !expiredHedge
     || !['NEW', 'OPEN', 'PARTIALLY_FILLED', 'FILLED', 'PENDING_CANCEL', 'CANCELLED'].includes(order.state)) return false;
   const index = legs.findIndex(l => l.symbol === order.symbol);
   if (index < 0 || order.strategyId !== record.id || order.strategyLeg !== (index === 0 ? 'left' : 'right')) return false;

@@ -8,6 +8,7 @@ import type { TransactionFeeStore } from './transaction-fee-store.js';
 import type { FeeEpoch } from './transaction-fee-model.js';
 import type { PnlBook } from './task-performance-store.js';
 import { coveredThrough, type CoverageRange } from './task-performance-coverage.js';
+import { krakenConversionRateResolver } from './task-performance-conversion-rate.js';
 
 export interface LegacyStage {
   base: TaskPerformance; before: string[]; after: string[]; feeValid: boolean;
@@ -15,9 +16,9 @@ export interface LegacyStage {
 }
 export function legacyContext(fees: TransactionFeeStore, key: string, profile: string, now: number, rows: PnlBook[]) {
   const all = proofs(fees, key, profile, now), trades = fees.trades(key), links = fundingLinks(rows, all);
-  const feeBooks = new Map(fees.book(key).map(r => [r.id, r])), valued = new Map<string, PnlEntry>();
+  const feeBooks = new Map(fees.book(key).map(r => [r.id, r])), valued = new Map<string, PnlEntry>(), conversionRate = krakenConversionRateResolver(rows);
   const value = (row: PnlBook) => {
-    let v = valued.get(row.id); if (!v) { v = entry(row, fees, key, feeBooks); valued.set(row.id, v); } return v;
+    let v = valued.get(row.id); if (!v) { v = entry(row, fees, key, feeBooks, conversionRate); valued.set(row.id, v); } return v;
   };
   const assigned = new Map<string, PnlBook[]>(), ambiguous: PnlBook[] = [];
   for (const row of rows.filter(r => !['TRANSFER_IN', 'TRANSFER_OUT'].includes(r.statement_type))) {

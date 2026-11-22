@@ -22,7 +22,7 @@ export function retainTradingResults(next: TaskPerformanceSummary, previous: Tas
   if (!previous || next.profileId !== previous.profileId) return next;
   return { ...next, tasks: next.tasks.map(task => {
     const value = task.trading, old = previous.tasks.find(t => t.taskId === task.taskId)?.trading;
-    if (!value || value.amount !== null || value.status === 'transferred' || old?.amount == null || value.groupId !== old.groupId
+    if (!value || task.status !== 'open' || value.amount !== null || value.status === 'transferred' || old?.amount == null || value.groupId !== old.groupId
       || [...value.members].sort().join(':') !== [...old.members].sort().join(':')) return task;
     return { ...task, trading: { ...old, status: 'partial' as const, stale: true, reasons: [...new Set([...value.reasons, 'last_confirmed_value'])] } };
   }) };

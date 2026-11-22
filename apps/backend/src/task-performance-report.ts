@@ -6,6 +6,7 @@ import { feeSummary } from './transaction-fee-report.js';
 import { TaskPerformanceStore, type PnlBook } from './task-performance-store.js';
 import { strictDecimal, type FeeBinding, type FeeBookRow } from './transaction-fee-model.js';
 import { boundedTaskEstimate } from './task-performance-tolerance.js';
+import { krakenConversionRateResolver } from './task-performance-conversion-rate.js';
 
 interface TaskRow { id: string; status: string; created_at: string; stopped_at: string | null; config_json: string; state_json: string | null }
 export interface Proof { task: TaskRow; bindings: FeeBinding[]; trades: StoredFeeTrade[]; symbols: string[]; from: number; to: number; closed: boolean; reasons: string[] }
@@ -44,10 +45,11 @@ export function proofs(fees: TransactionFeeStore, key: string, profile: string, 
       to:closed?Date.parse(task.stopped_at ?? ''):now,closed,reasons};
   });
 }
-export function entry(r: PnlBook, fees: TransactionFeeStore, key: string, feeBooks: Map<string,FeeBookRow>): PnlEntry {
+export function entry(r: PnlBook, fees: TransactionFeeStore, key: string, feeBooks: Map<string,FeeBookRow>,
+  conversionRate: (row: PnlBook) => string | null = () => null): PnlEntry {
   const fee=r.statement_type==='TRADING_FEE'?feeBooks.get(r.id):undefined;
   return {id:r.id,kind:kindOf(r.statement_type) ?? 'other',coin:r.coin,change:r.change,
-    rate:fee?.rate ?? fees.rateAt(key,r.coin,Number(r.create_time)),conflict:r.conflict || !!fee?.conflict};
+    rate:fee?.rate ?? fees.rateAt(key,r.coin,Number(r.create_time)) ?? conversionRate(r),conflict:r.conflict || !!fee?.conflict};
 }
 export function directOwner(r: PnlBook, all: Proof[]): Proof[] {
   if (!r.symbol) return [];
@@ -89,7 +91,8 @@ export function priceCoverage(p: Proof, rows: PnlBook[]): boolean {
 export function taskPerformanceReport(store: TaskPerformanceStore, key: string, profile: string, now: number, failure: string | null): TaskPerformanceSummary {
   const fees=new TransactionFeeStore(store.db), all=proofs(fees,key,profile,now), rows=store.rows(key), trades=fees.trades(key);
   const links=fundingLinks(rows,all), feeBooks=new Map(fees.book(key).map(r=>[r.id,r])), valued=new Map<string,PnlEntry>();
-  const value=(r:PnlBook)=>{let v=valued.get(r.id);if(!v){v=entry(r,fees,key,feeBooks);valued.set(r.id,v);}return v;};
+  const conversionRate=krakenConversionRateResolver(rows);
+  const value=(r:PnlBook)=>{let v=valued.get(r.id);if(!v){v=entry(r,fees,key,feeBooks,conversionRate);valued.set(r.id,v);}return v;};
   const feeTasks=feeSummary(fees,key,now).tasks, assigned=new Map<string,PnlBook[]>(), ambiguous: PnlBook[]=[];
   for (const r of rows.filter(r=>!transfers.has(r.statement_type))) {
     const owner=r.statement_type==='FUNDING_FEE'?fundingOwner(r,all,trades,links):directOwner(r,all);

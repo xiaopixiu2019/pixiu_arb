@@ -149,7 +149,10 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
   }
 
   async function resumeStrategy(id: string) {
-    if (tradingMode !== 'live') {
+    const management = strategies.find(strategy => strategy.id === id)?.management;
+    const protectedExit = tradingMode === 'protect_only' && management?.resumeAction === 'EXITING'
+      && management.stopIntent === 'EXIT' && management.exitRequested;
+    if (tradingMode !== 'live' && !protectedExit) {
       onOpenModeDialog();
       return;
     }
@@ -157,7 +160,6 @@ export function RunningStrategiesPanel({ strategies, authenticatedPortfolio, tra
     setResumingIds((current) => [...current, id]);
     setStopNotice(null);
     try {
-      const management = strategies.find(strategy => strategy.id === id)?.management;
       await api.resumeStrategy(id, management?.remainingEntryQuantity ? 'OPENING' : management?.resumeAction);
       await onStrategiesChanged();
     } catch (error) {

@@ -13,22 +13,28 @@ import {
   writeHyperliquidPerpMetadata,
 } from './repositories.js';
 import { monitorWindowsServiceParent } from './service-parent-monitor.js';
+import { performance } from 'node:perf_hooks';
 
 process.umask(0o077);
+const startupStarted = performance.now();
 const config = loadConfig();
 const processLock = acquireBackendProcessLock(config.dataDir);
 let database: ReturnType<typeof openDatabase>;
+let databaseReadyAt = startupStarted;
 try {
   database = openDatabase(config.databasePath, config.migrationsDir);
+  databaseReadyAt = performance.now();
 } catch (error) {
   processLock.release();
   throw error;
 }
 let app: Awaited<ReturnType<typeof buildApp>>;
+let credentialReadyAt = databaseReadyAt;
 try {
   const credentialVault = await createSystemCredentialVault(config.credentialEnvPath, {
     disableKeychain: process.env.GCT_DISABLE_OS_KEYCHAIN === '1',
   });
+  credentialReadyAt = performance.now();
   app = await buildApp({
     config,
     database,
@@ -56,6 +62,8 @@ try {
     startMarketStream: true,
     startNativeMarketStream: true,
   });
+  app.log.info({ databaseMs: databaseReadyAt - startupStarted, credentialMs: credentialReadyAt - databaseReadyAt,
+    appBuildMs: performance.now() - credentialReadyAt }, 'backend startup phases');
 } catch (error) {
   database.close();
   processLock.release();
@@ -104,7 +112,9 @@ process.on('unhandledRejection', (reason) => emergencyExit('unhandledRejection',
 process.on('uncaughtException', (error) => emergencyExit('uncaughtException', error));
 
 try {
+  const listenStarted = performance.now();
   await app.listen({ host: config.host, port: config.port });
+  app.log.info({ listenMs: performance.now() - listenStarted, totalMs: performance.now() - startupStarted }, 'backend startup complete');
 } catch (error) {
   app.log.error(error, 'failed to start local backend');
   await app.close().catch((closeError) => app.log.error(closeError, 'startup cleanup failed'));

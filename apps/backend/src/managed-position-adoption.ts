@@ -25,7 +25,7 @@ export function entryHoldings(db: Database.Database, id: string): [string, strin
   }) as [string, string];
 }
 
-function baseline(positions: GateCrossExPosition[], legs: ManagedLeg[]) {
+export function adoptionBaseline(positions: GateCrossExPosition[], legs: ManagedLeg[]) {
   return legs.map((leg) => {
     const position = positions.find((p) => p.symbol === leg.symbol && !new Decimal(p.position_qty).isZero());
     return { symbol: leg.symbol, quantity: position?.position_qty ?? '0',
@@ -99,7 +99,7 @@ export class ManagedAdoption {
       reject('managed_adoption_changed');
     this.pending.set(id, { ...pending, state: { ...initialManagedState(), groupId: donor?.groupId ?? pending.donor ?? id,
       adoptedLeft: quantities[0], adoptedRight: quantities[1], adoptedAt: new Date().toISOString(),
-      adoptionBaseline: baseline(facts.positions, pending.legs), leftQuantity: quantities[0], rightQuantity: quantities[1],
+      adoptionBaseline: adoptionBaseline(facts.positions, pending.legs), leftQuantity: quantities[0], rightQuantity: quantities[1],
       maxLeft: quantities[0], maxRight: quantities[1], checkedAt: new Date().toISOString() } });
   }
 

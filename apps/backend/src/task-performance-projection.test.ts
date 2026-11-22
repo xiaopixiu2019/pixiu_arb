@@ -47,6 +47,7 @@ function fixture(open = false, asset = 'TEST', taskId = 's', existing?: Database
 }
 
 import { TaskPerformanceProjection } from './task-performance-projection.js';
+import { TASK_PERFORMANCE_GROUP_SCHEMA } from './task-performance-projection-model.js';
 import { TaskPerformanceWorker } from './task-performance-worker-client.js';
 import { PerformanceStore } from './performance-store.js';
 import { taskPerformanceReport } from './task-performance-report.js';
@@ -202,6 +203,27 @@ describe('incremental task projections',()=>{
     const restarted=new TaskPerformanceProjection(h.db,'a','p');await compare(h,restarted);expect(restarted.statistics.historyGroups).toBe(0);
     h.db.prepare("UPDATE managed_positions SET state_json=? WHERE strategy_id='child'").run(JSON.stringify({...child,adoptedLeft:'2'}));await compare(h,restarted);
     await compare(h,restarted,500000); // fee freshness changes without historical recomputation.
+  });
+  it('rebuilds every published group when its financial algorithm schema is superseded',async()=>{
+    const h=fixture(),p=new TaskPerformanceProjection(h.db,'a','p');await compare(h,p);
+    expect(TASK_PERFORMANCE_GROUP_SCHEMA).toBe(2);
+    const row=h.db.prepare("SELECT payload FROM task_pnl_group_cache WHERE account_key='a' AND group_id='s'").get() as {payload:string};
+    h.db.prepare("UPDATE task_pnl_group_cache SET payload=? WHERE account_key='a' AND group_id='s'")
+      .run(JSON.stringify({...JSON.parse(row.payload),schema:TASK_PERFORMANCE_GROUP_SCHEMA-1}));
+    const restarted=new TaskPerformanceProjection(h.db,'a','p');expect(restarted.pending()).toBe(true);await compare(h,restarted);
+    expect(restarted.statistics.historyGroups).toBe(1);
+    const rebuilt=h.db.prepare("SELECT json_extract(payload,'$.schema') schema FROM task_pnl_group_cache WHERE account_key='a' AND group_id='s'").get();
+    expect(rebuilt).toEqual({schema:TASK_PERFORMANCE_GROUP_SCHEMA});
+  });
+  it('keeps symbolless unresolved cashflows at account level without poisoning every task',async()=>{
+    const h=fixture(true),p=new TaskPerformanceProjection(h.db,'a','p');await compare(h,p);
+    const base=h.books[0];h.store.save('a',[
+      {...base,id:'orphan-usdt',business_id:'orphan',statement_type:'KRAKEN_CONVERSION',symbol:'',exchange_type:'CROSSEX',coin:'USDT',change:'-6.86',create_time:'200000'},
+      {...base,id:'orphan-usd',business_id:'orphan',statement_type:'KRAKEN_CONVERSION',symbol:'',exchange_type:'KRAKEN',coin:'USD',change:'6.85',create_time:'200001'},
+    ],100000,310000);await compare(h,p);
+    const summary=p.summary(310000,null,h.valuation)!;const task=summary.tasks[0].trading!;
+    expect(task.amount).not.toBeNull();expect(task.reasons).not.toContain('unallocated_trade_evidence');
+    expect(summary.unresolvedCashflows).toMatchObject({count:2,native:{USDT:'-6.86',USD:'6.85'}});
   });
   it('retains external adoption cost baselines and rejects ambiguous manual fills',async()=>{
     const h=fixture(true),p=new TaskPerformanceProjection(h.db,'a','p');await compare(h,p);

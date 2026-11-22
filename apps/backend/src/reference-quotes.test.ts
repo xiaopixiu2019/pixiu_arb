@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PublicMarketDataGateway, VenueFundingStat } from '@gate-crossex/public-data';
+import type { PublicMarketSnapshot } from '@gate-crossex/shared-types';
 import { ReferenceQuotesService } from './reference-quotes.js';
 
 describe('independent reference quotes', () => {
@@ -7,30 +8,46 @@ describe('independent reference quotes', () => {
   const gate = 'GATE_FUTURE_BTC_USDT', hyper = 'HYPERLIQUID_FUTURE_BTC_USDC';
   const book = { bidPrice: '100', askPrice: '101', bookObservedAt: new Date(now).toISOString() };
   const stat: VenueFundingStat = { ...book, venue: 'GATE', base: 'BTC', quote: 'USDT', fundingRate: null, fundingIntervalHours: 8, fundingRate8h: null, nextFundingAt: null, openInterestValue: null, lastPrice: '99999', change24h: null };
+  const snapshot = (symbol: string): PublicMarketSnapshot => ({ symbol, venue: symbol.startsWith('OKX_') ? 'OKX' : 'GATE', product: 'FUTURE',
+    bidPrice: '100', askPrice: '101', lastPrice: '100', markPrice: '100', indexPrice: '100', fundingRate: '0', predictedFundingRate: null,
+    nextFundingAt: new Date(now + 3_600_000).toISOString(), sourceTimestamp: new Date(now).toISOString(), fetchedAt: new Date(now).toISOString(),
+    source: symbol.startsWith('OKX_') ? 'okx_public_rest' : 'gate_futures_public_rest' });
   const gateway = (overrides: Partial<PublicMarketDataGateway> = {}): PublicMarketDataGateway => ({
-    querySnapshot: async () => { throw new Error('not used'); },
+    querySnapshot: async (symbol) => snapshot(symbol),
     queryVenueFundingStats: async () => [stat], queryReferenceBook: async () => book, ...overrides,
   });
-  it('coalesces concurrent exact contracts, uses bulk venue data, expires without changing source time', async () => {
+  it('coalesces concurrent exact contracts, uses targeted venue data, expires without changing source time', async () => {
     let clock = now;
     const bulk = vi.fn(async () => [stat]);
     const native = vi.fn(async () => book);
-    const service = new ReferenceQuotesService(gateway({ queryVenueFundingStats: bulk, queryReferenceBook: native }), () => clock);
+    const targeted = vi.fn(async (symbol: string) => snapshot(symbol));
+    const service = new ReferenceQuotesService(gateway({ querySnapshot: targeted, queryVenueFundingStats: bulk, queryReferenceBook: native }), () => clock);
     const allowed = new Set([gate, hyper]);
     const results = await Promise.all([service.read([gate, hyper], allowed), service.read([gate, hyper], allowed)]);
-    expect(bulk).toHaveBeenCalledTimes(1); expect(native).toHaveBeenCalledTimes(1);
+    expect(targeted).toHaveBeenCalledTimes(1); expect(bulk).not.toHaveBeenCalled(); expect(native).toHaveBeenCalledTimes(1);
     expect(results[0].entries).toEqual(results[1].entries);
     clock += 16_000; await service.read([gate, hyper], allowed);
-    expect(bulk).toHaveBeenCalledTimes(2); expect(native).toHaveBeenCalledTimes(2);
+    expect(targeted).toHaveBeenCalledTimes(2); expect(bulk).not.toHaveBeenCalled(); expect(native).toHaveBeenCalledTimes(2);
     clock += 46_000;
     expect((await service.read([gate], allowed)).entries[0]).toMatchObject({ status: 'unavailable', reason: 'missing_book' });
   });
   it('isolates a failed venue, never promotes mark price, and does not fetch unknown contracts', async () => {
     const bulk = vi.fn(async () => [{ ...stat, bidPrice: undefined, askPrice: undefined }]);
-    const service = new ReferenceQuotesService(gateway({ queryVenueFundingStats: bulk, queryReferenceBook: async () => { throw new Error('failure'); } }), () => now);
+    const service = new ReferenceQuotesService(gateway({ querySnapshot: async (symbol) => ({ ...snapshot(symbol), bidPrice: null, askPrice: null }),
+      queryVenueFundingStats: bulk, queryReferenceBook: async () => { throw new Error('failure'); } }), () => now);
     const unknown = 'GATE_FUTURE_OTHER_USDT';
     expect((await service.read([gate, hyper, unknown], new Set([gate, hyper]))).entries.map((entry) => entry.reason)).toEqual(['missing_book', 'venue_unavailable', 'unknown_contract']);
-    expect(bulk).toHaveBeenCalledTimes(1);
+    expect(bulk).not.toHaveBeenCalled();
+  });
+  it('uses targeted snapshots for Gate and OKX without loading venue-wide statistics', async () => {
+    const okx = 'OKX_FUTURE_BTC_USDT';
+    const targeted = vi.fn(async (symbol: string) => snapshot(symbol));
+    const bulk = vi.fn(async () => [stat]);
+    const service = new ReferenceQuotesService(gateway({ querySnapshot: targeted,
+      queryVenueFundingStats: bulk }), () => now);
+    const result = await service.read([gate, okx], new Set([gate, okx]));
+    expect(result.entries.every((entry) => entry.status === 'ok')).toBe(true);
+    expect(targeted).toHaveBeenCalledTimes(2); expect(bulk).not.toHaveBeenCalled();
   });
   it('bounds concurrent native reads and rejects excessive or malformed selections', async () => {
     let active = 0, maximum = 0;
@@ -57,14 +74,13 @@ describe('independent reference quotes', () => {
     clock += 10_000; await service.read([hyper], new Set([hyper]));
     expect(native).toHaveBeenCalledTimes(1);
   });
-  it.each(['stale', 'failure'])('recovers a %s Binance bulk feed using a fresh explicit depth book', async (state) => {
+  it('uses a fresh explicit Binance depth book without loading the bulk funding feed', async () => {
     const symbol = 'BINANCE_FUTURE_BTC_USDT';
     const native = vi.fn(async () => book);
-    const service = new ReferenceQuotesService(gateway({ queryReferenceBook: native,
-      queryVenueFundingStats: async () => { if (state === 'failure') throw new Error('funding feed unavailable'); return [{ ...stat, venue: 'BINANCE', bookObservedAt: new Date(now - 60_000).toISOString() }]; },
-    }), () => now);
+    const bulk = vi.fn(async () => [{ ...stat, venue: 'BINANCE' as const }]);
+    const service = new ReferenceQuotesService(gateway({ queryReferenceBook: native, queryVenueFundingStats: bulk }), () => now);
     expect((await service.read([symbol], new Set([symbol]))).entries[0]).toMatchObject({ status: 'ok', bidPrice: '100', askPrice: '101' });
-    expect(native).toHaveBeenCalledExactlyOnceWith(symbol);
+    expect(native).toHaveBeenCalledExactlyOnceWith(symbol); expect(bulk).not.toHaveBeenCalled();
   });
   it('caps targeted native reads per venue per minute independently of cache size', async () => {
     let clock = now;

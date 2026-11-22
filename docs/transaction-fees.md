@@ -34,5 +34,6 @@
 - 必须带 `x-gct-read-intent: transaction-fees`，响应 `Cache-Control: no-store`；不接受任意账户参数或写入方法。原 `/api/crossex/fees` 费率接口不变。
 - Migration `0026_transaction_fees.sql` 新增 fee_epochs/book/trades/order_bindings/rates 和 execution_orders.fee_phase；新增 `0027_fee_binding_coverage.sql` 保留已验证绑定的合约、期望成交量及订单时间，并保存普通成交的费用币种，以维持清理旧执行记录后的覆盖责任和原币展示。旧绑定缺少证明时不填零，继续待核对；历史成交币种缺失显示待核对，只有真实成交回报可补齐。不得修改已应用迁移或删除事实记录。
 - 统计队列独立，30 秒超时，停止可取消；账户切换时丢弃旧响应。浏览器每 30 秒更新概览及展开明细，明细读取失败保留上次值并明示。费率页面/交易摘要/Boros 共用严格费率解析；空白不可用，实际零费率和负费返佣保留，缓存过期明示并刷新。
+- 估值汇率内容不变时每分钟最多保留一个心跳点，任何实际汇率变化立即保留。这保证历史费用时刻在原90秒查找窗内仍有可追溯证据，同时防止轮询频率直接放大 `fee_rates` 表。
 
 现行页面归属与财务显示见[账户收益统计](account-performance.md)；代码变更须以隔离账户和合成网关验证币种、符号、汇率、归属及重复数据边界。
